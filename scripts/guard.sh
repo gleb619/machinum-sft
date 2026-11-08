@@ -99,7 +99,9 @@ STEP_NAME=()
 STEP_CMD=()
 STEP_STATUS=()
 STEP_SECS=()
-STEP_ENV=()
+# Env assignments for the next step, space separated (word splitting is intended and
+# keeps this working on bash 3.2, where an empty array trips `set -u`).
+STEP_ENV=""
 
 now_ms() {
     local ns
@@ -127,19 +129,13 @@ record_step() { # name cmd status seconds_ms
 }
 
 run_quiet() { # cmd logfile
-    if [ "${#STEP_ENV[@]}" -gt 0 ]; then
-        env "${STEP_ENV[@]}" bash -c "$1" >>"$2" 2>&1
-    else
-        bash -c "$1" >>"$2" 2>&1
-    fi
+    # shellcheck disable=SC2086  # $STEP_ENV is a list of VAR=value assignments
+    env $STEP_ENV bash -c "$1" >>"$2" 2>&1
 }
 
 run_stream() { # cmd logfile
-    if [ "${#STEP_ENV[@]}" -gt 0 ]; then
-        env "${STEP_ENV[@]}" bash -c "$1" 2>&1 | tee -a "$2"
-    else
-        bash -c "$1" 2>&1 | tee -a "$2"
-    fi
+    # shellcheck disable=SC2086
+    env $STEP_ENV bash -c "$1" 2>&1 | tee -a "$2"
 }
 
 run_step() { # name cmd -> exit status of cmd; appends to the step table
@@ -171,7 +167,8 @@ show_failure() { # name rc
     local name=$1 rc=$2 log_file="$WORK_DIR/$1.log" line
     log ""
     log "${RED}${BOLD}GUARD FAILED: ${name} (exit ${rc})${RESET}"
-    if [ -s "$log_file" ]; then
+    # Banner mode already streamed the output; only --json needs the excerpt reprinted.
+    if [ "$JSON" -eq 1 ] && [ -s "$log_file" ]; then
         log "${DIM}--- last 40 lines of ${name} ---${RESET}"
         while IFS= read -r line; do
             log "$line"
@@ -179,6 +176,11 @@ show_failure() { # name rc
         log "${DIM}--- end ---${RESET}"
     fi
     log "${RED}full log: ${log_file}${RESET}"
+    if grep -q 'data input not found' "$log_file" 2>/dev/null &&
+        grep -q 'tests/fixtures' "$log_file" 2>/dev/null; then
+        log "${YELLOW}hint: the emulated checkout dropped tests/fixtures/*.jsonl — wrkflw 0.8.0"
+        log "      does not honour .gitignore '!' re-includes. See docs/guard.md, Caveats.${RESET}"
+    fi
     CLEAN_WORK=0
 }
 
@@ -291,10 +293,10 @@ if command -v wrkflw >/dev/null 2>&1; then
     fi
     # Emulation runs the workflow on this host, so its `pip install -e .` would
     # overwrite the dev venv's editable install. PIP_TARGET sends it to a temp dir.
-    STEP_ENV=("PIP_TARGET=$WORK_DIR/pip-target" "PIP_DISABLE_PIP_VERSION_CHECK=1")
+    STEP_ENV="PIP_TARGET=$WORK_DIR/pip-target PIP_DISABLE_PIP_VERSION_CHECK=1"
     rc=0
     run_step "ci-run" "wrkflw run --runtime emulation .github/workflows/ci.yml" || rc=$?
-    STEP_ENV=()
+    STEP_ENV=""
     if [ "$rc" -ne 0 ]; then
         show_failure "ci-run" "$rc"
         finish_fail 1

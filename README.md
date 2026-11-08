@@ -39,11 +39,35 @@ See `CONTRACT.md` for the module interfaces, and `docs/model-choice.md` for the 
 decision this repo follows. `docs/data-flow.md` explains how the pipeline's dataset tools
 hand JSONL to `msft data build`.
 
+## Remote worker
+
+The GPU box is a queue, not a second codebase. Code is committed and pushed here; the box
+pulls; a container serves jobs.
+
+```bash
+cp configs/worker.example.yaml configs/worker.local.yaml   # host goes here; git-ignored
+msft remote deploy --execute        # pull on the box + docker compose up --build
+msft remote signal train --execute  # queue a job
+msft remote status --execute        # container health + queue + heartbeat
+msft remote down --execute          # stop it
+```
+
+Inside the box the same CLI is used locally:
+
+```bash
+msft worker serve --dir .worker             # the daemon (this is what the container runs)
+msft worker signal train --config configs/gemma-4-12b-qlora.yaml
+msft worker status --dir .worker
+msft worker log --dir .worker --lines 60
+```
+
+The queue is a directory of JSON files (`inbox` → `running` → `done`), each job carrying its
+kind, config and result. The daemon writes `heartbeat.json` every loop, which is what the
+compose healthcheck reads.
+
 ## Verified run (2026-11-08)
 
 End-to-end on a 16 GB RTX 4060 Ti box, from a clean Python 3.12 venv:
-
-```
 msft data build  →  63 records in, 52 out, 2 898 approx tokens, 51 train / 1 val
 msft train       →  42 rows, effective batch 4, 11 steps, 1 epoch
                     train_loss 1.919 · eval_loss 1.144 · 64.6 s on GPU0 (1.9 GB VRAM)
