@@ -192,7 +192,9 @@ def validate_config(cfg: RunConfig) -> list[str]:
     return warnings
 
 
-_SECRET = re.compile(r"(?i)(hf_[a-z0-9]{8,}|sk-[a-z0-9]{8,}|gh[pousr]_[a-z0-9]{8,}|[A-Za-z0-9_-]{32,})")
+_SECRET = re.compile(
+    r"(?i)(hf_[a-z0-9]{8,}|sk-[a-z0-9]{8,}|gh[pousr]_[a-z0-9]{8,}|[A-Za-z0-9_-]{32,})"
+)
 _HOST = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 _HOME = re.compile(r"/(?:home|Users)/[^/\s]+")
 
