@@ -104,7 +104,10 @@ class RunConfig:
 
     @property
     def merged_path(self) -> Path:
-        return self.output_path / "merged"
+        # Per-run, not a shared `out/merged`: two configs (0.8B and 4B) merged into one path
+        # makes it possible to quantize the wrong weights under the right filename. That
+        # happened on the first real run — out/model-4b.gguf was the 0.8B model.
+        return self.output_path / f"merged-{self.name}"
 
     @property
     def dataset_path(self) -> Path:

@@ -39,6 +39,15 @@ See `CONTRACT.md` for the module interfaces, and `docs/model-choice.md` for the 
 decision this repo follows. `docs/data-flow.md` explains how the pipeline's dataset tools
 hand JSONL to `msft data build`.
 
+## Start here if you are picking this up cold
+
+| Document | Why |
+| --- | --- |
+| `AGENTS.md` | the rules — read before changing anything that costs GPU time |
+| `docs/memory.md` | every trap that cost time, with its fix and the command that proves it |
+| `docs/handoff.md` | the working loop: setup, daily commands, stage timings, failure playbook |
+| `docs/run-2026-11-08.md` | one real run end to end, with numbers |
+
 ## Remote worker
 
 The GPU box is a queue, not a second codebase. Code is committed and pushed here; the box
