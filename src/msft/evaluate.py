@@ -32,7 +32,11 @@ _ID_RE = re.compile(r"<id>\s*(\d+)\s*</id>")
 _TERMS_RE = re.compile(r"<terms>\s*(.*?)\s*</terms>", re.S)
 _PROPERTIES_RE = re.compile(r"^\s*(\d+)\s*=(.*)$")
 _FENCE_RE = re.compile(r"```|~~~")
-_CHATTER_RE = re.compile(r"^(?:sure|certainly|of course|here(?:'s| is| are)|below is)\b", re.I)
+_CHATTER_RE = re.compile(
+    r"^(?:sure|certainly|of course|here(?:'s| is| are)|below is"
+    r"|thinking process|analy[sz]e the request|the user wants|let me )",
+    re.I,
+)
 _XML_TERMS = ("text", "origin", "translation", "proofread")
 
 

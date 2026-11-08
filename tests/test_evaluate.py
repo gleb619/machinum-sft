@@ -167,3 +167,14 @@ def test_as_json_prints_one_object(tmp_path: Path, capsys: pytest.CaptureFixture
     assert payload["cases"] == 1
     assert [gate["gate"] for gate in payload["gates"]][-1] == "schema_validity"
     assert payload["schema_validity"] == 1.0
+
+def test_thinking_chatter_is_caught() -> None:
+    """A small model that narrates its reasoning is chatter, even with no preamble."""
+    from msft.evaluate import _CHATTER_RE
+
+    for opening in (
+        "Thinking Process:\n1. Analyze the Request: the user wants a translation",
+        "Let me translate this properly.",
+        "The user wants the text normalised, so I will",
+    ):
+        assert _CHATTER_RE.match(opening), opening
