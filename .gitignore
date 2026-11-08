@@ -1,0 +1,54 @@
+# --- secrets and private host information: never commit ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+secrets/
+config/local.yaml
+config/local.*.yaml
+hosts.local.yaml
+ssh_config
+*.kubeconfig
+credentials.json
+id_rsa*
+known_hosts
+
+# --- training artifacts (large, machine-specific) ---
+data/
+datasets/
+out/
+runs/
+checkpoints/
+adapters/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.log
+*.jsonl
+!tests/fixtures/*.jsonl
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.uv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+
+# --- editors / OS ---
+.DS_Store
+.idea/
+.vscode/
+
+# --- experiment tracking ---
+wandb/
+mlruns/
