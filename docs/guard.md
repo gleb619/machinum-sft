@@ -41,7 +41,7 @@ was edited into something broken, a runner image that no longer resolves.
 | Flag | Effect |
 | --- | --- |
 | `--allow-dirty` | run on a dirty tree; the offending paths are listed either way |
-| `--json` | emit exactly one JSON object on stdout, all human output to stderr |
+| `--json` | emit exactly one JSON object on stdout for the run itself; every banner, hint and log tail goes to stderr. `--help` still prints usage to stdout, and the usage/config errors that precede the run exit before any object is written |
 | `--require-ci` | exit 4 when `wrkflw` is missing instead of skipping the CI steps |
 | `-h`, `--help` | usage |
 
@@ -50,7 +50,7 @@ was edited into something broken, a runner image that no longer resolves.
 | Code | Meaning |
 | --- | --- |
 | `0` | every required step passed — `GUARD OK` |
-| `1` | a step failed; the red banner names it and prints the last 40 lines |
+| `1` | a step failed; the red banner names it, and in `--json` mode the last 40 lines of that step are reprinted to stderr (banner mode already streamed them) |
 | `2` | usage error, not a git repository, or `ruff`/`pytest` missing |
 | `3` | the working tree is dirty and `--allow-dirty` was not passed |
 | `4` | `--require-ci` was passed but `wrkflw` is not installed |
@@ -63,7 +63,8 @@ release branch).
 ## The `--json` contract
 
 One object, one line, on stdout (wrapped below for readability). Nothing else is written to
-stdout in this mode:
+stdout by a run in this mode — usage errors and `--help` exit before the object is written,
+and every step's log goes to stderr or to the run directory:
 
 ```json
 {"steps": [{"name": "ruff", "cmd": ".venv/bin/ruff check .", "status": "ok", "seconds": 0.011},
@@ -148,31 +149,29 @@ output — enough for a traceback or a lint diff, short enough to stay readable.
 stays behind at the printed path (`…/msft-guard.XXXXXX/<step>.log`) whenever a step fails, and
 the directory is removed on success.
 
-Output is scrubbed before it is echoed: credentials embedded in URLs (`https://user:token@…`)
-and `token=`/`key=`/`password=` query parameters are masked. The guard never prints the git
-remote URL, never dumps the environment, and never echoes `.env`.
+Output is scrubbed on the paths that quote it back — the dirty-file list and the `--json`
+failure excerpt; in banner mode a failing step's output is streamed raw as it runs, which is
+what you want while watching a test suite. Credentials embedded in URLs
+(`https://user:token@…`) and `token=`/`key=`/`password=` query parameters are masked there.
+The guard never prints the git remote URL, never dumps the environment, and never echoes
+`.env`.
 
 ## Caveats
 
 **Emulation is not a container.** `--runtime emulation` executes the workflow's `run:` steps
 directly on this host, with this host's Python, network and filesystem. It is fast and needs
 no Docker, but it is not isolation: the `Install` step really does `pip install -e .[dev]`.
-`guard.sh` sets `PIP_TARGET` to a temporary directory for that step so the install cannot
-overwrite the dev venv's editable install (without it, your `python -m msft` ends up pointing
-at a deleted sandbox). Do not run the emulation against a workflow you do not trust.
+The CI steps therefore run with two pins: `$REPO_ROOT/.venv/bin` first on `PATH`, so the
+workflow's `python`/`pip` are the project venv rather than whatever the caller's shell had,
+and `PIP_TARGET` set to a temporary directory, so the install cannot overwrite that venv's
+editable install (without it, your `python -m msft` ends up pointing at a deleted sandbox).
+The install also leaves `src/machinum_sft.egg-info/` in the checkout — it is ignored, so the
+tree stays clean, but it is a write. Do not run the emulation against a workflow you do not
+trust.
 
-**wrkflw 0.8.0 drops gitignored files from its emulated checkout.** Its checkout emulation
-copies the tree while honouring `.gitignore`, and it does not honour `!` re-include patterns.
-This repository ignores `*.jsonl` and re-includes `tests/fixtures/*.jsonl`, so the emulated
-workspace arrives without those fixtures and `pytest` fails there while real CI (a real git
-checkout, which does honour the negation) passes. Symptom:
-
-```
-data input not found: …/.tmpXXXXXXXX/tests/fixtures/book_pairs.jsonl
-assert 3 == 17
-```
-
-Fix at the source of the ambiguity: `data/` and `out/` are already ignored wholesale, so the
-`*.jsonl` / `!tests/fixtures/*.jsonl` pair can be dropped from `.gitignore` and the fixtures
-are copied again. Until that lands, a red `ci-run` on an otherwise green `ruff`/`pytest` is
-this defect, not your code — check whether the failing tests all read `tests/fixtures/`.
+**wrkflw 0.8.0 is young.** The emulated checkout honours `.gitignore` but not its `!`
+re-includes, so a rule like `*.jsonl` plus `!tests/fixtures/*.jsonl` silently removes tracked
+fixtures and `pytest` fails inside the emulation while real CI passes. This repository hit
+exactly that and removed the pair ( `data/` and `out/` are ignored wholesale). If a future
+`.gitignore` reintroduces a negation, expect a red `ci-run` that is a wrkflw defect, not your
+code — compare `git ls-files tests/fixtures` with what the run sees before debugging further.

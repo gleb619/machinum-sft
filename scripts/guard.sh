@@ -101,7 +101,7 @@ STEP_STATUS=()
 STEP_SECS=()
 # Env assignments for the next step, space separated (word splitting is intended and
 # keeps this working on bash 3.2, where an empty array trips `set -u`).
-STEP_ENV=""
+STEP_ENV=()
 
 now_ms() {
     local ns
@@ -129,13 +129,11 @@ record_step() { # name cmd status seconds_ms
 }
 
 run_quiet() { # cmd logfile
-    # shellcheck disable=SC2086  # $STEP_ENV is a list of VAR=value assignments
-    env $STEP_ENV bash -c "$1" >>"$2" 2>&1
+    env "${STEP_ENV[@]}" bash -c "$1" >>"$2" 2>&1
 }
 
 run_stream() { # cmd logfile
-    # shellcheck disable=SC2086
-    env $STEP_ENV bash -c "$1" 2>&1 | tee -a "$2"
+    env "${STEP_ENV[@]}" bash -c "$1" 2>&1 | tee -a "$2"
 }
 
 run_step() { # name cmd -> exit status of cmd; appends to the step table
@@ -176,11 +174,6 @@ show_failure() { # name rc
         log "${DIM}--- end ---${RESET}"
     fi
     log "${RED}full log: ${log_file}${RESET}"
-    if grep -q 'data input not found' "$log_file" 2>/dev/null &&
-        grep -q 'tests/fixtures' "$log_file" 2>/dev/null; then
-        log "${YELLOW}hint: the emulated checkout dropped tests/fixtures/*.jsonl — wrkflw 0.8.0"
-        log "      does not honour .gitignore '!' re-includes. See docs/guard.md, Caveats.${RESET}"
-    fi
     CLEAN_WORK=0
 }
 
@@ -284,24 +277,31 @@ if [ "$rc" -ne 0 ]; then
     finish_fail 1
 fi
 
-if command -v wrkflw >/dev/null 2>&1; then
+if WRKFLW=$(pick_tool wrkflw); then
     rc=0
-    run_step "ci-validate" "wrkflw validate .github/workflows/ci.yml" || rc=$?
+    run_step "ci-validate" "$WRKFLW validate .github/workflows/ci.yml" || rc=$?
     if [ "$rc" -ne 0 ]; then
         show_failure "ci-validate" "$rc"
         finish_fail 1
     fi
-    # Emulation runs the workflow on this host, so its `pip install -e .` would
-    # overwrite the dev venv's editable install. PIP_TARGET sends it to a temp dir.
-    STEP_ENV="PIP_TARGET=$WORK_DIR/pip-target PIP_DISABLE_PIP_VERSION_CHECK=1"
+    # Emulation runs the workflow on this host. Two things must be pinned or the result
+    # depends on the caller's shell: PATH, so the workflow's `python`/`pip` are the project
+    # venv rather than whatever the login shell has; and PIP_TARGET, so its
+    # `pip install -e .` cannot overwrite the venv's editable install.
+    STEP_ENV=(
+        "PATH=$REPO_ROOT/.venv/bin:$PATH"
+        "PIP_TARGET=$WORK_DIR/pip-target"
+        "PIP_DISABLE_PIP_VERSION_CHECK=1"
+    )
     rc=0
-    run_step "ci-run" "wrkflw run --runtime emulation .github/workflows/ci.yml" || rc=$?
-    STEP_ENV=""
+    run_step "ci-run" "$WRKFLW run --runtime emulation .github/workflows/ci.yml" || rc=$?
+    STEP_ENV=()
     if [ "$rc" -ne 0 ]; then
         show_failure "ci-run" "$rc"
         finish_fail 1
     fi
 else
+    record_step "ci-validate" "wrkflw validate .github/workflows/ci.yml" skipped 0
     record_step "ci-run" "wrkflw run --runtime emulation .github/workflows/ci.yml" skipped 0
     log ""
     log "${YELLOW}SKIP ci: wrkflw is not on PATH, the GitHub workflow was NOT run locally${RESET}"
