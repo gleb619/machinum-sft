@@ -33,27 +33,26 @@ fi
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-# Gemma 4 chat format: <|turn>role … <turn|>. The worker never thinks — the pipeline wants
-# the reply only — so no <|think|> marker here.
+# The chat template is NOT written here by hand. A GGUF carries the tokenizer's own
+# chat_template in its metadata, and ollama renders that faithfully — a hand-written copy is
+# how you get a Qwen3.5 model prompted in Gemma's <|turn> format, which makes it fall back to
+# narrating its reasoning ("Thinking Process:") instead of answering. Override only for a
+# GGUF that lacks the metadata: TEMPLATE_FILE=/path/to/tpl.jinja.
 cat >"$WORK/Modelfile" <<EOF
 FROM /models/$(basename "$GGUF")
 
-PARAMETER num_ctx 8192
-PARAMETER temperature 0
+PARAMETER num_ctx ${NUM_CTX:-8192}
+PARAMETER temperature ${TEMPERATURE:-0}
 PARAMETER top_p 0.95
-PARAMETER top_k 64
 PARAMETER repeat_penalty 1.05
-
-TEMPLATE """{{ if .System }}<bos><|turn>system
-{{ .System }}<turn|>
-{{ end }}<|turn>user
-{{ .Prompt }}<turn|>
-<|turn>model
-"""
-
-PARAMETER stop "<turn|>"
-PARAMETER stop "<|turn>"
 EOF
+if [ -n "${TEMPLATE_FILE:-}" ]; then
+    {
+        echo "TEMPLATE \"\"\""
+        cat "$TEMPLATE_FILE"
+        echo "\"\"\""
+    } >>"$WORK/Modelfile"
+fi
 
 echo "== mode: $MODE =="
 cat "$WORK/Modelfile"
