@@ -36,6 +36,23 @@ python -m msft doctor
 - **Tests never touch the network or a GPU.**
 
 See `CONTRACT.md` for the module interfaces, and `docs/model-choice.md` for the base-model
-decision this repo follows.
+decision this repo follows. `docs/data-flow.md` explains how the pipeline's dataset tools
+hand JSONL to `msft data build`.
+
+## Verified run (2026-11-08)
+
+End-to-end on a 16 GB RTX 4060 Ti box, from a clean Python 3.12 venv:
+
+```
+msft data build  →  63 records in, 52 out, 2 898 approx tokens, 51 train / 1 val
+msft train       →  42 rows, effective batch 4, 11 steps, 1 epoch
+                    train_loss 1.919 · eval_loss 1.144 · 64.6 s on GPU0 (1.9 GB VRAM)
+                    adapter_model.safetensors 25.6 MB
+```
+
+The smoke config (`configs/smoke-qwen3.5-0.8b.yaml`) uses the same code path as the real
+configs — Unsloth `FastLanguageModel` → PEFT → TRL `SFTTrainer` — so a green smoke means the
+stack, the generated script and the artifact layout all work. Size and quality claims need
+`configs/gemma-4-12b-qlora.yaml` or `configs/qwen3.5-4b-lora.yaml`, not the smoke.
 
 MIT licensed.

@@ -72,9 +72,12 @@ def vram_class(cfg: RunConfig, *, target_gb: float = 16.0) -> dict[str, Any]:
     else:
         klass = "exceeds"
     note = (
-        f"4-bit QLoRA, r={cfg.lora.r}, seq={cfg.train.max_seq_length}, "
+        f"{'4-bit QLoRA' if cfg.model.load_in_4bit else 'bf16 LoRA'}, r={cfg.lora.r}, "
+        f"seq={cfg.train.max_seq_length}, "
         f"batch={cfg.train.per_device_batch}x{cfg.train.grad_accum}"
     )
+    if cfg.model.load_in_4bit and cfg.model.id.lower().startswith("qwen/qwen3.5"):
+        note += "; Unsloth discourages QLoRA on Qwen3.5 — prefer bf16 LoRA (4B) or Gemma 4"
     if klass != "fits":
         note += "; drop max_seq_length or r if the run OOMs"
     return {

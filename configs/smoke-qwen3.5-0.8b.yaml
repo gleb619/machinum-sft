@@ -1,0 +1,60 @@
+# Smoke test: prove the training script runs end to end on a small GPU box.
+#
+# Same code path as the real configs (Unsloth FastLanguageModel → PEFT → TRL SFTTrainer),
+# but a 0.8 B model and 1 k sequences so the whole loop finishes in minutes and the model
+# download is ~1.6 GB. Use it to verify the stack, not to judge quality.
+base_dir: ".."
+name: smoke-qwen3.5-0.8b
+
+model:
+  id: Qwen/Qwen3.5-0.8B
+  revision: null
+  load_in_4bit: false        # bf16 LoRA: 3 GB documented, keeps the smoke fast
+  dtype: bfloat16
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  modules_to_save: []
+  use_rslora: false
+
+train:
+  max_seq_length: 1024
+  per_device_batch: 1
+  grad_accum: 4
+  lr: 2.0e-4
+  epochs: 1.0
+  warmup_steps: 2
+  weight_decay: 0.05
+  max_grad_norm: 1.0
+  scheduler: cosine
+  optim: adamw_8bit
+  seed: 42
+  packing: false
+  completion_only_loss: true
+  save_steps: 1000
+  eval_steps: 1000
+
+data:
+  input: data/raw
+  val_ratio: 0.1
+  dedupe: true
+  min_chars: 40
+  max_chars: 8000
+  max_tokens: null
+
+quantize:
+  method: q4_k_s
+  imatrix: false
+  output: out-smoke/model.gguf
+
+output_dir: out-smoke
