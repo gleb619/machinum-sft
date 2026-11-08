@@ -119,6 +119,35 @@ def main() -> int:
     model.save_pretrained_merged(str(MERGED_DIR), tokenizer, save_method=SAVE_METHOD)
     tokenizer.save_pretrained(str(MERGED_DIR))
 
+    # The saved tokenizer_config can name a class that the installed transformers does not
+    # export (e.g. Qwen3_5Tokenizer), or carry extra_special_tokens as a list where newer
+    # transformers expects a mapping. Both break `convert_hf_to_gguf.py` later, so normalise
+    # the config to what actually loaded, and prove it loads before declaring success.
+    tok_cfg_path = MERGED_DIR / "tokenizer_config.json"
+    if tok_cfg_path.is_file():
+        tok_cfg = json.loads(tok_cfg_path.read_text(encoding="utf-8"))
+        actual = type(tokenizer).__name__
+        if tok_cfg.get("tokenizer_class") != actual:
+            print(f"tokenizer_config: {tok_cfg.get('tokenizer_class')} -> {actual}")
+            tok_cfg["tokenizer_class"] = actual
+        if isinstance(tok_cfg.get("extra_special_tokens"), list):
+            tok_cfg["extra_special_tokens"] = {
+                str(i): token for i, token in enumerate(tok_cfg["extra_special_tokens"])
+            }
+        tok_cfg_path.write_text(json.dumps(tok_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    from transformers import AutoTokenizer
+
+    try:
+        AutoTokenizer.from_pretrained(str(MERGED_DIR))
+    except Exception as exc:  # noqa: BLE001 - any failure here breaks the GGUF step
+        print(
+            "merge: the merged tokenizer does not load; copy the base tokenizer files over it:"
+            f" {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
     meta = {
         "model": declared or BASE_MODEL,
         "revision": REVISION,
