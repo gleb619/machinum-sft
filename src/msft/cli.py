@@ -460,6 +460,7 @@ def _cmd_worker_status(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     age = heartbeat.get("age_s")
     lines = [
         f"worker  {state.get('dir')}",
+        f"{state.get('gpu', 'GPU: unknown')}",
         f"state   {heartbeat.get('state', 'no heartbeat')}"
         + (f" (updated {age}s ago)" if isinstance(age, (int, float)) else ""),
         f"queue   pending={counts.get('pending', 0)} running={counts.get('running', 0)}"

@@ -172,6 +172,7 @@ Adapter: $ADAPTER_DIR
 from __future__ import annotations
 
 import json
+import os
 import platform
 import sys
 import time
@@ -239,6 +240,26 @@ def gpu_name() -> str | None:
 def main() -> int:
     """Load the base model, train the adapter, save it next to run_meta.json."""
     started = time.time()
+
+    # --- device guard -------------------------------------------------------------
+    # A CPU run is never what anyone wants here: the same 0.8B job takes minutes on a GPU
+    # and days on a CPU. Fail loudly instead of looking "slow but fine".
+    if not torch.cuda.is_available():
+        for line in (
+            "!" * 78,
+            "!! msft: NO CUDA DEVICE VISIBLE - refusing to train on the CPU.",
+            "!! A 4B LoRA that takes ~3 min on a GPU takes days on a CPU; a silent fallback",
+            "!! is almost always a broken container or driver, not a small job.",
+            "!! Check: nvidia-smi, that the container runs with --gpus all,",
+            "!! and that CUDA_VISIBLE_DEVICES is not empty.",
+            "!! Override only if you truly mean it: MSFT_ALLOW_CPU=1",
+            "!" * 78,
+        ):
+            print(line, file=sys.stderr, flush=True)
+        if os.environ.get("MSFT_ALLOW_CPU") != "1":
+            return fail("no CUDA device; set MSFT_ALLOW_CPU=1 to force a CPU run")
+        print("!! msft: MSFT_ALLOW_CPU=1 - continuing on the CPU, expect hours.", flush=True)
+
     if trl_version() and trl_version() < MIN_TRL:
         return fail(f"trl {trl.__version__} is too old; completion_only_loss needs >= 0.16")
 
@@ -286,6 +307,26 @@ def main() -> int:
         bias="none",
         use_gradient_checkpointing="unsloth",
         random_state=$SEED,
+    )
+
+    # The model can still land on the CPU even with CUDA available (device_map misread,
+    # a container that exposes the driver but not the device). Say where it actually is.
+    _device = next(model.parameters()).device
+    if _device.type != "cuda":
+        for line in (
+            "!" * 78,
+            f"!! msft: the model is on {_device}, not a GPU - aborting, not burning CPU time.",
+            "!! This is a configuration bug, not a slow machine: check nvidia-smi,",
+            "!! the --gpus all flag, and CUDA_VISIBLE_DEVICES.",
+            "!" * 78,
+        ):
+            print(line, file=sys.stderr, flush=True)
+        return fail(f"model placed on {_device}; expected cuda")
+    _props = torch.cuda.get_device_properties(_device)
+    print(
+        f"[msft] training on {_device} - {torch.cuda.get_device_name(_device)}"
+        f" ({_props.total_memory / 2**30:.1f} GiB)",
+        flush=True,
     )
 
     args = SFTConfig(

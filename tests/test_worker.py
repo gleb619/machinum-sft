@@ -123,3 +123,29 @@ def test_reset_clears_queue_keeps_logs(tmp_path: Path) -> None:
     assert removed >= 1
     assert worker.status(tmp_path)["counts"]["pending"] == 0
     assert (root / "logs" / "x.log").exists()
+
+def test_gpu_note_reports_the_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Proc:
+        returncode = 0
+        stdout = "0, NVIDIA GeForce RTX 4060 Ti, 16380 MiB\n"
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(worker.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(worker.subprocess, "run", lambda *a, **k: Proc())
+    assert worker.gpu_note().startswith("GPU: 0, NVIDIA GeForce RTX 4060 Ti")
+
+
+def test_gpu_note_warns_when_there_is_no_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(worker.shutil, "which", lambda name: None)
+    assert worker.gpu_note().startswith("WARNING: nvidia-smi not found")
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(worker.shutil, "which", lambda name: "/usr/bin/nvidia-smi")
+    assert "CUDA_VISIBLE_DEVICES is empty" in worker.gpu_note()
+
+
+def test_status_carries_the_gpu_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker, "gpu_note", lambda: "GPU: 0, test card")
+    worker.signal(tmp_path, "doctor", job_id="g")
+    assert worker.status(tmp_path)["gpu"] == "GPU: 0, test card"

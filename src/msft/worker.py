@@ -179,6 +179,35 @@ def run_job(
     return job
 
 
+def gpu_note() -> str:
+    """A one-line, console-visible statement about where jobs will actually run.
+
+    Silence is the bug here: a worker that quietly falls back to the CPU looks healthy while
+    a 3-minute job runs for days. Every serve start prints this line, and `status` carries it.
+    """
+    if os.environ.get("CUDA_VISIBLE_DEVICES") == "":
+        return (
+            "WARNING: CUDA_VISIBLE_DEVICES is empty — jobs would run on the CPU "
+            "(refused unless MSFT_ALLOW_CPU=1)"
+        )
+    if shutil.which("nvidia-smi") is None:
+        return "WARNING: nvidia-smi not found — no GPU here; training jobs will refuse to start"
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"WARNING: cannot query the GPU ({exc}); training jobs will refuse to start"
+    gpus = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if proc.returncode != 0 or not gpus:
+        return "WARNING: nvidia-smi reported no GPU; training jobs will refuse to start"
+    return "GPU: " + " | ".join(gpus)
+
+
 def _install_stop_handler() -> Any:
     """Turn SIGTERM/SIGINT into a clean loop exit so a job is not left 'running'."""
     stop = {"flag": False}
@@ -204,6 +233,7 @@ def serve(
     stop = _install_stop_handler()
     _heartbeat(root, "idle")
     print(f"worker: serving {root} (interval {interval:g}s)", flush=True)
+    print(f"worker: {gpu_note()}", flush=True)
     while not stop["flag"]:
         job_file = _next_job(root)
         if job_file is None:
@@ -261,6 +291,7 @@ def status(directory: str | Path) -> dict[str, Any]:
         "pending": pending,
         "running": running,
         "done": done[-10:],
+        "gpu": gpu_note(),
         "counts": {
             "pending": len(pending),
             "running": len(running),
