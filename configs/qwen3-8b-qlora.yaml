@@ -1,0 +1,56 @@
+base_dir: ".."
+name: qwen3-8b-qlora
+
+model:
+  id: Qwen/Qwen3-8B
+  revision: null
+  load_in_4bit: true
+  dtype: bfloat16
+
+lora:
+  r: 32
+  alpha: 16
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  modules_to_save:
+    - lm_head
+  use_rslora: false
+
+train:
+  max_seq_length: 4096
+  per_device_batch: 1
+  grad_accum: 32
+  lr: 5.0e-5
+  epochs: 2.0
+  warmup_steps: 8
+  weight_decay: 0.05
+  max_grad_norm: 1.0
+  scheduler: cosine
+  optim: adamw_8bit
+  seed: 42
+  packing: false
+  completion_only_loss: true
+  save_steps: 20
+  eval_steps: 20
+
+data:
+  input: data/raw
+  val_ratio: 0.03
+  dedupe: true
+  min_chars: 50
+  max_chars: 8000
+  max_tokens: null
+
+quantize:
+  method: q4_k_m
+  imatrix: false
+  output: out/model.gguf
+
+output_dir: out

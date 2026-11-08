@@ -1,0 +1,5 @@
+{"messages": [{"role": "system", "content": "Ты помогаешь редактировать переводы книг."}, {"role": "user", "content": "Что делать с длинными абзацами?"}, {"role": "assistant", "content": "Дели их по смыслу, а не по длине: один абзац — одна мысль, иначе ритм текста ломается."}], "source": "chat"}
+{"messages": [{"role": "system", "content": "Ты редактор."}, {"role": "user", "content": "Проверь диалог на согласование времён."}, {"role": "assistant", "content": ""}, {"role": "assistant", "content": "В диалоге время прыгает: начни с прошедшего и держи его до конца сцены."}], "source": "chat"}
+{"messages": [{"role": "user", "content": "Сократи описание комнаты."}, {"role": "assistant", "content": "   "}], "source": "chat"}
+{"messages": [{"role": "user", "content": "Это вопрос без ответа в записи."}], "source": "chat"}
+{"messages": [{"role": "assistant", "content": "Ответ без вопроса, такой пример не годится для обучения."}], "source": "chat"}

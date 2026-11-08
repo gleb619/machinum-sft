@@ -144,13 +144,18 @@ def load_config(path: str | Path) -> RunConfig:
     cfg = RunConfig(
         name=str(data.get("name") or p.stem),
         output_dir=str(data.get("output_dir") or "out"),
-        base_dir=str(data.get("base_dir") or p.parent),
+        base_dir=str(data.get("base_dir") or "."),
         model=_section(data, "model", ModelCfg),
         lora=_section(data, "lora", LoraCfg),
         train=_section(data, "train", TrainCfg),
         data=_section(data, "data", DataCfg),
         quantize=_section(data, "quantize", QuantCfg),
     )
+    # A relative base_dir is resolved against the config file, so a config in
+    # configs/ can say ".." and mean the repo root from any working directory.
+    base = Path(cfg.base_dir)
+    if not base.is_absolute():
+        cfg.base_dir = str((p.parent / base).resolve())
     validate_config(cfg)
     return cfg
 
