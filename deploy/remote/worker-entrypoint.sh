@@ -12,10 +12,15 @@ fi
 cd "$REPO"
 
 # Install the package itself in editable mode the first time (and after dependency changes).
-# `--no-deps` keeps it instant: torch/unsloth live in the image.
+# `--no-deps` keeps it instant: torch/unsloth live in the image. pip may be absent in a uv
+# venv, so prefer uv when it exists.
 if ! python -c "import msft" 2>/dev/null; then
     echo "worker-entrypoint: installing msft from $REPO"
-    pip install --no-deps -e . >/dev/null
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install --python "$(command -v python)" --no-deps -e "$REPO" >/dev/null
+    else
+        python -m pip install --no-deps -e "$REPO" >/dev/null
+    fi
 fi
 
 mkdir -p "$REPO/.worker" "${HF_HOME:-/hf}"
