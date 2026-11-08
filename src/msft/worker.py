@@ -127,8 +127,11 @@ def _heartbeat(root: Path, state: str, job: str | None = None) -> None:
 
 
 def build_command(job: Job, argv0: list[str]) -> list[str]:
-    """`python -m msft <kind> [--config ...] --execute` plus any extra args."""
-    cmd = [*argv0, "-m", "msft", job.kind]
+    """`python -m msft <kind> [--config ...] --execute` plus any extra args.
+
+    `data` needs its `build` action; the other kinds are leaves of the CLI.
+    """
+    cmd = [*argv0, "-m", "msft", *([job.kind, "build"] if job.kind == "data" else [job.kind])]
     if job.config:
         cmd += ["--config", job.config]
     cmd += list(job.extra_args)
