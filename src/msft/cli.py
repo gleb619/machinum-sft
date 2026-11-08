@@ -350,6 +350,153 @@ def _common_flags() -> argparse.ArgumentParser:
     return common
 
 
+def _cmd_remote_deploy(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Pull the pushed branch on the box and bring the worker container up."""
+    deploy = _impl("msft.deploy")
+    spec = deploy.load_spec()
+    pulled = _jsonable(deploy.pull(spec, execute=bool(args.execute)))
+    up = _jsonable(deploy.up(spec, execute=bool(args.execute), build=not args.no_build))
+    payload = {"spec": deploy.spec_json(spec), "pull": pulled, "up": up}
+    text = "\n".join(
+        [
+            f"remote {deploy.spec_json(spec)['host']}  {spec.repo}",
+            f"pull   {'rc=' + str(pulled.get('returncode')) if pulled.get('executed') else 'plan'}",
+            f"up     {'rc=' + str(up.get('returncode')) if up.get('executed') else 'plan'}",
+        ]
+    )
+    _emit(args.as_json, payload, text)
+    return EXIT_OK
+
+
+def _cmd_remote_down(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Stop the worker container on the box."""
+    deploy = _impl("msft.deploy")
+    spec = deploy.load_spec()
+    result = _jsonable(deploy.down(spec, execute=bool(args.execute)))
+    _emit(args.as_json, result, f"down rc={result.get('returncode', 'plan')}")
+    return EXIT_OK
+
+
+def _cmd_remote_signal(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Queue a job on the box through the running container."""
+    deploy = _impl("msft.deploy")
+    spec = deploy.load_spec()
+    result = _jsonable(
+        deploy.signal(
+            spec,
+            args.kind,
+            config=_config_arg(cfg, args),
+            job_id=args.job_id,
+            execute=bool(args.execute),
+        )
+    )
+    _emit(args.as_json, result, f"signal {args.kind} -> rc={result.get('returncode', 'plan')}")
+    return EXIT_OK
+
+
+def _cmd_remote_status(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Container health and the worker queue from the box."""
+    deploy = _impl("msft.deploy")
+    spec = deploy.load_spec()
+    result = _jsonable(deploy.status(spec, execute=bool(args.execute)))
+    _emit(args.as_json, result, result.get("stdout") or "plan")
+    return EXIT_OK
+
+
+def _worker_dir(cfg: RunConfig | None, explicit: str | None) -> str:
+    """Worker directory: --dir, else MSFT_WORKER_DIR, else <repo>/.worker."""
+    if explicit:
+        return explicit
+    env = os.environ.get("MSFT_WORKER_DIR")
+    if env:
+        return env
+    if cfg is not None:
+        return str(Path(cfg.base_dir) / ".worker")
+    return ".worker"
+
+
+def _config_arg(cfg: RunConfig | None, args: argparse.Namespace) -> str | None:
+    """The config path to hand to the worker (the file the user actually passed)."""
+    explicit = getattr(args, "config", None)
+    if explicit:
+        return str(explicit)
+    if cfg is not None:
+        return str(Path(cfg.base_dir) / "configs" / f"{cfg.name}.yaml")
+    return None
+
+
+def _cmd_worker_serve(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Serve the job queue: one job at a time, forever (or once)."""
+    worker = _impl("msft.worker")
+    directory = _worker_dir(cfg, args.dir)
+    if args.as_json:
+        _emit(True, {"dir": directory, "interval": args.interval, "once": bool(args.once)}, "")
+        return EXIT_OK
+    return int(worker.serve(directory, interval=args.interval, once=bool(args.once)))
+
+
+def _cmd_worker_signal(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Queue a job for the worker."""
+    worker = _impl("msft.worker")
+    directory = _worker_dir(cfg, args.dir)
+    job_id = worker.signal(
+        directory,
+        args.kind,
+        job_id=args.job_id,
+        config=_config_arg(cfg, args),
+        extra_args=args.extra_args,
+    )
+    _emit(args.as_json, {"id": job_id, "dir": directory}, f"queued {job_id} in {directory}")
+    return EXIT_OK
+
+
+def _cmd_worker_status(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Print the queue state and the heartbeat age."""
+    worker = _impl("msft.worker")
+    directory = _worker_dir(cfg, args.dir)
+    state = _jsonable(worker.status(directory))
+    heartbeat = state.get("heartbeat") or {}
+    counts = state.get("counts") or {}
+    age = heartbeat.get("age_s")
+    lines = [
+        f"worker  {state.get('dir')}",
+        f"state   {heartbeat.get('state', 'no heartbeat')}"
+        + (f" (updated {age}s ago)" if isinstance(age, (int, float)) else ""),
+        f"queue   pending={counts.get('pending', 0)} running={counts.get('running', 0)}"
+        f" done={counts.get('done', 0)} failed={counts.get('failed', 0)}",
+    ]
+    for job in state.get("running") or []:
+        lines.append(f"running {job.get('id')} {job.get('kind')} since {job.get('started')}")
+    for job in (state.get("done") or [])[-3:]:
+        lines.append(
+            f"{job.get('status', '?'):<6} {job.get('id')} rc={job.get('returncode')}"
+            f" {job.get('duration_s')}s"
+        )
+    _emit(args.as_json, state, "\n".join(lines))
+    return EXIT_OK
+
+
+def _cmd_worker_log(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Tail one job log."""
+    worker = _impl("msft.worker")
+    directory = _worker_dir(cfg, args.dir)
+    text = worker.tail_log(directory, args.job_id, lines=args.lines)
+    if args.as_json:
+        _emit(True, {"dir": directory, "job": args.job_id, "tail": text}, text)
+    else:
+        print(text, end="" if text.endswith("\n") else "\n")
+    return EXIT_OK
+
+
+def _cmd_worker_reset(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Clear inbox/running/done, keeping the logs."""
+    worker = _impl("msft.worker")
+    directory = _worker_dir(cfg, args.dir)
+    removed = worker.reset(directory)
+    _emit(args.as_json, {"dir": directory, "removed": removed}, f"cleared {removed} entries")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argparse tree; every leaf sets a `(cfg, args) -> int` handler."""
     common = _common_flags()
@@ -411,11 +558,59 @@ def build_parser() -> argparse.ArgumentParser:
         "run", parents=[common], help="run the configured pipeline remotely"
     )
     p_run.set_defaults(handler=_cmd_remote_run)
+    p_deploy = remote_sub.add_parser(
+        "deploy", parents=[common], help="pull on the box and bring the worker container up"
+    )
+    p_deploy.add_argument("--no-build", action="store_true", help="skip the image rebuild")
+    p_deploy.set_defaults(handler=_cmd_remote_deploy)
+    p_down = remote_sub.add_parser("down", parents=[common], help="stop the worker container")
+    p_down.set_defaults(handler=_cmd_remote_down)
+    p_signal = remote_sub.add_parser(
+        "signal", parents=[common], help="queue a job on the box (train|merge|quantize|eval)"
+    )
+    p_signal.add_argument("kind")
+    p_signal.add_argument("--id", dest="job_id", default=None)
+    p_signal.set_defaults(handler=_cmd_remote_signal)
+    p_rstatus = remote_sub.add_parser(
+        "status", parents=[common], help="container health plus the worker queue"
+    )
+    p_rstatus.set_defaults(handler=_cmd_remote_status)
 
     p_config = sub.add_parser("config", parents=[common], help="inspect the effective config")
     config_sub = p_config.add_subparsers(dest="config_command", metavar="ACTION", required=True)
     p_show = config_sub.add_parser("show", parents=[common], help="print the resolved config")
     p_show.set_defaults(handler=_cmd_config_show)
+
+    p_worker = sub.add_parser(
+        "worker", parents=[common], help="job queue served on the GPU box (signal / serve / status)"
+    )
+    worker_sub = p_worker.add_subparsers(dest="worker_command", metavar="ACTION", required=True)
+    p_w_serve = worker_sub.add_parser("serve", parents=[common], help="serve the job queue")
+    p_w_serve.add_argument("--dir", metavar="PATH", default=None, help="worker directory")
+    p_w_serve.add_argument("--interval", type=float, default=15.0, help="poll interval, seconds")
+    p_w_serve.add_argument("--once", action="store_true", help="run one job and exit")
+    p_w_serve.set_defaults(handler=_cmd_worker_serve)
+    p_w_signal = worker_sub.add_parser("signal", parents=[common], help="queue a job")
+    p_w_signal.add_argument("kind", help="train | merge | quantize | eval | data | doctor")
+    p_w_signal.add_argument("--dir", metavar="PATH", default=None, help="worker directory")
+    p_w_signal.add_argument(
+        "--id", dest="job_id", default=None, help="job id (default: time-based)"
+    )
+    p_w_signal.add_argument(
+        "--arg", dest="extra_args", action="append", default=[], help="extra CLI arg (repeatable)"
+    )
+    p_w_signal.set_defaults(handler=_cmd_worker_signal)
+    p_w_status = worker_sub.add_parser("status", parents=[common], help="queue and heartbeat")
+    p_w_status.add_argument("--dir", metavar="PATH", default=None, help="worker directory")
+    p_w_status.set_defaults(handler=_cmd_worker_status)
+    p_w_log = worker_sub.add_parser("log", parents=[common], help="tail a job log")
+    p_w_log.add_argument("--dir", metavar="PATH", default=None, help="worker directory")
+    p_w_log.add_argument("--id", dest="job_id", default=None, help="job id (default: latest)")
+    p_w_log.add_argument("--lines", type=int, default=40)
+    p_w_log.set_defaults(handler=_cmd_worker_log)
+    p_w_reset = worker_sub.add_parser("reset", parents=[common], help="clear the queue, keep logs")
+    p_w_reset.add_argument("--dir", metavar="PATH", default=None, help="worker directory")
+    p_w_reset.set_defaults(handler=_cmd_worker_reset)
 
     return parser
 

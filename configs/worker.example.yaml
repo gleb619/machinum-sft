@@ -1,0 +1,20 @@
+# Copy to configs/worker.local.yaml — that file is git-ignored and holds the real host.
+# Nothing here is secret except the host, which is why it stays out of the repo.
+
+# ssh target of the GPU box (user@host). Leave empty to use MSFT_REMOTE_HOST.
+host: ""
+
+# Path of the repo on the box, relative to $HOME. The container bind-mounts this.
+repo_dir: "WORKSPACE/machinum-sft"
+
+# Compose file inside the repo.
+compose_file: "deploy/remote/docker-compose.yml"
+
+# Container name used for `docker exec` (queue signalling and status).
+container: "msft-worker"
+
+# Optional: HF cache on the host, mounted at /hf inside the container.
+# hf_cache: "~/.cache/huggingface"
+
+# Optional: worker queue directory inside the repo mount.
+# worker_dir: "/workspace/.worker"

@@ -52,3 +52,8 @@ dist/
 # --- experiment tracking ---
 wandb/
 mlruns/
+# --- worker / remote deployment: host information stays local ---
+configs/worker.local.yaml
+configs/*.local.yaml
+worker.local.yaml
+.worker/
