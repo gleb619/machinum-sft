@@ -1,0 +1,60 @@
+# Qwen3.5 0.8B — the smallest member of the family.
+#
+# Purpose: a fast, honest end-to-end artifact (train → merge → GGUF → ollama) when the card
+# or the network cannot carry a 4B/12B run. Same tokenizer and chat template as the bigger
+# Qwen3.5 models, so the data and the pipeline transfer unchanged; only quality differs.
+base_dir: ".."
+name: qwen3.5-0.8b-lora
+
+model:
+  id: Qwen/Qwen3.5-0.8B
+  revision: null
+  load_in_4bit: false
+  dtype: bfloat16
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  modules_to_save: []
+  use_rslora: false
+
+train:
+  max_seq_length: 4096
+  per_device_batch: 1
+  grad_accum: 8
+  lr: 1.0e-4
+  epochs: 3.0
+  warmup_steps: 4
+  weight_decay: 0.05
+  max_grad_norm: 1.0
+  scheduler: cosine
+  optim: adamw_8bit
+  seed: 42
+  packing: false
+  completion_only_loss: true
+  save_steps: 50
+  eval_steps: 50
+
+data:
+  input: data/raw
+  val_ratio: 0.05
+  dedupe: true
+  min_chars: 40
+  max_chars: 8000
+  max_tokens: null
+
+quantize:
+  method: q4_k_s
+  imatrix: false
+  output: out/model-0.8b.gguf
+
+output_dir: out
