@@ -21,6 +21,8 @@ services:
       PYTHONUNBUFFERED: "1"
       MSFT_WORKER_DIR: /workspace/.worker
       WANDB_MODE: offline
+      # llama.cpp is built into the image at /opt/llama.cpp (llama-quantize + convert script)
+      LLAMA_CPP_DIR: /opt/llama.cpp
     volumes:
       - ${MSFT_REPO:-../..}:/workspace
       - ${HF_CACHE:-~/.cache/huggingface}:/hf
