@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/root/.local/bin:$PATH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git python3.12 python3.12-venv python3.12-dev \
+        ca-certificates curl git cmake python3.12 python3.12-venv python3.12-dev \
         build-essential libgomp1 tini \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
@@ -27,10 +27,22 @@ RUN uv venv --python 3.12 /opt/venv \
     && uv pip install --index-url https://download.pytorch.org/whl/cu128 torch \
     && uv pip install --index-url https://download.pytorch.org/whl/cu128 --no-deps torchvision==0.26.0 \
     && uv pip install unsloth trl peft datasets accelerate bitsandbytes pyyaml \
-    && python -c "import torch, torchvision; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+    && uv pip install "transformers>=5.2.0" \
+    && python -c "import torch, torchvision; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())" \
+    && python -c "import transformers; assert tuple(int(x) for x in transformers.__version__.split('.')[:2]) >= (5, 2), transformers.__version__"
+
+# llama.cpp lives in the image, not in the container's writable layer: a `docker compose up`
+# after any compose edit recreates the container and would otherwise throw away the build.
+# Same reasoning as transformers above — anything a run needs must be in the image.
+RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /opt/llama.cpp \
+    && cmake -S /opt/llama.cpp -B /opt/llama.cpp/build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /opt/llama.cpp/build --config Release -j "$(nproc)" --target llama-quantize \
+    && . /opt/venv/bin/activate \
+    && uv pip install -r /opt/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
 
 ENV PATH=/opt/venv/bin:$PATH \
-    VIRTUAL_ENV=/opt/venv
+    VIRTUAL_ENV=/opt/venv \
+    LLAMA_CPP_DIR=/opt/llama.cpp
 
 RUN pip install --no-cache-dir "huggingface_hub[cli]" || true
 
