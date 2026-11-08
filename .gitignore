@@ -28,8 +28,7 @@ adapters/
 *.pt
 *.pth
 *.log
-*.jsonl
-!tests/fixtures/*.jsonl
+*.pt
 
 # --- python ---
 __pycache__/
