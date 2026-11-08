@@ -68,6 +68,8 @@ compose healthcheck reads.
 ## Verified run (2026-11-08)
 
 End-to-end on a 16 GB RTX 4060 Ti box, from a clean Python 3.12 venv:
+
+```
 msft data build  →  63 records in, 52 out, 2 898 approx tokens, 51 train / 1 val
 msft train       →  42 rows, effective batch 4, 11 steps, 1 epoch
                     train_loss 1.919 · eval_loss 1.144 · 64.6 s on GPU0 (1.9 GB VRAM)
