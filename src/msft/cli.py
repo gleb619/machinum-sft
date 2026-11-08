@@ -204,9 +204,27 @@ def _model_stage(module: str, title: str, cfg: RunConfig | None, args: argparse.
         result = _jsonable(_func(stage, "run")(config, execute=True))
         _emit(args.as_json, result, _render(title, result))
         return EXIT_OK
-    plan = _jsonable(_func(stage, "plan")(config))
+    # Dry run: a missing external tool (llama.cpp, a merged adapter) is a warning on the
+    # plan, not an error — the whole point is to see what would run on this machine.
+    try:
+        plan = _jsonable(_func(stage, "plan")(config))
+    except MsftError as exc:
+        plan = _jsonable(_func(stage, "plan")(config, require_tools=False)) if _accepts_kwarg(
+            stage, "plan", "require_tools"
+        ) else {"error": redact(str(exc))}
     _emit(args.as_json, plan, _render(f"{title} plan", plan))
     return EXIT_OK
+
+
+def _accepts_kwarg(module: Any, func_name: str, kwarg: str) -> bool:
+    """True when the callable takes `kwarg`; used to degrade gracefully on dry runs."""
+    import inspect
+
+    try:
+        signature = inspect.signature(_func(module, func_name))
+    except (TypeError, ValueError):  # pragma: no cover - builtins
+        return False
+    return kwarg in signature.parameters
 
 
 def _cmd_train(cfg: RunConfig | None, args: argparse.Namespace) -> int:
@@ -248,12 +266,13 @@ def _cmd_remote_preflight(cfg: RunConfig | None, args: argparse.Namespace) -> in
     """Check the remote host over ssh before syncing or training."""
     remote = _impl("msft.remote")
     host = _remote_host()
+    display = getattr(remote, "mask_host", redact)(host)
     checks = _jsonable(_func(remote, "preflight")(host, execute=bool(args.execute)))
-    payload = {"host": redact(host), "checks": checks}
+    payload = {"host": display, "checks": checks}
     text = "\n".join(
         f"{row.get('status', '?'):<4} {row.get('name')}: {row.get('detail')}" for row in checks
     )
-    _emit(args.as_json, payload, f"remote {redact(host)}:\n{text}")
+    _emit(args.as_json, payload, f"remote {display}:\n{text}")
     return EXIT_OK
 
 
