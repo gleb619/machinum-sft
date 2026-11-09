@@ -128,6 +128,17 @@ are trained alongside the translation — every adapter so far was built this wa
 for every run now, so this cannot regress silently. Loss magnitudes from those runs are therefore
 not comparable with completion-only runs.
 
+After the own-collator fix (same command, commit `e6398c7`):
+
+```
+[msft] loss-mask: real_tokens=180 labeled=73 masked_leading=107 (expected prompt len 107)
+[msft] loss-mask: VERDICT COMPLETION-ONLY — only the assistant reply is trained
+```
+
+`masked_leading` equals the expected prompt length and the first labeled token is the Russian reply,
+so the boundary is right. The 2 000-step 4B adapter was trained the old way; any comparison against
+it is a comparison against a model that also learned to reproduce its own instructions.
+
 **A stale `packages/core/dist` fabricates typecheck errors.** `@mt/tools` resolves `@mt/core`
 through `dist/index.d.ts`, and the root `npx tsc --noEmit` does not build dependencies, so it
 reported 0 errors while `tsc -p packages/tools/tsconfig.json` reported 57 — every one of them a
