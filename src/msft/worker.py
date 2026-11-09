@@ -19,6 +19,7 @@ caller (or by the container's entrypoint), never by the worker itself.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -45,9 +46,12 @@ FAILED = "failed"
 HEARTBEAT_INTERVAL_S = 30.0
 STOP_POLL_S = 1.0
 STOP_GRACE_S = 30.0
+MAX_TIMEOUT_S = 2_592_000
 INTERRUPTED_ERROR = "interrupted (worker restarted)"
 
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+_DURATION_RE = re.compile(r"^([0-9]+)([smhd]?)$")
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 
 
 def _now() -> str:
@@ -62,6 +66,31 @@ def _validate_id(ident: str) -> str:
             "(at most 80 characters, starting with a letter or digit)"
         )
     return ident
+
+
+def parse_duration(text: str) -> int:
+    """Parse `90`, `90s`, `45m`, `2h` or `1d` into seconds; reject signs and fractions."""
+    match = _DURATION_RE.fullmatch(text.strip()) if isinstance(text, str) else None
+    if match is not None:
+        seconds = int(match.group(1)) * _DURATION_UNITS[match.group(2)]
+        if 1 <= seconds <= MAX_TIMEOUT_S:
+            return seconds
+    raise MsftError(f"invalid --timeout {text!r}: use e.g. 900, 15m, 2h")
+
+
+def _check_timeout(value: Any) -> int | None:
+    """Accept None or a whole number of seconds in range; reject everything else."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MsftError(
+            f"invalid timeout_s {value!r}: use a positive whole number of seconds"
+        )
+    if not 1 <= value <= MAX_TIMEOUT_S:
+        raise MsftError(
+            f"invalid timeout_s {value!r}: use a positive whole number of seconds"
+        )
+    return value
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -98,6 +127,8 @@ class Job:
     log: str | None = None
     error: str | None = None
     pid: int | None = None
+    timeout_s: int | None = None
+    timed_out: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -110,6 +141,7 @@ def signal(
     job_id: str | None = None,
     config: str | None = None,
     extra_args: list[str] | None = None,
+    timeout_s: int | None = None,
 ) -> str:
     """Drop a job request into the inbox; returns its id.
 
@@ -117,12 +149,19 @@ def signal(
     """
     if kind not in JOB_KINDS:
         raise MsftError(f"unknown job kind '{kind}'; pick one of {', '.join(JOB_KINDS)}")
+    timeout_s = _check_timeout(timeout_s)
     if job_id is not None:
         _validate_id(job_id)
     root = worker_dir(directory)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     ident = job_id or f"{kind}-{stamp}-{secrets.token_hex(2)}"
-    job = Job(id=ident, kind=kind, config=config, extra_args=list(extra_args or []))
+    job = Job(
+        id=ident,
+        kind=kind,
+        config=config,
+        extra_args=list(extra_args or []),
+        timeout_s=timeout_s,
+    )
     target = root / "inbox" / f"{ident}.json"
     tmp = target.with_name(target.name + f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(job.to_dict(), indent=2), encoding="utf-8")
@@ -200,21 +239,56 @@ def build_command(job: Job, argv0: list[str]) -> list[str]:
     return cmd
 
 
-def _wait_for_child(proc: subprocess.Popen[Any], stop: threading.Event | None) -> tuple[int, bool]:
-    """Wait for a child, forwarding a stop request as SIGTERM (then SIGKILL)."""
+def _signal_group(proc: subprocess.Popen[Any], sig: int) -> bool:
+    """Signal the child's whole process group; False when `killpg` does not exist."""
+    if not hasattr(os, "killpg"):
+        return False
+    # The group is already gone, or we may not signal it; either way there is nothing
+    # further to escalate here.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, sig)
+    return True
+
+
+def _terminate_group(proc: subprocess.Popen[Any]) -> tuple[int, bool]:
+    """SIGTERM the process group, SIGKILL it after the grace period; return (rc, escalated)."""
+    if not _signal_group(proc, _sig.SIGTERM):
+        proc.terminate()
+    escalated = False
+    try:
+        proc.wait(timeout=STOP_GRACE_S)
+    except subprocess.TimeoutExpired:
+        escalated = True
+        if not _signal_group(proc, _sig.SIGKILL):
+            proc.kill()
+        proc.wait()
+    return (proc.returncode if proc.returncode is not None else -1), escalated
+
+
+def _wait_for_child(
+    proc: subprocess.Popen[Any],
+    stop: threading.Event | None,
+    deadline: float | None = None,
+) -> tuple[int, str | None]:
+    """Wait for a child; a stop request or the deadline terminates its process group.
+
+    Returns the child's real return code and the reason it was killed: None, "stop" or
+    "timeout". A stop wins over a timeout when both are set: a worker shutdown must never
+    be reported as a job that ran too long.
+    """
     while True:
         try:
-            return proc.wait(timeout=STOP_POLL_S), False
+            return proc.wait(timeout=STOP_POLL_S), None
         except subprocess.TimeoutExpired:
-            if stop is None or not stop.is_set():
+            reason: str | None = None
+            if stop is not None and stop.is_set():
+                reason = "stop"
+            elif deadline is not None and time.monotonic() >= deadline:
+                reason = "timeout"
+            if reason is None:
                 continue
-            proc.terminate()
-            try:
-                proc.wait(timeout=STOP_GRACE_S)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            return proc.returncode if proc.returncode is not None else -1, True
+            returncode, _escalated = _terminate_group(proc)
+            return returncode, reason
 
 
 def _record_failure(
@@ -259,6 +333,7 @@ def run_job(
             f"job '{job.id}' has unknown kind '{job.kind}'; "
             f"pick one of {', '.join(JOB_KINDS)}"
         )
+    job.timeout_s = _check_timeout(job.timeout_s)
     running = root / "running" / job_file.name
     os.replace(job_file, running)
     job.status = RUNNING
@@ -270,7 +345,7 @@ def run_job(
     heartbeat = _Heartbeat(root, job.id)
     heartbeat.start()
     _heartbeat(root, RUNNING, job.id)
-    interrupted = False
+    reason: str | None = None
     try:
         with log_path.open("w", encoding="utf-8") as log:
             log.write(
@@ -283,6 +358,7 @@ def run_job(
                     cwd=cwd,
                     stdout=log,
                     stderr=subprocess.STDOUT,
+                    start_new_session=True,
                 )
             except OSError as exc:  # missing interpreter, permissions
                 log.write(f"error: {exc}\n")
@@ -293,15 +369,34 @@ def run_job(
                 heartbeat.pid = proc.pid
                 # Persist the child pid now that it exists; the file must not say "pending".
                 _write_json(running, job.to_dict())
-                job.returncode, interrupted = _wait_for_child(proc, stop)
-                if interrupted:
+                deadline = (
+                    time.monotonic() + job.timeout_s if job.timeout_s is not None else None
+                )
+                job.returncode, reason = _wait_for_child(proc, stop, deadline=deadline)
+                if reason == "timeout":
+                    log.write(
+                        f"# {_now()} TIMEOUT: exceeded {job.timeout_s}s; "
+                        "sending SIGTERM to the process group\n"
+                    )
+                    log.flush()
+                    job.timed_out = True
+                    killed = (
+                        f" (SIGKILL after {STOP_GRACE_S:g}s grace)"
+                        if job.returncode == -_sig.SIGKILL
+                        else ""
+                    )
+                    job.error = (
+                        f"timed out after {job.timeout_s}s; the process group was terminated"
+                        + killed
+                    )
+                elif reason == "stop":
                     job.error = "interrupted (worker stopped); the child was terminated"
     finally:
         heartbeat.stop()
     job.duration_s = round(time.monotonic() - started, 1)
     job.finished = _now()
     job.log = str(log_path)
-    job.status = DONE if job.returncode == 0 and not interrupted else FAILED
+    job.status = DONE if job.returncode == 0 and reason is None else FAILED
     _write_json(root / "done" / job_file.name, job.to_dict())
     running.unlink(missing_ok=True)
     return job

@@ -203,7 +203,13 @@ def _cmd_data_build(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _model_stage(module: str, title: str, cfg: RunConfig | None, args: argparse.Namespace) -> int:
+def _model_stage(
+    module: str,
+    title: str,
+    cfg: RunConfig | None,
+    args: argparse.Namespace,
+    **run_kwargs: Any,
+) -> int:
     """Shared body for train/merge/quantize: script, dry-run plan, or execution."""
     config = _require_config(cfg)
     stage = _impl(module)
@@ -212,7 +218,7 @@ def _model_stage(module: str, title: str, cfg: RunConfig | None, args: argparse.
         _emit(args.as_json, {"script": script}, str(script))
         return EXIT_OK
     if args.execute:
-        result = _jsonable(_func(stage, "run")(config, execute=True))
+        result = _jsonable(_func(stage, "run")(config, execute=True, **run_kwargs))
         _emit(args.as_json, result, _render(title, result))
         return EXIT_OK
     # Dry run: a missing external tool (llama.cpp, a merged adapter) is a warning on the
@@ -240,7 +246,15 @@ def _accepts_kwarg(module: Any, func_name: str, kwarg: str) -> bool:
 
 def _cmd_train(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     """Plan or execute QLoRA/SFT training."""
-    return _model_stage("msft.train", "train", cfg, args)
+    inspect = bool(getattr(args, "inspect_mask", False))
+    if inspect and args.dry_run:
+        raise MsftError(
+            "--inspect-mask runs the training script; it cannot be combined with --dry-run"
+        )
+    if inspect:
+        # Inspection loads the model and renders one batch; it is an explicit run request.
+        args.execute = True
+    return _model_stage("msft.train", "train", cfg, args, inspect_mask=inspect)
 
 
 def _cmd_merge(cfg: RunConfig | None, args: argparse.Namespace) -> int:
@@ -342,20 +356,34 @@ def _cmd_remote_preflight(cfg: RunConfig | None, args: argparse.Namespace) -> in
 
 
 def _cmd_remote_sync(cfg: RunConfig | None, args: argparse.Namespace) -> int:
-    """Copy the dataset or a directory to the remote host."""
+    """Copy a directory under `data/` to `<remote repo>/data/` on the box."""
     remote_mod = _impl("msft.remote")
+    if getattr(args, "remote_path", None):
+        raise MsftError("--remote was removed: the destination is always <remote repo>/data/…")
     host = _remote_host()
     local = args.local
-    remote_path = args.remote_path
     if local is None:
-        local = _require_config(cfg).data.input
-    if remote_path is None:
-        remote_path = _require_config(cfg).output_dir
+        local = cfg.data.input if cfg is not None else "data"
+    base_dir = Path(cfg.base_dir) if cfg is not None else Path(".")
     result = _jsonable(
-        _func(remote_mod, "sync")(host, Path(local), str(remote_path), execute=bool(args.execute))
+        _func(remote_mod, "sync")(
+            host,
+            local,
+            base_dir=base_dir,
+            delete=bool(args.delete),
+            execute=bool(args.execute),
+        )
     )
     _emit(args.as_json, result, _render("remote sync", result))
     return _exit_for(result)
+
+
+def _parse_timeout(value: str | None) -> int | None:
+    """Parse `--timeout DURATION` into seconds; absent means no limit."""
+    if value is None:
+        return None
+    worker = _impl("msft.worker")
+    return int(_func(worker, "parse_duration")(value))
 
 
 def _cmd_remote_run(cfg: RunConfig | None, args: argparse.Namespace) -> int:
@@ -363,7 +391,14 @@ def _cmd_remote_run(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     config = _require_config(cfg)
     remote = _impl("msft.remote")
     host = _remote_host()
-    result = _jsonable(_func(remote, "run_remote")(config, host, execute=bool(args.execute)))
+    result = _jsonable(
+        _func(remote, "run_remote")(
+            config,
+            host,
+            execute=bool(args.execute),
+            timeout_s=_parse_timeout(args.timeout),
+        )
+    )
     _emit(args.as_json, result, _render("remote run", result))
     return _exit_for(result)
 
@@ -478,6 +513,8 @@ def _cmd_remote_signal(cfg: RunConfig | None, args: argparse.Namespace) -> int:
             args.kind,
             config=_config_arg(cfg, args),
             job_id=args.job_id,
+            extra_args=args.extra_args,
+            timeout_s=_parse_timeout(args.timeout),
             execute=bool(args.execute),
         )
     )
@@ -530,14 +567,22 @@ def _cmd_worker_signal(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     """Queue a job for the worker."""
     worker = _impl("msft.worker")
     directory = _worker_dir(cfg, args.dir)
+    timeout_s = _parse_timeout(args.timeout)
     job_id = worker.signal(
         directory,
         args.kind,
         job_id=args.job_id,
         config=_config_arg(cfg, args),
         extra_args=args.extra_args,
+        timeout_s=timeout_s,
     )
-    _emit(args.as_json, {"id": job_id, "dir": directory}, f"queued {job_id} in {directory}")
+    timeout_note = "none" if timeout_s is None else f"{timeout_s}s"
+    payload = {"id": job_id, "dir": directory, "timeout": timeout_note}
+    _emit(
+        args.as_json,
+        payload,
+        f"queued {job_id} in {directory} (timeout: {timeout_note})",
+    )
     return EXIT_OK
 
 
@@ -615,6 +660,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_train = sub.add_parser("train", parents=[common], help="QLoRA/SFT via Unsloth + TRL")
     p_train.add_argument("--script", action="store_true", help="print the generated script")
+    p_train.add_argument(
+        "--inspect-mask",
+        action="store_true",
+        help="run the script with MSFT_INSPECT_MASK=1 to report the loss mask, then stop",
+    )
     p_train.set_defaults(handler=_cmd_train)
 
     p_merge = sub.add_parser("merge", parents=[common], help="merge the adapter into 16-bit")
@@ -692,14 +742,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_preflight.set_defaults(handler=_cmd_remote_preflight)
     p_sync = remote_sub.add_parser("sync", parents=[common], help="copy data to the remote host")
-    p_sync.add_argument("--local", metavar="PATH", default=None, help="local path to send")
+    p_sync.add_argument("--local", metavar="PATH", default=None, help="path under data/ to send")
     p_sync.add_argument(
-        "--remote", dest="remote_path", metavar="PATH", default=None, help="destination directory"
+        "--delete",
+        action="store_true",
+        help="delete files on the destination that are gone locally (--delete-after)",
+    )
+    p_sync.add_argument(
+        "--remote", dest="remote_path", metavar="PATH", default=None, help=argparse.SUPPRESS
     )
     p_sync.set_defaults(handler=_cmd_remote_sync)
     p_run = remote_sub.add_parser(
         "run", parents=[common], help="run the configured pipeline remotely"
     )
+    p_run.add_argument("--timeout", metavar="DURATION", default=None, help="e.g. 900, 15m, 2h")
     p_run.set_defaults(handler=_cmd_remote_run)
     p_deploy = remote_sub.add_parser(
         "deploy", parents=[common], help="pull on the box and bring the worker container up"
@@ -720,6 +776,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_signal.add_argument("kind")
     p_signal.add_argument("--id", dest="job_id", default=None)
+    p_signal.add_argument(
+        "--arg", dest="extra_args", action="append", default=[], help="extra CLI arg (repeatable)"
+    )
+    p_signal.add_argument(
+        "--timeout", metavar="DURATION", default=None, help="kill the job after e.g. 900, 15m, 2h"
+    )
     p_signal.set_defaults(handler=_cmd_remote_signal)
     p_rstatus = remote_sub.add_parser(
         "status", parents=[common], help="container health plus the worker queue"
@@ -750,6 +812,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_w_signal.add_argument(
         "--arg", dest="extra_args", action="append", default=[], help="extra CLI arg (repeatable)"
+    )
+    p_w_signal.add_argument(
+        "--timeout", metavar="DURATION", default=None, help="kill the job after e.g. 900, 15m, 2h"
     )
     p_w_signal.set_defaults(handler=_cmd_worker_signal)
     p_w_status = worker_sub.add_parser("status", parents=[common], help="queue and heartbeat")

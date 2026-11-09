@@ -282,6 +282,36 @@ def load_config(path: str | Path) -> RunConfig:
     return cfg
 
 
+def _ignored_knob_reasons() -> dict[str, str]:
+    """Fields the generated training script does not read, with the reason each is ignored."""
+    from msft.train import IGNORED_KNOBS
+
+    return IGNORED_KNOBS
+
+
+def _knob_default(knob: str) -> Any:
+    """Default value of a `section.field` knob, including default factories."""
+    section, _, name = knob.partition(".")
+    cls = {"model": ModelCfg, "lora": LoraCfg, "train": TrainCfg}.get(section)
+    if cls is None:
+        return None
+    for spec in fields(cls):
+        if spec.name == name:
+            if spec.default is not MISSING:
+                return spec.default
+            if spec.default_factory is not MISSING:
+                return spec.default_factory()
+    return None
+
+
+def _knob_is_changed(cfg: RunConfig, knob: str) -> bool:
+    """True when a config sets `section.field` away from its dataclass default."""
+    section, _, name = knob.partition(".")
+    section_obj = getattr(cfg, section, None)
+    value = getattr(section_obj, name, None)
+    return value != _knob_default(knob)
+
+
 def validate_config(cfg: RunConfig) -> list[str]:
     """Return warnings; raise MsftError on anything that cannot work."""
     warnings: list[str] = []
@@ -348,6 +378,9 @@ def validate_config(cfg: RunConfig) -> list[str]:
         warnings.append("more than 3 epochs usually overfits a small literary set")
     if cfg.quantize.imatrix:
         warnings.append("imatrix calibration needs a corpus file and a llama.cpp build")
+    for knob, reason in _ignored_knob_reasons().items():
+        if _knob_is_changed(cfg, knob):
+            warnings.append(f"{knob} is ignored by the generated training script: {reason}")
     return warnings
 
 

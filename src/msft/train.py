@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -21,6 +22,51 @@ TRAIN_SCRIPT_NAME = "train_script.py"
 RUN_META_NAME = "run_meta.json"
 CHECKPOINT_DIR_NAME = "checkpoints"
 MIN_TRL = (0, 16)
+
+IGNORED_KNOBS: dict[str, str] = {
+    "model.dtype": "the script passes dtype=None so Unsloth chooses the device dtype",
+    "train.packing": "the script hardcodes packing=False; enabling it needs a measured run",
+    "train.completion_only_loss": (
+        "the script trains on a `text` column, so TRL has no completion mask; it is hardcoded True"
+    ),
+}
+
+MASK_REPORT_SOURCE = '''\
+# --- loss-mask report: shared verbatim with src/msft/train.py ---
+def mask_report(input_ids, labels, attention_mask, *, prompt_len, tokenizer=None) -> dict:
+    """Count labeled vs real tokens in one collated batch and name the loss mask."""
+    real = [i for i, flag in enumerate(attention_mask) if flag]
+    labeled = [i for i in real if labels[i] != -100]
+    real_tokens = len(real)
+    labeled_tokens = len(labeled)
+    first = labeled[0] if labeled else None
+    last_real = real[-1] if real else None
+    last_labeled = last_real is not None and labels[last_real] != -100
+    masked_leading = first if first is not None else real_tokens
+    if first == 0 and real_tokens and labeled_tokens >= 0.98 * real_tokens:
+        verdict = "FULL-SEQUENCE"
+    elif first is not None and abs(first - prompt_len) <= 2 and last_labeled:
+        verdict = "COMPLETION-ONLY"
+    else:
+        verdict = "UNEXPECTED"
+    report = {
+        "real_tokens": real_tokens,
+        "labeled": labeled_tokens,
+        "masked_leading": masked_leading,
+        "first_labeled": first,
+        "last_real_labeled": last_labeled,
+        "verdict": verdict,
+    }
+    if tokenizer is not None and first is not None:
+        snippet = tokenizer.decode(list(input_ids)[first : first + 16])
+        report["first_labeled_text"] = snippet.replace("\\n", "\\\\n")[:40]
+    return report
+# --- end loss-mask report ---
+'''
+
+_MASK_NAMESPACE: dict[str, Any] = {}
+exec(MASK_REPORT_SOURCE, _MASK_NAMESPACE)
+mask_report = _MASK_NAMESPACE["mask_report"]
 
 
 def dataset_paths(cfg: RunConfig) -> dict[str, Path]:
@@ -156,6 +202,7 @@ def plan(cfg: RunConfig) -> dict[str, Any]:
             "completion_only_loss": cfg.train.completion_only_loss,
             "save_steps": cfg.train.save_steps,
             "eval_steps": cfg.train.eval_steps,
+            "ignored_knobs": dict(IGNORED_KNOBS),
         },
         "vram_16gb": vram_class(cfg),
     }
@@ -237,6 +284,22 @@ def gpu_name() -> str | None:
     return torch.cuda.get_device_name(0)
 
 
+$MASK_REPORT_SOURCE
+
+
+def expected_prompt_len(tokenizer, messages) -> int:
+    """Token count of the longest common prefix of the prompt and the fully rendered row."""
+    prompt = tokenizer.apply_chat_template(
+        messages[:-1], tokenize=False, add_generation_prompt=True
+    )
+    full = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    limit = min(len(prompt), len(full))
+    shared = 0
+    while shared < limit and prompt[shared] == full[shared]:
+        shared += 1
+    return len(tokenizer(prompt[:shared], add_special_tokens=False)["input_ids"])
+
+
 def main() -> int:
     """Load the base model, train the adapter, save it next to run_meta.json."""
     started = time.time()
@@ -280,6 +343,8 @@ def main() -> int:
     )
     if getattr(tokenizer, "chat_template", None) is None:
         return fail(f"tokenizer for {MODEL_ID} has no chat template; pick a chat model")
+
+    EXPECTED_PROMPT_LEN = expected_prompt_len(tokenizer, raw["train"][0]["messages"])
 
     def render(example: dict) -> dict:
         """Render one conversation through the tokenizer's chat template."""
@@ -368,6 +433,49 @@ def main() -> int:
         eval_dataset=val_ds,
         args=args,
     )
+
+    # Measure the loss mask before training: `completion_only_loss=True` with a `text` column
+    # has no completion mask to apply, and nobody has verified what it actually labels.
+    batch = next(iter(trainer.get_train_dataloader()))
+    report = mask_report(
+        batch["input_ids"][0].tolist(),
+        batch["labels"][0].tolist(),
+        batch["attention_mask"][0].tolist(),
+        prompt_len=EXPECTED_PROMPT_LEN,
+        tokenizer=tokenizer,
+    )
+    print(
+        f"[msft] loss-mask: real_tokens={report['real_tokens']} "
+        f"labeled={report['labeled']} masked_leading={report['masked_leading']} "
+        f"(expected prompt len {EXPECTED_PROMPT_LEN})",
+        flush=True,
+    )
+    if report["first_labeled"] is not None:
+        snippet = report.get("first_labeled_text", "")
+        print(f"[msft] loss-mask: first labeled: '{snippet}…'", flush=True)
+    notes = {
+        "FULL-SEQUENCE": "system and user tokens are trained",
+        "COMPLETION-ONLY": "only the assistant reply is trained",
+        "UNEXPECTED": "neither full-sequence nor completion-only; check the data collator",
+    }
+    print(
+        f"[msft] loss-mask: VERDICT {report['verdict']} — {notes[report['verdict']]}",
+        flush=True,
+    )
+    if report["verdict"] != "COMPLETION-ONLY":
+        for line in (
+            "!" * 78,
+            "!! msft: completion_only_loss=True but this batch is not completion-only.",
+            f"!! {report['labeled']} of {report['real_tokens']} real tokens are labeled;",
+            "!! system and user tokens are being trained. Measure before changing the format.",
+            "!" * 78,
+        ):
+            print(line, file=sys.stderr, flush=True)
+
+    if os.environ.get("MSFT_INSPECT_MASK") == "1":
+        print("[msft] MSFT_INSPECT_MASK=1: stopping before trainer.train()", flush=True)
+        return 0
+
     result = trainer.train()
 
     ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
@@ -459,6 +567,7 @@ def build_script(cfg: RunConfig) -> str:
         USE_RSLORA=cfg.lora.use_rslora,
         LOAD_IN_4BIT=cfg.model.load_in_4bit,
         MIN_TRL=repr(MIN_TRL),
+        MASK_REPORT_SOURCE=MASK_REPORT_SOURCE,
     )
 
 
@@ -467,7 +576,9 @@ def _log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def run(cfg: RunConfig, *, execute: bool = False) -> dict[str, Any]:
+def run(
+    cfg: RunConfig, *, execute: bool = False, inspect_mask: bool = False
+) -> dict[str, Any]:
     """Return the plan; with `execute=True` write output/train_script.py and run it.
 
     Nothing is written when `execute` is false: a dry run must not create artifacts.
@@ -483,17 +594,25 @@ def run(cfg: RunConfig, *, execute: bool = False) -> dict[str, Any]:
     _log(f"wrote {script_path}")
     _log(f"$ {sys.executable} {script_path}")
 
-    completed = subprocess.run([sys.executable, str(script_path)], stdout=sys.stderr, check=False)
+    env = dict(os.environ)
+    if inspect_mask:
+        env["MSFT_INSPECT_MASK"] = "1"
+    completed = subprocess.run(
+        [sys.executable, str(script_path)], stdout=sys.stderr, check=False, env=env
+    )
     if completed.returncode != 0:
         raise MsftError(
             f"training script exited {completed.returncode}; read the log above, fix the "
             f"cause and re-run: {script_path}"
         )
+    result["executed"] = True
+    result["returncode"] = completed.returncode
+    if inspect_mask:
+        result["inspect_mask"] = True
+        return result
     adapter_config = cfg.adapter_path / "adapter_config.json"
     if not adapter_config.is_file():
         raise MsftError(
             f"training exited 0 but {adapter_config} is missing; the adapter was not saved"
         )
-    result["executed"] = True
-    result["returncode"] = completed.returncode
     return result

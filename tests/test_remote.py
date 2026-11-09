@@ -54,8 +54,10 @@ class Forbidden(FakeRun):
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep remote paths out of the developer's environment."""
-    monkeypatch.delenv("MSFT_REMOTE_DIR", raising=False)
     monkeypatch.delenv("MSFT_REMOTE_CONFIG", raising=False)
+    # Hermetic default: preflight/run resolve the repo from the environment, never from a
+    # developer's git-ignored configs/worker.local.yaml.
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
 
 
 def which_all(name: str) -> str:
@@ -72,9 +74,9 @@ def fake_ssh(monkeypatch: pytest.MonkeyPatch, responder: object) -> FakeRun:
 def responder_ok(argv: list[str]) -> subprocess.CompletedProcess[str]:
     """Answer the four preflight probes like a healthy GPU box would."""
     command = argv[-1]
-    if command.startswith("nvidia-smi"):
+    if "nvidia-smi" in command:
         return subprocess.CompletedProcess(argv, 0, "NVIDIA L40S, 46068 MiB, 512 MiB\n", "")
-    if command.startswith("python3"):
+    if "python --version" in command:
         return subprocess.CompletedProcess(argv, 0, "Python 3.11.8\n", "")
     if command.startswith("df"):
         return subprocess.CompletedProcess(argv, 0, "Avail\n400G\n", "")
@@ -149,7 +151,7 @@ def test_preflight_execute_probes_every_target(monkeypatch: pytest.MonkeyPatch) 
         assert kwargs["capture_output"] is True
         assert kwargs["text"] is True
         assert kwargs["timeout"] == remote.PROBE_TIMEOUT_S
-    assert fake.calls[0][0][6] == remote.GPU_COMMAND
+    assert fake.calls[0][0][6] == f"docker exec {remote.CONTAINER} {remote.GPU_COMMAND}"
 
 
 def test_preflight_execute_flags_old_remote_python(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -198,76 +200,215 @@ def test_preflight_ssh_error_does_not_leak_host(monkeypatch: pytest.MonkeyPatch)
 # --- sync -----------------------------------------------------------------
 
 
-def test_sync_plan_argv_and_excludes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.fixture
+def data_tree(tmp_path: Path) -> Path:
+    """A checkout with `data/raw`, `data/other` and a directory outside data."""
+    (tmp_path / "data" / "raw").mkdir(parents=True)
+    (tmp_path / "data" / "other").mkdir()
+    (tmp_path / "out").mkdir()
+    (tmp_path / "data" / "link").symlink_to(tmp_path / "out")
+    return tmp_path
+
+
+def test_sync_plan_argv_and_excludes(monkeypatch: pytest.MonkeyPatch, data_tree: Path) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/WORKSPACE/machinum-sft")
     monkeypatch.setattr(subprocess, "run", Forbidden())
-    result = remote.sync(HOST, tmp_path, "~/proj")
+    result = remote.sync(HOST, "data/raw", base_dir=data_tree)
 
     argv = result["argv"]
     assert argv[0] == "rsync"
-    assert "-az" in argv and "--delete-after" in argv
+    assert "-az" in argv and "--protect-args" in argv
+    assert not any(part.startswith("--delete") for part in argv)
     pairs = set(zip(argv, argv[1:], strict=False))
-    for pattern in (".git", ".venv", "out", "data"):
+    for pattern in remote.ALWAYS_EXCLUDES:
         assert ("--exclude", pattern) in pairs
+    assert ("--exclude", "out") not in pairs
+    assert ("--exclude", "data") not in pairs
     assert remote.TRANSPORT in argv
-    assert argv[-2] == f"{tmp_path}/"
-    assert argv[-1] == f"{remote.HOST_PLACEHOLDER}:~/proj/"
+    assert "ServerAliveInterval=30" in remote.TRANSPORT
+    assert argv[-2] == f"{data_tree / 'data' / 'raw'}/"
+    assert argv[-1] == f"{remote.HOST_PLACEHOLDER}:WORKSPACE/machinum-sft/data/raw/"
 
+    assert result["dest"] == "WORKSPACE/machinum-sft/data/raw/"
+    assert result["local"] == "data/raw"
+    assert result["delete"] is False
+    assert result["repo_checked"] is False
+    assert result["excludes"] == list(remote.ALWAYS_EXCLUDES)
+    assert "remote" not in result
     assert result["executed"] is False
     assert result["ok"] is True
     assert result["host"] == MASKED
-    assert result["remote"] == "~/proj"
     assert "buildbox" not in json.dumps(result)
-    json.dumps(result)  # the whole plan is JSON-serialisable
+    json.dumps(result)
 
 
-def test_sync_execute_runs_rsync_with_real_host(
+def test_sync_delete_uses_delete_after_only(
+    monkeypatch: pytest.MonkeyPatch, data_tree: Path
+) -> None:
+    monkeypatch.setattr(subprocess, "run", Forbidden())
+    result = remote.sync(HOST, "data", base_dir=data_tree, delete=True)
+
+    argv = result["argv"]
+    assert argv.count("--delete-after") == 1
+    assert not any(
+        part.startswith("--delete") and part != "--delete-after" for part in argv
+    )
+    assert result["delete"] is True
+    assert result["dest"] == "proj/data/"
+
+
+@pytest.mark.parametrize("local", ["/etc", "../x", "data/../out", "data/link", ".", "out"])
+def test_sync_rejects_paths_outside_data(
+    monkeypatch: pytest.MonkeyPatch, data_tree: Path, local: str
+) -> None:
+    monkeypatch.setattr(subprocess, "run", Forbidden())
+    with pytest.raises(remote.MsftError):
+        remote.sync(HOST, local, base_dir=data_tree)
+
+
+def test_sync_refusal_names_the_data_root(
+    monkeypatch: pytest.MonkeyPatch, data_tree: Path
+) -> None:
+    monkeypatch.setattr(subprocess, "run", Forbidden())
+    with pytest.raises(remote.MsftError, match="remote sync only sends paths under") as info:
+        remote.sync(HOST, "out", base_dir=data_tree)
+    assert "code goes through git pull" in str(info.value)
+
+
+@pytest.mark.parametrize("local", ["data", "data/raw"])
+def test_sync_accepts_directories_under_data(
+    monkeypatch: pytest.MonkeyPatch, data_tree: Path, local: str
+) -> None:
+    monkeypatch.setattr(subprocess, "run", Forbidden())
+    result = remote.sync(HOST, local, base_dir=data_tree)
+    expected = "proj/data/" if local == "data" else "proj/data/raw/"
+    assert result["dest"] == expected
+
+
+@pytest.mark.parametrize(
+    ("repo", "relative", "dest"),
+    [
+        ("~/WORKSPACE/machinum-sft", "raw", "WORKSPACE/machinum-sft/data/raw/"),
+        ("/srv/m", "raw", "/srv/m/data/raw/"),
+        ("~/proj", ".", "proj/data/"),
+    ],
+)
+def test_remote_dest_appends_data(repo: str, relative: str, dest: str) -> None:
+    assert remote.remote_dest(repo, Path(relative)) == dest
+
+
+@pytest.mark.parametrize("repo", ["~", "/", "$HOME/x", "a b", "x/../y", "x;rm"])
+def test_remote_dest_rejects_unsafe_repos(repo: str) -> None:
+    with pytest.raises(remote.MsftError):
+        remote.remote_dest(repo, Path("raw"))
+
+
+def test_msft_remote_dir_beats_the_worker_yaml(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.chdir(tmp_path)
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    worker_yaml = configs / "worker.local.yaml"
+    worker_yaml.write_text("repo_dir: from-yaml\n", encoding="utf-8")
+
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "from-env")
+    assert remote.remote_repo_dir() == "from-env"
+
+    monkeypatch.delenv("MSFT_REMOTE_DIR")
+    assert remote.remote_repo_dir() == "from-yaml"
+
+    worker_yaml.unlink()
+    with pytest.raises(remote.MsftError, match="no remote repo directory"):
+        remote.remote_repo_dir()
+
+
+def test_sync_execute_probes_the_repo_before_rsync(
+    monkeypatch: pytest.MonkeyPatch, data_tree: Path
+) -> None:
     monkeypatch.setattr(remote.shutil, "which", which_all)
-    fake = FakeRun(stdout="sent 12 bytes\n")
-    monkeypatch.setattr(subprocess, "run", fake)
-    result = remote.sync(HOST, tmp_path, "~/proj", execute=True)
+
+    def responder(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "ssh":
+            return subprocess.CompletedProcess(argv, 0, "yes\n", "")
+        return subprocess.CompletedProcess(argv, 0, "sent 12 bytes\n", "")
+
+    fake = fake_ssh(monkeypatch, responder)
+    result = remote.sync(HOST, "data/raw", base_dir=data_tree, execute=True)
 
     assert result["executed"] is True
     assert result["ok"] is True
     assert result["returncode"] == 0
     assert result["stdout"] == "sent 12 bytes"
-    argv, kwargs = fake.calls[0]
-    assert argv[-1] == f"{HOST}:~/proj/"
-    assert argv[-2] == f"{tmp_path}/"
+    assert result["repo_checked"] is True
+
+    assert fake.calls[0][0][0] == "ssh"
+    assert fake.calls[0][0][-1].startswith("test -d ")
+    assert ".git" in fake.calls[0][0][-1]
+    rsync_calls = [call for call in fake.calls if call[0][0] == "rsync"]
+    assert len(rsync_calls) == 1
+    argv, kwargs = rsync_calls[0]
+    assert argv[-1] == f"{HOST}:proj/data/raw/"
     assert kwargs["timeout"] == remote.RSYNC_TIMEOUT_S
     assert kwargs["capture_output"] is True
     assert kwargs["text"] is True
 
 
-def test_sync_without_rsync_fails_softly(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_sync_execute_refuses_without_a_remote_repo(
+    monkeypatch: pytest.MonkeyPatch, data_tree: Path
+) -> None:
+    monkeypatch.setattr(remote.shutil, "which", which_all)
+
+    def responder(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "rsync":
+            raise AssertionError("rsync must not run when the repo probe fails")
+        return subprocess.CompletedProcess(argv, 0, "no\n", "")
+
+    fake = fake_ssh(monkeypatch, responder)
+    with pytest.raises(remote.MsftError, match="not found or not a git clone"):
+        remote.sync(HOST, "data/raw", base_dir=data_tree, execute=True)
+    assert all(call[0][0] == "ssh" for call in fake.calls)
+
+
+def test_sync_without_rsync_fails_softly(
+    monkeypatch: pytest.MonkeyPatch, data_tree: Path
+) -> None:
     monkeypatch.setattr(
         remote.shutil, "which", lambda name: None if name == "rsync" else "/usr/bin/ssh"
     )
     monkeypatch.setattr(subprocess, "run", Forbidden())
-    result = remote.sync(HOST, tmp_path, "~/proj", execute=True)
+    result = remote.sync(HOST, "data", base_dir=data_tree, execute=True)
 
     assert result["executed"] is False
     assert result["ok"] is False
     assert "rsync not found" in result["error"]
 
 
-def test_sync_without_ssh_fails_softly(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_sync_without_ssh_fails_softly(
+    monkeypatch: pytest.MonkeyPatch, data_tree: Path
+) -> None:
     monkeypatch.setattr(remote.shutil, "which", lambda name: None)
     monkeypatch.setattr(subprocess, "run", Forbidden())
-    result = remote.sync(HOST, tmp_path, "~/proj", execute=True)
+    result = remote.sync(HOST, "data", base_dir=data_tree, execute=True)
 
     assert result["ok"] is False
     assert "ssh not found" in result["error"]
 
 
 def test_sync_failure_keeps_code_and_scrubs_stderr(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, data_tree: Path
 ) -> None:
     monkeypatch.setattr(remote.shutil, "which", which_all)
-    fake = FakeRun(stderr=f"rsync: connection to {HOST} refused\n", returncode=23)
-    monkeypatch.setattr(subprocess, "run", fake)
-    result = remote.sync(HOST, tmp_path, "~/proj", execute=True)
+
+    def responder(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "ssh":
+            return subprocess.CompletedProcess(argv, 0, "yes\n", "")
+        return subprocess.CompletedProcess(
+            argv, 23, "", f"rsync: connection to {HOST} refused\n"
+        )
+
+    fake_ssh(monkeypatch, responder)
+    result = remote.sync(HOST, "data", base_dir=data_tree, execute=True)
 
     assert result["ok"] is False
     assert result["returncode"] == 23
@@ -278,12 +419,21 @@ def test_sync_failure_keeps_code_and_scrubs_stderr(
 # --- remote run -----------------------------------------------------------
 
 
-def expected_command(cfg_name: str = "smoke", directory: str = "~/proj") -> str:
-    """The exact remote shell line the contract asks for."""
+def expected_command(cfg_name: str = "smoke") -> str:
+    """The exact container command the contract asks for."""
     return (
-        f'cd "$HOME"/{directory[2:]} && . .venv/bin/activate && '
-        f"python -m msft train --config configs/{cfg_name}.yaml --execute"
+        f"docker exec {remote.CONTAINER} python -m msft train "
+        f"--config configs/{cfg_name}.yaml --execute"
     )
+
+
+def test_container_command_never_activates_a_venv() -> None:
+    command = remote.container_command("train", "configs/smoke.yaml")
+    assert command.startswith("docker exec msft-worker ")
+    assert "python -m msft train" in command
+    assert "--config configs/smoke.yaml --execute" in command
+    assert ".venv" not in command
+    assert "cd " not in command
 
 
 def test_run_remote_plan_composes_command(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -295,31 +445,66 @@ def test_run_remote_plan_composes_command(monkeypatch: pytest.MonkeyPatch) -> No
     assert argv[:5] == ["ssh", *SSH_OPTS]
     assert argv[5] == remote.HOST_PLACEHOLDER
     assert argv[6] == expected_command()
+    assert argv[6].startswith("docker exec msft-worker ")
+    assert ".venv" not in argv[6]
+    assert "cd " not in argv[6]
     assert result["command"].startswith("ssh -o BatchMode=yes -o ConnectTimeout=10 ")
     assert result["executed"] is False
     assert result["host"] == MASKED
     assert result["dir"] == "~/proj"
     assert result["config"] == "configs/smoke.yaml"
+    assert result["timeout"] == "none"
     assert "buildbox" not in json.dumps(result)
+
+
+def test_run_remote_plan_wraps_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(subprocess, "run", Forbidden())
+    result = remote.run_remote(RunConfig(name="smoke"), HOST, timeout_s=900)
+
+    assert result["argv"][6] == (
+        f"timeout --signal=TERM --kill-after=30 900 {expected_command()}"
+    )
+    assert result["timeout"] == 900
 
 
 def test_run_remote_execute_uses_real_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
     monkeypatch.setattr(remote.shutil, "which", which_all)
-    fake = FakeRun(stdout="step 10/10 done\n")
-    monkeypatch.setattr(subprocess, "run", fake)
+
+    def responder(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[-1].startswith("docker inspect"):
+            return subprocess.CompletedProcess(argv, 0, "true\n", "")
+        return subprocess.CompletedProcess(argv, 0, "step 10/10 done\n", "")
+
+    fake = fake_ssh(monkeypatch, responder)
     result = remote.run_remote(RunConfig(name="smoke"), HOST, execute=True)
 
     assert result["executed"] is True
     assert result["ok"] is True
     assert result["returncode"] == 0
-    argv, kwargs = fake.calls[0]
-    assert argv[:5] == ["ssh", *SSH_OPTS]
-    assert argv[5] == HOST
-    assert argv[6] == expected_command()
+    assert "done" in result["stdout"]
+    assert len(fake.calls) == 2
+    inspect_argv, _ = fake.calls[0]
+    assert inspect_argv[5] == HOST
+    assert inspect_argv[6].startswith("docker inspect")
+    run_argv, kwargs = fake.calls[1]
+    assert run_argv[6] == expected_command()
     assert kwargs["capture_output"] is True
     assert kwargs["text"] is True
-    assert "done" in result["stdout"]
+
+
+def test_run_remote_requires_a_running_container(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    monkeypatch.setattr(remote.shutil, "which", which_all)
+
+    def responder(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[-1].startswith("docker inspect"):
+            return subprocess.CompletedProcess(argv, 0, "false\n", "")
+        raise AssertionError("the run must not start when the container is down")
+
+    fake_ssh(monkeypatch, responder)
+    with pytest.raises(remote.MsftError, match="worker container is not running"):
+        remote.run_remote(RunConfig(name="smoke"), HOST, execute=True)
 
 
 def test_run_remote_without_ssh_fails_softly(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -343,8 +528,13 @@ def test_run_remote_honours_env_config(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_run_remote_failure_scrubs_output(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(remote.shutil, "which", which_all)
-    fake = FakeRun(stderr=f"Permission denied ({HOST})\n", returncode=255)
-    monkeypatch.setattr(subprocess, "run", fake)
+
+    def responder(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[-1].startswith("docker inspect"):
+            return subprocess.CompletedProcess(argv, 0, "true\n", "")
+        return subprocess.CompletedProcess(argv, 255, "", f"Permission denied ({HOST})\n")
+
+    fake_ssh(monkeypatch, responder)
     result = remote.run_remote(RunConfig(name="smoke"), HOST, execute=True)
 
     assert result["ok"] is False

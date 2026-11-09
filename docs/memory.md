@@ -30,6 +30,10 @@ container (`docker compose restart worker`) after changing worker code.
 **One job at a time is a feature.** Two 4B trainings on a 16 GB card is an OOM. The queue
 serialises; do not "parallelise" by queueing two trains.
 
+**`msft remote sync` never chooses its own destination.** The destination is always
+`<repo_dir>/data/<path relative to data/>/`, sources outside `data/` are refused, and `--remote`
+is gone: code reaches the box by `git pull`, never rsync.
+
 ## Models and downloads
 
 **HF drops shards on this link and `from_pretrained` does not always resume.** The 4B fell from

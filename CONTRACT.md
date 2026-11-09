@@ -89,7 +89,8 @@ run_gates(predictions: Path, *, as_json: bool = False) -> list[GateResult]
 ```python
 # remote.py
 def preflight(host: str, *, execute: bool = False) -> list[Check]
-def sync(host: str, local: Path, remote: str, *, execute: bool = False) -> dict
+def sync(host: str, local: str | Path, *, base_dir: str | Path = ".",
+         delete: bool = False, execute: bool = False) -> dict
 def run_remote(cfg: RunConfig, host: str, *, execute: bool = False) -> dict
 ```
 

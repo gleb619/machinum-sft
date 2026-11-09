@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -51,8 +53,9 @@ def test_run_job_moves_files_and_records_result(
         pid = 4242
         returncode: int | None = None
 
-        def __init__(self, cmd, cwd=None, stdout=None, stderr=None):
+        def __init__(self, cmd, cwd=None, stdout=None, stderr=None, **kwargs):
             seen["cmd"] = cmd
+            seen["kwargs"] = kwargs
             assert stdout is not None
             stdout.write("pretend output\n")
 
@@ -74,6 +77,7 @@ def test_run_job_moves_files_and_records_result(
     assert not (tmp_path / "running" / "j2.json").exists()
     assert "pretend output" in (tmp_path / "logs" / "j2.log").read_text()
     assert seen["cmd"][-1] == "--execute"
+    assert seen["kwargs"]["start_new_session"] is True
 
 
 def test_run_job_marks_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -305,13 +309,15 @@ def test_heartbeat_thread_refreshes_during_a_job(tmp_path: Path) -> None:
     assert data["child_pid"] == 77
 
 
-def test_a_stop_request_terminates_the_child() -> None:
+def test_a_stop_request_terminates_the_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Proc:
+        pid = 4321
         returncode: int | None = None
 
         def __init__(self) -> None:
             self.waits = 0
-            self.terminated = False
 
         def wait(self, timeout=None):
             self.waits += 1
@@ -320,16 +326,199 @@ def test_a_stop_request_terminates_the_child() -> None:
             self.returncode = -15
             return -15
 
-        def terminate(self) -> None:
-            self.terminated = True
-
-    proc = Proc()
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(worker.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
     stop = threading.Event()
     stop.set()
-    returncode, interrupted = worker._wait_for_child(proc, stop)
-    assert interrupted is True
-    assert proc.terminated is True
+    returncode, reason = worker._wait_for_child(Proc(), stop)
+    assert reason == "stop"
     assert returncode == -15
+    assert signals == [(4321, worker._sig.SIGTERM)]
+
+
+# --- timeouts -------------------------------------------------------------
+
+
+def test_wait_for_child_reports_timeout_when_the_deadline_has_passed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Proc:
+        pid = 4321
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("child", timeout)
+            self.returncode = -15
+            return -15
+
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(worker.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    returncode, reason = worker._wait_for_child(
+        Proc(), None, deadline=time.monotonic() - 1
+    )
+    assert reason == "timeout"
+    assert returncode == -15
+    assert signals == [(4321, worker._sig.SIGTERM)]
+
+
+def test_wait_for_child_without_a_deadline_does_not_time_out() -> None:
+    class Proc:
+        pid = 1
+        returncode: int | None = None
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    assert worker._wait_for_child(Proc(), None, deadline=None) == (0, None)
+
+
+def test_a_stop_request_wins_over_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Proc:
+        pid = 4321
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("child", timeout)
+            self.returncode = -15
+            return -15
+
+    monkeypatch.setattr(worker.os, "killpg", lambda pid, sig: None)
+    stop = threading.Event()
+    stop.set()
+    _returncode, reason = worker._wait_for_child(
+        Proc(), stop, deadline=time.monotonic() - 1
+    )
+    assert reason == "stop"
+
+
+def test_run_job_times_out_a_real_sleeping_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker.signal(tmp_path, "doctor", job_id="slow", timeout_s=1)
+    monkeypatch.setattr(
+        worker,
+        "build_command",
+        lambda job, argv0: [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+
+    started = time.monotonic()
+    job = worker.run_job(tmp_path, tmp_path / "inbox" / "slow.json")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5
+    assert job.status == worker.FAILED
+    assert job.timed_out is True
+    assert job.returncode == -worker._sig.SIGTERM
+    assert job.error == "timed out after 1s; the process group was terminated"
+    log = (tmp_path / "logs" / "slow.log").read_text()
+    assert "TIMEOUT: exceeded 1s" in log
+    assert "sending SIGTERM to the process group" in log
+
+
+def test_a_timeout_kills_the_whole_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pidfile = tmp_path / "grandchild.pid"
+    script = f"sleep 30 & echo $! > {shlex.quote(str(pidfile))}; wait"
+    worker.signal(tmp_path, "doctor", job_id="tree", timeout_s=1)
+    monkeypatch.setattr(worker, "build_command", lambda job, argv0: ["sh", "-c", script])
+
+    job = worker.run_job(tmp_path, tmp_path / "inbox" / "tree.json")
+    assert job.timed_out is True
+
+    pid = int(pidfile.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"grandchild {pid} survived the process-group kill")
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, "5"])
+def test_signal_rejects_an_invalid_timeout(tmp_path: Path, bad: object) -> None:
+    with pytest.raises(MsftError, match="invalid timeout_s"):
+        worker.signal(tmp_path, "train", timeout_s=bad)  # type: ignore[arg-type]
+    assert not list(tmp_path.glob("inbox/*.json"))
+
+
+def test_signal_writes_a_valid_timeout(tmp_path: Path) -> None:
+    worker.signal(tmp_path, "train", job_id="t", timeout_s=7200)
+    data = json.loads((tmp_path / "inbox" / "t.json").read_text())
+    assert data["timeout_s"] == 7200
+
+
+def test_a_job_file_without_a_timeout_still_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = worker.worker_dir(tmp_path)
+    payload = worker.Job(id="old", kind="doctor").to_dict()
+    payload.pop("timeout_s")
+    payload.pop("timed_out")
+    (root / "inbox" / "old.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    class Done:
+        pid = 1
+        returncode: int | None = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    monkeypatch.setattr(worker.subprocess, "Popen", Done)
+    job = worker.run_job(root, root / "inbox" / "old.json")
+    assert job.status == worker.DONE
+    assert job.timeout_s is None
+    assert job.timed_out is False
+
+
+def test_a_job_with_an_invalid_timeout_is_quarantined(tmp_path: Path) -> None:
+    root = worker.worker_dir(tmp_path)
+    payload = worker.Job(id="badto", kind="doctor").to_dict()
+    payload["timeout_s"] = "abc"
+    (root / "inbox" / "badto.json").write_text(json.dumps(payload), encoding="utf-8")
+    worker.signal(tmp_path, "doctor", job_id="zz-after")
+
+    assert worker.serve(tmp_path, once=True, interval=0.01) == 0
+    broken = json.loads((root / "done" / "badto.json").read_text())
+    assert broken["status"] == worker.FAILED
+    assert "invalid timeout_s" in broken["error"]
+
+    # The worker survived the hand-edited file and still runs the next job.
+    assert worker.serve(tmp_path, once=True, interval=0.01) == 0
+    after = json.loads((root / "done" / "zz-after.json").read_text())
+    assert after["status"] == worker.DONE
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [("90", 90), ("90s", 90), ("45m", 2700), ("2h", 7200), ("1d", 86400), ("30m", 1800)],
+)
+def test_parse_duration_accepts_whole_units(text: str, seconds: int) -> None:
+    assert worker.parse_duration(text) == seconds
+
+
+@pytest.mark.parametrize("text", ["0", "-5", "1.5h", "2x", "", "1/2", "99999d"])
+def test_parse_duration_rejects_everything_else(text: str) -> None:
+    with pytest.raises(MsftError, match="invalid --timeout"):
+        worker.parse_duration(text)
 
 
 def test_run_job_rejects_an_unknown_kind(tmp_path: Path) -> None:

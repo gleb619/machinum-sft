@@ -188,7 +188,9 @@ def test_train_prints_plan_from_module(
         calls["plan"] = cfg.name
         return {"stage": "train", "model": cfg.model.id, "execute": False}
 
-    def run(cfg: Any, *, execute: bool = False) -> dict[str, Any]:
+    def run(
+        cfg: Any, *, execute: bool = False, inspect_mask: bool = False
+    ) -> dict[str, Any]:
         calls["run"] = execute
         return {"stage": "train", "executed": execute}
 
@@ -196,6 +198,7 @@ def test_train_prints_plan_from_module(
     stub.plan = plan  # type: ignore[attr-defined]
     stub.run = run  # type: ignore[attr-defined]
     stub.build_script = lambda cfg: "# script\n"  # type: ignore[attr-defined]
+    stub.IGNORED_KNOBS = {}  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "msft.train", stub)
 
     path = write_config(tmp_path)
@@ -280,7 +283,7 @@ def test_remote_sync_exit_code_follows_the_result(
     monkeypatch.setattr(
         remote,
         "sync",
-        lambda host, local, dest, execute=False: {
+        lambda host, local, *, base_dir=".", delete=False, execute=False: {
             "executed": True,
             "ok": False,
             "returncode": 23,
@@ -290,6 +293,38 @@ def test_remote_sync_exit_code_follows_the_result(
     code = main(["--config", str(path), "remote", "sync", "--execute"])
     assert code == 1
     assert "rsync failed" in capsys.readouterr().out
+
+
+def test_remote_sync_defaults_local_to_the_config_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import msft.remote as remote
+
+    _remote_env(monkeypatch)
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        remote,
+        "sync",
+        lambda host, local, *, base_dir=".", delete=False, execute=False: (
+            seen.update(local=local, base_dir=str(base_dir)) or {"executed": False}
+        ),
+    )
+    path = write_config(tmp_path)
+    assert main(["--config", str(path), "remote", "sync"]) == 0
+    assert seen["local"] == "data/raw"
+    assert seen["base_dir"] == str(tmp_path)
+
+
+def test_remote_sync_remote_flag_is_a_removed_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import msft.remote as remote
+
+    _remote_env(monkeypatch)
+    monkeypatch.setattr(remote, "sync", lambda *args, **kwargs: {"executed": False})
+    code = main(["--config", str(write_config(tmp_path)), "remote", "sync", "--remote", "x"])
+    assert code == 2
+    assert "--remote was removed" in capsys.readouterr().err
 
 
 def test_remote_run_plan_still_exits_zero(
@@ -302,9 +337,56 @@ def test_remote_run_plan_still_exits_zero(
     monkeypatch.setattr(
         remote,
         "run_remote",
-        lambda cfg, host, execute=False: {"executed": False, "host": "masked"},
+        lambda cfg, host, execute=False, timeout_s=None: {
+            "executed": False,
+            "host": "masked",
+        },
     )
     assert main(["--config", str(path), "remote", "run"]) == 0
+
+
+def test_worker_signal_prints_the_parsed_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _remote_env(monkeypatch)
+    code = main(
+        [
+            "--json",
+            "--config",
+            str(write_config(tmp_path)),
+            "worker",
+            "signal",
+            "doctor",
+            "--dir",
+            str(tmp_path / ".worker"),
+            "--timeout",
+            "15m",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["timeout"] == "900s"
+
+
+def test_a_bad_timeout_is_a_validation_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _remote_env(monkeypatch)
+    code = main(
+        [
+            "--config",
+            str(write_config(tmp_path)),
+            "worker",
+            "signal",
+            "doctor",
+            "--dir",
+            str(tmp_path / ".worker"),
+            "--timeout",
+            "2x",
+        ]
+    )
+    assert code == 2
+    assert "invalid --timeout '2x'" in capsys.readouterr().err
 
 
 def test_remote_status_exits_one_when_ssh_failed(

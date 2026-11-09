@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from msft.config import MsftError, redact
-from msft.remote import mask_host
+from msft.remote import mask_host, remote_path, remote_repo_dir
 
 CONFIG_CANDIDATES = ("configs/worker.local.yaml", "worker.local.yaml")
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
@@ -61,7 +61,7 @@ def load_spec(path: str | Path | None = None) -> WorkerSpec:
         )
     return WorkerSpec(
         host=host,
-        repo_dir=str(data.get("repo_dir") or WorkerSpec.repo_dir),
+        repo_dir=str(data.get("repo_dir") or remote_repo_dir()),
         compose_file=str(data.get("compose_file") or WorkerSpec.compose_file),
         container=str(data.get("container") or WorkerSpec.container),
     )
@@ -89,9 +89,11 @@ def _ssh(spec: WorkerSpec, command: str, *, execute: bool) -> dict[str, Any]:
 
 def pull(spec: WorkerSpec, *, execute: bool = False) -> dict[str, Any]:
     """Fast-forward the box to the pushed branch (single source of truth)."""
+    safe = '-c safe.directory="$PWD"'
     return _ssh(
         spec,
-        f"cd {shlex.quote(spec.repo)} && git fetch --all --prune && git pull --ff-only",
+        f"cd {remote_path(spec.repo)} && git {safe} fetch --all --prune"
+        f" && git {safe} pull --ff-only",
         execute=execute,
     )
 
@@ -101,7 +103,7 @@ def up(spec: WorkerSpec, *, execute: bool = False, build: bool = True) -> dict[s
     flag = "--build" if build else "--no-build"
     return _ssh(
         spec,
-        f"cd {shlex.quote(spec.repo)} && docker compose -f {shlex.quote(spec.compose_file)}"
+        f"cd {remote_path(spec.repo)} && docker compose -f {shlex.quote(spec.compose_file)}"
         f" up -d {flag} worker",
         execute=execute,
     )
@@ -111,7 +113,7 @@ def restart(spec: WorkerSpec, *, execute: bool = False) -> dict[str, Any]:
     """Restart the worker container in place (after a pull that changed worker code)."""
     return _ssh(
         spec,
-        f"cd {shlex.quote(spec.repo)} && docker compose -f {shlex.quote(spec.compose_file)}"
+        f"cd {remote_path(spec.repo)} && docker compose -f {shlex.quote(spec.compose_file)}"
         " restart worker",
         execute=execute,
     )
@@ -121,7 +123,7 @@ def down(spec: WorkerSpec, *, execute: bool = False) -> dict[str, Any]:
     """Stop and remove the worker container (the image and the mount stay)."""
     return _ssh(
         spec,
-        f"cd {shlex.quote(spec.repo)} && docker compose -f {shlex.quote(spec.compose_file)}"
+        f"cd {remote_path(spec.repo)} && docker compose -f {shlex.quote(spec.compose_file)}"
         " down",
         execute=execute,
     )
@@ -133,26 +135,34 @@ def signal(
     *,
     config: str | None = None,
     job_id: str | None = None,
+    extra_args: list[str] | None = None,
+    timeout_s: int | None = None,
     execute: bool = False,
 ) -> dict[str, Any]:
     """Queue a job by writing the request file through the container (no python on the host)."""
-    args = [f'"{kind}"']
+    args = [shlex.quote(kind)]
     if config:
         args.append(f"--config {shlex.quote(config)}")
     if job_id:
         args.append(f"--id {shlex.quote(job_id)}")
+    for extra in extra_args or []:
+        # `--arg=--inspect-mask`, never `--arg --inspect-mask`: argparse reads an
+        # option-looking token as a flag, not as the value.
+        args.append(f"--arg={shlex.quote(extra)}")
+    if timeout_s is not None:
+        args.append(f"--timeout {int(timeout_s)}")
     inner = (
         "docker exec "
         f"{shlex.quote(spec.container)} python -m msft worker signal {' '.join(args)} "
         "--dir /workspace/.worker"
     )
-    return _ssh(spec, f"cd {shlex.quote(spec.repo)} && {inner}", execute=execute)
+    return _ssh(spec, f"cd {remote_path(spec.repo)} && {inner}", execute=execute)
 
 
 def status(spec: WorkerSpec, *, execute: bool = False) -> dict[str, Any]:
     """Container health plus the queue summary from inside the worker."""
     compose = (
-        f"cd {shlex.quote(spec.repo)} && docker compose -f {shlex.quote(spec.compose_file)}"
+        f"cd {remote_path(spec.repo)} && docker compose -f {shlex.quote(spec.compose_file)}"
         " ps --format json"
     )
     queue = (

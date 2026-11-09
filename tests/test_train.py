@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import dataclasses
 import json
 import subprocess
 import sys
@@ -10,7 +12,16 @@ from pathlib import Path
 import pytest
 
 from msft import merge, train
-from msft.config import DataCfg, LoraCfg, ModelCfg, MsftError, QuantCfg, RunConfig, TrainCfg
+from msft.config import (
+    DataCfg,
+    LoraCfg,
+    ModelCfg,
+    MsftError,
+    QuantCfg,
+    RunConfig,
+    TrainCfg,
+    validate_config,
+)
 
 
 @pytest.fixture()
@@ -229,6 +240,161 @@ def test_execute_sends_the_child_output_to_stderr(
 
     assert captured["stdout"] is sys.stderr
     assert capsys.readouterr().out == ""
+
+
+# --- loss-mask measurement ------------------------------------------------
+
+
+def _extract_mask_report(script: str):
+    """Exec the report helper exactly as it is embedded in the generated script."""
+    start = script.index("# --- loss-mask report")
+    end = script.index("# --- end loss-mask report ---")
+    end += len("# --- end loss-mask report ---")
+    namespace: dict[str, object] = {}
+    exec(script[start:end], namespace)
+    return namespace["mask_report"]
+
+
+def test_mask_report_full_sequence() -> None:
+    report = train.mask_report([0, 1, 2, 3], [0, 1, 2, 3], [1, 1, 1, 1], prompt_len=2)
+    assert report["verdict"] == "FULL-SEQUENCE"
+    assert report["real_tokens"] == 4
+    assert report["labeled"] == 4
+    assert report["masked_leading"] == 0
+
+
+def test_mask_report_completion_only() -> None:
+    report = train.mask_report(
+        [0, 1, 2, 3, 4], [-100, -100, 2, 3, 4], [1, 1, 1, 1, 1], prompt_len=2
+    )
+    assert report["verdict"] == "COMPLETION-ONLY"
+    assert report["first_labeled"] == 2
+    assert report["masked_leading"] == 2
+    assert report["last_real_labeled"] is True
+
+
+def test_mask_report_ignores_padding_tokens() -> None:
+    """Truncation/padding leaves attention_mask==0 slots that must not count as real tokens."""
+    report = train.mask_report(
+        [0, 1, 2, 3, 0, 0], [-100, -100, 2, 3, -100, -100], [1, 1, 1, 1, 0, 0], prompt_len=2
+    )
+    assert report["real_tokens"] == 4
+    assert report["labeled"] == 2
+    assert report["verdict"] == "COMPLETION-ONLY"
+
+
+def test_mask_report_flags_an_unlabeled_final_token() -> None:
+    report = train.mask_report(
+        [0, 1, 2, 3], [-100, -100, 2, -100], [1, 1, 1, 1], prompt_len=2
+    )
+    assert report["verdict"] == "UNEXPECTED"
+    assert report["last_real_labeled"] is False
+
+
+def test_mask_report_counts_every_leading_masked_token() -> None:
+    report = train.mask_report(
+        [0, 1, 2, 3, 4], [-100, -100, -100, 3, 4], [1, 1, 1, 1, 1], prompt_len=3
+    )
+    assert report["masked_leading"] == 3
+    assert report["first_labeled"] == 3
+    assert report["verdict"] == "COMPLETION-ONLY"
+
+
+def test_the_embedded_mask_helper_matches_the_imported_one(cfg: RunConfig) -> None:
+    embedded = _extract_mask_report(train.build_script(cfg))
+    args = ([0, 1, 2, 3], [-100, -100, 2, 3], [1, 1, 1, 1])
+    assert embedded(*args, prompt_len=2) == train.mask_report(*args, prompt_len=2)
+    assert embedded(*args, prompt_len=2)["verdict"] == "COMPLETION-ONLY"
+
+
+def test_the_script_measures_the_mask_before_training(cfg: RunConfig) -> None:
+    script = train.build_script(cfg)
+    ast.parse(script)
+    assert "mask_report(" in script
+    assert "batch = next(iter(trainer.get_train_dataloader()))" in script
+    assert "MSFT_INSPECT_MASK" in script
+    assert "loss-mask: VERDICT" in script
+    assert script.index("SFTTrainer(") < script.index("= mask_report(")
+    assert script.index("= mask_report(") < script.index("trainer.train()")
+
+
+def test_inspect_mask_sets_the_env_and_skips_the_adapter_assertion(
+    cfg: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(train.subprocess, "run", fake_run)
+    result = train.run(cfg, execute=True, inspect_mask=True)
+
+    env = seen["env"]
+    assert isinstance(env, dict)
+    assert env["MSFT_INSPECT_MASK"] == "1"
+    assert result["inspect_mask"] is True
+    assert result["executed"] is True
+    assert not cfg.adapter_path.exists()
+
+
+def test_plan_lists_the_ignored_knobs(cfg: RunConfig) -> None:
+    assert train.plan(cfg)["optim"]["ignored_knobs"] == train.IGNORED_KNOBS
+
+
+def test_validate_config_warns_about_an_ignored_knob(tmp_path: Path) -> None:
+    cfg = RunConfig(
+        name="model",
+        base_dir=str(tmp_path),
+        train=TrainCfg(packing=True),
+        quantize=QuantCfg(output="out/model.gguf"),
+    )
+    warnings = validate_config(cfg)
+    assert any("train.packing is ignored" in warning for warning in warnings)
+
+
+def _sentinel_for(value: object) -> object:
+    """A value of the same shape but certainly different from `value`."""
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, int):
+        return value + 7
+    if isinstance(value, float):
+        return value + 0.123
+    if isinstance(value, list):
+        return [*value, "sentinel_x"]
+    return "sentinel_x"
+
+
+def test_every_config_knob_reaches_the_script_or_is_listed_ignored(
+    tmp_path: Path,
+) -> None:
+    baseline = train.build_script(RunConfig(name="knob", base_dir=str(tmp_path)))
+    sections = {"model": ModelCfg, "lora": LoraCfg, "train": TrainCfg}
+
+    for section, cls in sections.items():
+        for spec in dataclasses.fields(cls):
+            cfg = RunConfig(name="knob", base_dir=str(tmp_path))
+            target = getattr(cfg, section)
+            if spec.default is not dataclasses.MISSING:
+                default = spec.default
+            elif spec.default_factory is not dataclasses.MISSING:
+                default = spec.default_factory()
+            else:
+                default = getattr(target, spec.name)
+            setattr(target, spec.name, _sentinel_for(default))
+            knob = f"{section}.{spec.name}"
+            changed = train.build_script(cfg) != baseline
+            if knob in train.IGNORED_KNOBS:
+                assert not changed, (
+                    f"stale IGNORED_KNOBS entry {knob}: it now changes the script; "
+                    "remove it"
+                )
+            else:
+                assert changed, (
+                    f"knob {knob} is read from the config but never reaches the generated "
+                    "script; use it or add it to IGNORED_KNOBS with a reason"
+                )
 
 
 def test_merge_sends_the_child_output_to_stderr(
