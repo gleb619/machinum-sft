@@ -113,6 +113,19 @@ as «палубный甲板 магазина». Nothing ratio-based catches it; 
 `scripts/audit_translation.py` over the finished book, and keep the linter's `foreign-script`
 rule (added in `ce31a9d`) as the retry trigger.
 
+**A detached tmux pane has no foreground process group.** `docker exec -it` there stops dead in
+state `T` on its first read (SIGTTIN), and `-t` with a redirected stdin is refused outright, so a
+`--tmux` job looked "started" while running nothing: no log, no exit code, `logs --wait` blocked for
+ever. Run `docker exec -i` with stdin from the null device, and stop the job by the pid it writes
+into `.worker/tmux/<session>.pid` — C-c has no tty to forward to. The session also runs a small
+script file uploaded with base64: quoting a command that already contains quotes turns `exec` into
+literal text.
+
+**`repo_dir` in `configs/worker.local.yaml` is relative on purpose.** `cd WORKSPACE/machinum-sft`
+resolves against whatever directory the ssh shell starts in, so every remote command died with "No
+such file or directory" while the repo sat in the home directory. `remote_path()` anchors a
+relative remote path at `$HOME`, which is also what rsync does with a relative destination.
+
 **`completion_only_loss` trains the prompt too (measured 2026-11-09).** The generated script passes
 `completion_only_loss=True` on a single `text` column, which TRL 1.15 rejects for a language-modeling
 dataset, so the flag cannot be honoured — but the loss still ran over everything:

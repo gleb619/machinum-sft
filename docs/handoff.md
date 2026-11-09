@@ -168,3 +168,29 @@ docker exec ollama ollama push <user>/machinum-book-ru:4b
   516 MB for a 4B model is a 0.8B model with the wrong name.
 - Run the smoke config for 3 minutes after touching train/merge/quantize. It has caught every
   regression on this path so far.
+
+## Which way to run a stage
+
+`remote run` has three modes and they are not interchangeable. Queue is the default for anything
+GPU-heavy; tmux is the escape hatch; foreground is for a short job you want to watch.
+
+| | foreground | `--tmux` | `--queue` |
+|---|---|---|---|
+| survives a dropped link | no (detected in ~2 min) | yes | yes |
+| survives a box reboot | no | no (`lost`) | marked failed, never requeued |
+| serialised against other GPU jobs | no | guard only | yes |
+| records rc / duration / status | no | rc file | `done/<id>.json` |
+| attach and debug live | no | yes (`tmux attach`) | no |
+| needs the worker container up | yes | yes | yes |
+
+```bash
+msft remote run --config configs/qwen3.5-4b-lora.yaml --execute              # foreground, streams
+msft remote run --tmux  --config configs/qwen3.5-4b-lora.yaml --execute      # detached on the box
+msft remote logs --tmux <session> --wait --execute                           # block on its exit code
+msft remote stop --tmux <session> --execute                                  # SIGTERM, then kill
+
+msft remote run --queue --config configs/qwen3.5-4b-lora.yaml --timeout 2h --execute
+msft remote logs --job <id> --wait --execute
+```
+
+There is no per-job cancel for the queue: `worker reset` or stopping the container are the tools.
