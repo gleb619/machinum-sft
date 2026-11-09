@@ -165,3 +165,15 @@ traps that cost a run each.
 Base model Qwen3.5-4B under its own licence; the adapter, the tooling and these notes are MIT.
 The training corpus is a private parallel translation and is not redistributed. If you publish a
 derivative of this adapter, keep the base model's attribution.
+
+## Which model to run
+
+This page describes `machinum:4b`, the artefact this repo builds: 2.63 GB, 3.2 GB of VRAM, ~40 s
+per chapter, correct through the pipeline but with occasional semantic slips (it has rendered
+"boats" as "yachts" and "tin" as "brass").
+
+For the finished text there is one second model in the project,
+`igorls/gemma-4-12B-it-heretic-GGUF`: 7.4 GB, 8.4 GB of VRAM at 32 768 context, ~60 s per chapter,
+and it stops making those substitutions. Both run on one 16 GB card through the same endpoint;
+the measurements and the reasons every other candidate was discarded are in
+[model-candidates.md](model-candidates.md).
