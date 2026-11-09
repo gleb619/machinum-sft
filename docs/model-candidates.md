@@ -63,3 +63,33 @@ Verdict for this repo:
    that size needs QLoRA on 16 GB and no concurrent training job.
 3. Never ship an abliterated model as the pipeline's default. If one is tried, it goes through
    `msft eval` like everything else.
+
+
+## Tested on this box, on our task
+
+Same chapter (held-out book2 ch.1), same filled glossary, same flags, one card, through `mt`:
+
+| model | quant | size | resident @ 32k | chapter | prose verdict |
+| --- | --- | --- | --- | --- | --- |
+| `machinum:4b` (ours) | Q4_K_S | 2.63 GB | 3.2 GB | **40 s** | fluent, but semantic slips |
+| `igorls/gemma-4-12B-it-heretic-GGUF` | Q4_K_M | 7.4 GB | **8.4 GB** | 60 s | close to a 27B, no slips in the sample |
+| `qwen3.8:27b` | Q4_K_M | 17 GB | 20 GB (both cards) | 107 s | best; one case error |
+
+Aggregates do not separate them — all three: 17/17 lines, 0 metadata leaks, 0 foreign
+characters, identical name handling, Cyrillic share 0.79. The gap is semantic, and it shows on
+a single sentence. *“…a tin of licorice drops at his elbow”*:
+
+- 4B: «баночкой с жевательной резинкой на подоконнике» — licorice became chewing gum, elbow
+  became windowsill.
+- 12B heretic: «баночкой лакричных конфет у локтя» — correct, slightly literal.
+- 27B: «жестяная банка с леденцами из лакрицы» — correct and idiomatic.
+
+*“…Cormac Doyle had owned boats … in the lot behind the boatyard”*: 4B says «владел яхтами …
+в гараже за причалом» (yachts, garage); the 12B says «владел лодками … на стоянке за верфью»,
+correctly. *“She set the reel in the tin”*: 4B renders tin as «латунь» (brass) — the 12B and 27B
+both say «жестяная коробка».
+
+**So the guide's "small GPU" pick is right, and it is a genuine step up from our 4B**: 2.4× the
+time and 2.6× the VRAM for prose that no longer invents objects. It does not beat the 27B, and
+the 27B does not fit one card. Abliteration itself is irrelevant to this task — nothing here was
+refused by any model — the win is simply 11.9 B parameters instead of 4.7 B.

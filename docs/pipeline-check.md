@@ -98,6 +98,31 @@ Two defects survived to the audit and both are now fixed in the pipeline:
   («Пеларгик»); the entry was corrected by hand — which is exactly the workflow the file's
   comment describes — and the seven affected chapters re-ran in 4 minutes.
 
+### The glossary itself was the worst defect
+
+The automated fill made the drift *worse* in one respect: it translated each term in isolation,
+so the file ended up containing `Doyle → «Дойл»` alongside `Fiona Doyle → «Файона Доул»`,
+`Cormac Doyle → «Кормак До»` (truncated mid-name), `Fiona's → «Файон»` — and, because the
+extractor's heuristic also proposes ordinary words, `March → «Мэрч»`, `Lock → «Лок»`,
+`Rain → «Дождь»`, `Bring → «Приносить»` and `Rusk Marine → «Российский морской пехотинец»`.
+`tagWithGlossary` pins whatever the file says, so those entries were being injected into every
+prompt: a poisoned glossary corrupts more reliably than a good one helps.
+
+Fixed by separating the two jobs:
+
+- `chapters/names.json` — an editorial table of the book's proper nouns, check in the repo, with
+  the Russian form and its genitive (Доул, Раска, Файоны, Оконкво…). Names are editorial
+  decisions; they should not be re-invented per run.
+- `scripts/apply_names.py` — rewrites every glossary entry from that table, marks the extractor's
+  non-names `ignored` (the pipeline honours the flag, so they stay on record but never enter a
+  prompt), and creates entries the extractor missed (`Kestrel Point`, `Marrow Bay Municipal
+  Archive`, the ship `The Anselm`). Result: 63 active terms, 45 ignored.
+- `scripts/compare_translations.py` — the measurement that caught it: parity, words, sentence
+  length, Cyrillic share, repetition, foreign script, and the name forms each model produced.
+
+After the re-run, across all 21 chapters: «Доул» ×18 and zero «Дойл»/«Доули», «Раск» ×23 and zero
+«Ракс», «Надя» ×99 with one stray «Надия». Name drift is now a rounding error, not a defect class.
+
 Residual, measured honestly: **10 of 331 lines** still use a second spelling of a name
 («Надия» ×2, «Доул» ×2, «Доули» ×1, «Дойл» ×5) against 97 × «Надя» and 24 × «Файона». The
 glossary pins most lines, not all; a proofreading pass over the finished book is the next step,
