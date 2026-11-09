@@ -113,6 +113,21 @@ as «палубный甲板 магазина». Nothing ratio-based catches it; 
 `scripts/audit_translation.py` over the finished book, and keep the linter's `foreign-script`
 rule (added in `ce31a9d`) as the retry trigger.
 
+**`completion_only_loss` trains the prompt too (measured 2026-11-09).** The generated script passes
+`completion_only_loss=True` on a single `text` column, which TRL 1.15 rejects for a language-modeling
+dataset, so the flag cannot be honoured — but the loss still ran over everything:
+
+```
+msft remote signal train --config configs/smoke-qwen3.5-0.8b.yaml --arg=--inspect-mask --execute
+[msft] loss-mask: real_tokens=249 labeled=248 masked_leading=1 (expected prompt len 100)
+[msft] loss-mask: VERDICT UNEXPECTED
+```
+
+One masked leading token against a 100-token prompt means the system prompt and the English source
+are trained alongside the translation — every adapter so far was built this way. The report prints
+for every run now, so this cannot regress silently. Loss magnitudes from those runs are therefore
+not comparable with completion-only runs.
+
 **A stale `packages/core/dist` fabricates typecheck errors.** `@mt/tools` resolves `@mt/core`
 through `dist/index.d.ts`, and the root `npx tsc --noEmit` does not build dependencies, so it
 reported 0 errors while `tsc -p packages/tools/tsconfig.json` reported 57 — every one of them a
