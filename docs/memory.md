@@ -109,6 +109,14 @@ as «палубный甲板 магазина». Nothing ratio-based catches it; 
 `scripts/audit_translation.py` over the finished book, and keep the linter's `foreign-script`
 rule (added in `ce31a9d`) as the retry trigger.
 
+**A stale `packages/core/dist` fabricates typecheck errors.** `@mt/tools` resolves `@mt/core`
+through `dist/index.d.ts`, and the root `npx tsc --noEmit` does not build dependencies, so it
+reported 0 errors while `tsc -p packages/tools/tsconfig.json` reported 57 — every one of them a
+mismatch between the new source (`class Chapter`) and the old declaration file (`interface
+Chapter`). It looked exactly like a half-finished refactor and cost an hour. Run
+`npx pnpm --filter @mt/core build` before believing a type error in a cross-package boundary, and
+use `pnpm typecheck` (which builds first) rather than a bare `tsc`.
+
 **`MT_OLLAMA_URL` must include `/v1`.** It is an OpenAI base URL, not a host. Without the suffix
 every call returns `404 page not found` from a server that answers `/api/tags` perfectly.
 
