@@ -33,6 +33,20 @@ DEFAULT_CONFIG = Path("configs") / "qwen3.5-9b-qlora.yaml"
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PACKAGE_ROOT.parent
 
+RUN_MODES_HELP = """\
+Which mode to use:
+
+| | foreground | `--tmux` | `--queue` |
+|---|---|---|---|
+| survives a dropped link | no (detected fast) | yes | yes |
+| survives a box reboot | no | no (`lost`) | job marked failed, never requeued |
+| serialised against other GPU jobs | no | guard only | yes |
+| recorded rc / duration / status | no | rc file | `done/<id>.json` |
+| attach and debug live | no | yes (`tmux attach`) | no |
+
+Only --queue and --tmux survive a dropped link.
+"""
+
 Handler = Callable[[RunConfig | None, argparse.Namespace], int]
 
 
@@ -136,6 +150,32 @@ def _exit_for(result: dict[str, Any]) -> int:
     if "ok" in result:
         return EXIT_OK if result["ok"] else 1
     return EXIT_OK if result.get("returncode", 0) == 0 else 1
+
+
+def _exit_for_run(result: dict[str, Any]) -> int:
+    """0 ok/plan, 1 the remote command failed, 2 it could not run (transport)."""
+    failure = result.get("failure")
+    if failure == "remote":
+        return 1
+    if failure == "transport":
+        return 2
+    if result.get("state") == "started":
+        return EXIT_OK
+    if result.get("executed") is False:
+        return EXIT_OK
+    return EXIT_OK if result.get("ok") else 1
+
+
+def _exit_for_logs(result: dict[str, Any]) -> int:
+    """`lost` cannot be read (2); a job verdict follows its rc; running/stopped are fine."""
+    state = result.get("state")
+    if state == "lost":
+        return EXIT_ERROR
+    if state == "failed":
+        return 1
+    if state in ("done", "exited"):
+        return EXIT_OK if result.get("returncode") in (0, None) else 1
+    return EXIT_OK if result.get("ok", True) else 1
 
 
 # --- configuration --------------------------------------------------------
@@ -392,21 +432,167 @@ def _parse_timeout(value: str | None) -> int | None:
     return int(_func(worker, "parse_duration")(value))
 
 
+def _run_kind(args: argparse.Namespace) -> str:
+    """Validate the job kind locally so a typo fails in 0.0 s, not in the container."""
+    kind = str(getattr(args, "kind", "train") or "train")
+    worker = _impl("msft.worker")
+    kinds = tuple(getattr(worker, "JOB_KINDS", ()))
+    if kinds and kind not in kinds:
+        raise MsftError(f"unknown kind '{kind}'; pick one of {', '.join(kinds)}")
+    return kind
+
+
+def _queue_remote(
+    cfg: RunConfig,
+    kind: str,
+    extra_args: list[str],
+    timeout_s: int | None,
+    as_json: bool,
+    execute: bool,
+) -> int:
+    """`remote run --queue`: signal the worker, with an id generated locally."""
+    remote = _impl("msft.remote")
+    deploy = _impl("msft.deploy")
+    spec = deploy.load_spec()
+    ident = _func(remote, "job_id")(kind)
+    result = _jsonable(
+        _func(deploy, "signal")(
+            spec,
+            kind,
+            config=_func(remote, "remote_config")(cfg),
+            job_id=ident,
+            extra_args=extra_args,
+            timeout_s=timeout_s,
+            execute=execute,
+        )
+    )
+    queued = bool(result.get("executed")) and bool(result.get("ok"))
+    state = "queued" if queued else ("plan" if not result.get("executed") else "failed")
+    payload = {**result, "id": ident, "kind": kind, "state": state}
+    if queued:
+        text = (
+            f"queued {ident} (kind {kind})\n"
+            f"follow: msft remote logs --job {ident} --follow\n"
+            f"wait:   msft remote logs --job {ident} --wait"
+        )
+    elif state == "plan":
+        text = f"queue plan {ident} (kind {kind})"
+    else:
+        text = f"queue failed {ident} (kind {kind}) rc={result.get('returncode')}"
+    _emit(as_json, payload, text)
+    if state == "plan":
+        return EXIT_OK
+    return EXIT_OK if queued else 1
+
+
 def _cmd_remote_run(cfg: RunConfig | None, args: argparse.Namespace) -> int:
-    """Run the whole pipeline on the remote host."""
+    """Run the configured stage in the foreground, under tmux, or through the queue."""
+    queue = bool(getattr(args, "queue", False))
+    tmux = bool(getattr(args, "tmux", False))
+    if queue and tmux:
+        raise MsftError("--queue and --tmux are mutually exclusive")
+    if getattr(args, "session", None) and not tmux:
+        raise MsftError("--session only applies to --tmux")
     config = _require_config(cfg)
+    kind = _run_kind(args)
+    extra_args = list(getattr(args, "extra_args", []) or [])
+    timeout_s = _parse_timeout(getattr(args, "timeout", None))
+    if queue:
+        return _queue_remote(
+            config, kind, extra_args, timeout_s, bool(args.as_json), bool(args.execute)
+        )
     remote = _impl("msft.remote")
     host = _remote_host()
+    if tmux:
+        result = _jsonable(
+            _func(remote, "launch_tmux")(
+                config,
+                host,
+                kind=kind,
+                extra_args=extra_args,
+                timeout_s=timeout_s,
+                session=getattr(args, "session", None),
+                force=bool(getattr(args, "force", False)),
+                execute=bool(args.execute),
+            )
+        )
+        _emit(args.as_json, result, _render("remote run --tmux", result))
+        return _exit_for_run(result)
     result = _jsonable(
         _func(remote, "run_remote")(
             config,
             host,
+            kind=kind,
+            extra_args=extra_args,
             execute=bool(args.execute),
-            timeout_s=_parse_timeout(args.timeout),
+            timeout_s=timeout_s,
         )
     )
     _emit(args.as_json, result, _render("remote run", result))
-    return _exit_for(result)
+    return _exit_for_run(result)
+
+
+def _cmd_remote_logs(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Tail a tmux session or a queued job; `--wait` follows the verdict, not the link."""
+    remote = _impl("msft.remote")
+    host = _remote_host()
+    session = getattr(args, "tmux", None)
+    job = getattr(args, "job_id", None)
+    if session and job:
+        raise MsftError("--tmux and --job are mutually exclusive")
+    if not session and not job:
+        raise MsftError("logs needs --tmux NAME or --job ID")
+    if getattr(args, "follow", False) and getattr(args, "wait", False):
+        raise MsftError("--follow and --wait are mutually exclusive")
+    if session:
+        result = _jsonable(
+            _func(remote, "logs_tmux")(
+                host,
+                session,
+                lines=int(args.lines),
+                follow=bool(args.follow),
+                wait=bool(args.wait),
+            )
+        )
+        label = f"tmux {result.get('session')}"
+    else:
+        result = _jsonable(
+            _func(remote, "logs_job")(
+                host,
+                job,
+                lines=int(args.lines),
+                wait=bool(args.wait),
+            )
+        )
+        label = f"job {result.get('job')}"
+    state = result.get("state")
+    rc = result.get("returncode")
+    _log(f"{label}: {state}" + (f" rc={rc}" if rc is not None else ""))
+    text = str(result.get("tail") or "")
+    if state == "follow-ended" and not args.as_json:
+        return EXIT_OK
+    _emit(args.as_json, result, text)
+    return _exit_for_logs(result)
+
+
+def _cmd_remote_stop(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Stop a tmux session: C-c first, kill after the grace period."""
+    remote = _impl("msft.remote")
+    host = _remote_host()
+    result = _jsonable(
+        _func(remote, "stop_tmux")(
+            host, args.tmux, grace=int(args.grace), execute=True
+        )
+    )
+    if result.get("state") == "missing":
+        _emit(args.as_json, result, "no such session")
+        return 1
+    _emit(
+        args.as_json,
+        result,
+        f"stopped {args.tmux} ({result.get('state')})",
+    )
+    return EXIT_OK if result.get("ok") else 1
 
 
 def _cmd_config_show(cfg: RunConfig | None, args: argparse.Namespace) -> int:
@@ -769,10 +955,86 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_sync.set_defaults(handler=_cmd_remote_sync)
     p_run = remote_sub.add_parser(
-        "run", parents=[common], help="run the configured pipeline remotely"
+        "run",
+        parents=[common],
+        help="run a pipeline stage remotely (foreground, --tmux or --queue)",
+        description=(
+            "Run one stage on the GPU box. The foreground path streams the log and fails "
+            "fast when the link drops; --tmux detaches it; --queue hands it to the worker."
+        ),
+        epilog=RUN_MODES_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_run.add_argument(
+        "--queue",
+        action="store_true",
+        help="queue the job on the worker (serialised, survives a dropped link)",
+    )
+    p_run.add_argument(
+        "--tmux",
+        action="store_true",
+        help="run in a detached tmux session on the box (attach with tmux attach)",
+    )
+    p_run.add_argument(
+        "--session",
+        metavar="NAME",
+        default=None,
+        help="tmux session name (default: msft-<config>-<UTC stamp>; must start with msft-)",
+    )
+    p_run.add_argument(
+        "--force",
+        action="store_true",
+        help="start --tmux even when the worker already has a job in running/",
+    )
+    p_run.add_argument(
+        "--kind",
+        default="train",
+        metavar="KIND",
+        help="job kind: train, merge, quantize, eval, data, fetch, verify, doctor "
+        "(default: train)",
+    )
+    p_run.add_argument(
+        "--arg",
+        dest="extra_args",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="extra CLI arg passed to the stage (repeatable)",
     )
     p_run.add_argument("--timeout", metavar="DURATION", default=None, help="e.g. 900, 15m, 2h")
     p_run.set_defaults(handler=_cmd_remote_run)
+    p_logs = remote_sub.add_parser(
+        "logs",
+        parents=[common],
+        aliases=["log"],
+        help="tail a tmux session or a queued job (alias: log)",
+    )
+    p_logs.add_argument("--tmux", metavar="NAME", default=None, help="tmux session name")
+    p_logs.add_argument("--job", dest="job_id", metavar="ID", default=None, help="queued job id")
+    p_logs.add_argument("--lines", type=int, default=40, help="tail length (default: 40)")
+    p_logs.add_argument(
+        "--follow", action="store_true", help="stream the log; Ctrl-C does not touch the job"
+    )
+    p_logs.add_argument(
+        "--wait",
+        action="store_true",
+        help="poll every 10 s until the job has a verdict, then exit with its code",
+    )
+    p_logs.set_defaults(handler=_cmd_remote_logs)
+    p_stop = remote_sub.add_parser(
+        "stop",
+        parents=[common],
+        help="stop a tmux session (there is no per-job cancel for the queue)",
+    )
+    p_stop.add_argument("--tmux", metavar="NAME", required=True, help="tmux session name")
+    p_stop.add_argument(
+        "--grace",
+        type=int,
+        default=30,
+        metavar="SECONDS",
+        help="wait this long after C-c before killing (default: 30)",
+    )
+    p_stop.set_defaults(handler=_cmd_remote_stop)
     p_deploy = remote_sub.add_parser(
         "deploy", parents=[common], help="pull on the box and bring the worker container up"
     )

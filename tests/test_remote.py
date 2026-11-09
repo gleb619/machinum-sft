@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -69,6 +71,25 @@ def fake_ssh(monkeypatch: pytest.MonkeyPatch, responder: object) -> FakeRun:
     fake = FakeRun(responder=responder)
     monkeypatch.setattr(subprocess, "run", fake)
     return fake
+
+
+def fake_popen(
+    monkeypatch: pytest.MonkeyPatch, lines: list[str], returncode: int = 0
+) -> list[tuple[list[str], dict]]:
+    """Stand in for `subprocess.Popen`; `stdout` yields the given lines."""
+    calls: list[tuple[list[str], dict]] = []
+
+    class Fake:
+        def __init__(self, argv: list[str], **kwargs: object) -> None:
+            calls.append((list(argv), dict(kwargs)))
+            self.stdout = iter([f"{line}\n" for line in lines])
+            self.returncode = returncode
+
+        def wait(self) -> int:
+            return returncode
+
+    monkeypatch.setattr(subprocess, "Popen", Fake)
+    return calls
 
 
 def responder_ok(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -443,13 +464,18 @@ def test_run_remote_plan_composes_command(monkeypatch: pytest.MonkeyPatch) -> No
 
     argv = result["argv"]
     assert argv[:5] == ["ssh", *SSH_OPTS]
-    assert argv[5] == remote.HOST_PLACEHOLDER
-    assert argv[6] == expected_command()
-    assert argv[6].startswith("docker exec msft-worker ")
-    assert ".venv" not in argv[6]
-    assert "cd " not in argv[6]
+    assert "ServerAliveInterval=30" in argv
+    assert "ServerAliveCountMax=4" in argv
+    assert argv[-2] == remote.HOST_PLACEHOLDER
+    assert argv[-1] == remote.verdict_command(expected_command())
+    assert argv[-1].startswith("docker exec msft-worker ")
+    assert ".venv" not in argv[-1]
+    assert "cd " not in argv[-1]
     assert result["command"].startswith("ssh -o BatchMode=yes -o ConnectTimeout=10 ")
+    assert "ServerAliveInterval=30" in result["command"]
     assert result["executed"] is False
+    assert result["failure"] is None
+    assert result["ssh_returncode"] is None
     assert result["host"] == MASKED
     assert result["dir"] == "~/proj"
     assert result["config"] == "configs/smoke.yaml"
@@ -461,36 +487,86 @@ def test_run_remote_plan_wraps_a_timeout(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(subprocess, "run", Forbidden())
     result = remote.run_remote(RunConfig(name="smoke"), HOST, timeout_s=900)
 
-    assert result["argv"][6] == (
+    assert result["argv"][-1] == remote.verdict_command(
         f"timeout --signal=TERM --kill-after=30 900 {expected_command()}"
     )
     assert result["timeout"] == 900
 
 
-def test_run_remote_execute_uses_real_host(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_remote_streams_to_stderr_and_keeps_the_remote_verdict(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
     monkeypatch.setattr(remote.shutil, "which", which_all)
+    monkeypatch.setattr(remote, "_container_running", lambda host: True)
+    calls = fake_popen(monkeypatch, ["Loading weights", "[msft-rc] 3"], returncode=3)
 
-    def responder(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        if argv[-1].startswith("docker inspect"):
-            return subprocess.CompletedProcess(argv, 0, "true\n", "")
-        return subprocess.CompletedProcess(argv, 0, "step 10/10 done\n", "")
-
-    fake = fake_ssh(monkeypatch, responder)
     result = remote.run_remote(RunConfig(name="smoke"), HOST, execute=True)
 
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Loading weights" in captured.err
     assert result["executed"] is True
-    assert result["ok"] is True
-    assert result["returncode"] == 0
-    assert "done" in result["stdout"]
-    assert len(fake.calls) == 2
-    inspect_argv, _ = fake.calls[0]
-    assert inspect_argv[5] == HOST
-    assert inspect_argv[6].startswith("docker inspect")
-    run_argv, kwargs = fake.calls[1]
-    assert run_argv[6] == expected_command()
-    assert kwargs["capture_output"] is True
+    assert result["failure"] == "remote"
+    assert result["returncode"] == 3
+    assert result["ssh_returncode"] == 3
+    assert result["ok"] is False
+    assert result["stdout"] == ""
+    argv, kwargs = calls[0]
+    assert argv[:5] == ["ssh", *SSH_OPTS]
+    assert argv[-2] == HOST
+    assert "ServerAliveInterval=30" in argv
+    assert kwargs["stdout"] is subprocess.PIPE
+    assert kwargs["stderr"] is subprocess.STDOUT
     assert kwargs["text"] is True
+    assert kwargs["bufsize"] == 1
+
+
+def test_run_remote_sentinel_255_is_remote_not_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    monkeypatch.setattr(remote.shutil, "which", which_all)
+    monkeypatch.setattr(remote, "_container_running", lambda host: True)
+    fake_popen(monkeypatch, ["[msft-rc] 255"], returncode=255)
+
+    result = remote.run_remote(RunConfig(name="smoke"), HOST, execute=True)
+
+    assert result["failure"] == "remote"
+    assert result["returncode"] == 255
+    assert result["ssh_returncode"] == 255
+
+
+def test_run_remote_sentinel_zero_is_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    monkeypatch.setattr(remote.shutil, "which", which_all)
+    monkeypatch.setattr(remote, "_container_running", lambda host: True)
+    fake_popen(monkeypatch, ["done", "[msft-rc] 0"], returncode=0)
+
+    result = remote.run_remote(RunConfig(name="smoke"), HOST, execute=True)
+
+    assert result["failure"] is None
+    assert result["returncode"] == 0
+    assert result["ok"] is True
+
+
+def test_run_remote_missing_sentinel_is_a_transport_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    monkeypatch.setattr(remote.shutil, "which", which_all)
+    monkeypatch.setattr(remote, "_container_running", lambda host: True)
+    fake_popen(monkeypatch, [f"Permission denied ({HOST})"], returncode=255)
+
+    result = remote.run_remote(RunConfig(name="smoke"), HOST, execute=True)
+
+    assert result["failure"] == "transport"
+    assert result["returncode"] is None
+    assert result["ssh_returncode"] == 255
+    assert "without a [msft-rc] verdict" in result["error"]
+    assert "buildbox" not in json.dumps(result)
+    assert MASKED in result["stderr"]
+    assert "buildbox" not in capsys.readouterr().err
 
 
 def test_run_remote_requires_a_running_container(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -514,6 +590,7 @@ def test_run_remote_without_ssh_fails_softly(monkeypatch: pytest.MonkeyPatch) ->
 
     assert result["ok"] is False
     assert result["executed"] is False
+    assert result["failure"] == "transport"
     assert "ssh not found" in result["error"]
 
 
@@ -523,21 +600,259 @@ def test_run_remote_honours_env_config(monkeypatch: pytest.MonkeyPatch) -> None:
     result = remote.run_remote(RunConfig(name="ignored"), HOST)
 
     assert result["config"] == "/srv/runs/smoke.yaml"
-    assert "--config /srv/runs/smoke.yaml --execute" in result["argv"][6]
+    assert "--config /srv/runs/smoke.yaml --execute" in result["argv"][-1]
 
 
-def test_run_remote_failure_scrubs_output(monkeypatch: pytest.MonkeyPatch) -> None:
+# --- tmux sessions --------------------------------------------------------
+
+FROZEN = datetime(2026, 11, 9, 12, 34, 56, tzinfo=UTC)
+SESSION = "msft-smoke-20261109T123456Z"
+
+
+def test_session_name_is_deterministic_and_has_no_dots() -> None:
+    name = remote.tmux_session_name("qwen3.5-4b.lora", now=FROZEN)
+    assert name == "msft-qwen3_5-4b_lora-20261109T123456Z"
+    assert "." not in name
+    assert name.startswith("msft-")
+    assert remote.TMUX_SESSION_RE.fullmatch(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["worker", "msft-", "msft-a.b", "msft-a b", "msft-" + "x" * 81, "msft-a;rm"],
+)
+def test_validate_session_rejects_foreign_names(name: str) -> None:
+    with pytest.raises(remote.MsftError):
+        remote.validate_session(name)
+
+
+def test_launch_tmux_plan_builds_a_parseable_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    result = remote.launch_tmux(RunConfig(name="smoke"), HOST, session=SESSION)
+    command = result["argv"][-1]
+
+    assert "command -v tmux" in command
+    assert "docker exec -it msft-worker python -m msft train" in command
+    assert f"has-session -t ={SESSION}" in command
+    assert f"tee -a .worker/tmux/{SESSION}.log" in command
+    assert "timeout --signal" not in command
+    assert shlex.split(shlex.join(result["argv"])) == result["argv"]
+    session_cmd = next(tok for tok in shlex.split(command) if tok.startswith("bash -c "))
+    assert shlex.split(session_cmd)[:2] == ["bash", "-c"]
+    assert "docker exec -it" in shlex.split(session_cmd)[2]
+    assert subprocess.run(["bash", "-n", "-c", command], check=False).returncode == 0
+
+    assert result["state"] == "plan"
+    assert result["session"] == SESSION
+    assert result["log"] == f".worker/tmux/{SESSION}.log"
+    assert result["rc_file"] == f".worker/tmux/{SESSION}.rc"
+    assert any("--follow" in hint for hint in result["hints"])
+    assert "ServerAliveInterval=30" in result["argv"]
+    assert "buildbox" not in json.dumps(result)
+
+
+def test_launch_tmux_timeout_prefix_only_with_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    without = remote.launch_tmux(RunConfig(name="smoke"), HOST, session=SESSION)
+    with_timeout = remote.launch_tmux(
+        RunConfig(name="smoke"), HOST, session=SESSION, timeout_s=900
+    )
+
+    assert "timeout --signal" not in without["argv"][-1]
+    assert (
+        "timeout --signal=TERM --kill-after=30 900 docker exec -it msft-worker"
+        in with_timeout["argv"][-1]
+    )
+
+
+def test_launch_tmux_missing_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    monkeypatch.setattr(remote.shutil, "which", which_all)
+    fake_ssh(
+        monkeypatch,
+        lambda argv: subprocess.CompletedProcess(
+            argv, 127, "", f"{remote.TMUX_MISSING}\n"
+        ),
+    )
+
+    with pytest.raises(remote.MsftError, match="tmux is not installed on the box"):
+        remote.launch_tmux(
+            RunConfig(name="smoke"), HOST, session=SESSION, force=True, execute=True
+        )
+
+
+def test_launch_tmux_refuses_a_second_gpu_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    monkeypatch.setattr(remote.shutil, "which", which_all)
+    fake = fake_ssh(
+        monkeypatch,
+        lambda argv: subprocess.CompletedProcess(argv, 0, "train-existing.json\n", ""),
+    )
+
+    with pytest.raises(remote.MsftError, match="two GPU jobs OOM"):
+        remote.launch_tmux(RunConfig(name="smoke"), HOST, session=SESSION, execute=True)
+    assert len(fake.calls) == 1
+    assert "running/*.json" in fake.calls[0][0][-1]
+
+
+def test_launch_tmux_force_skips_the_gpu_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
     monkeypatch.setattr(remote.shutil, "which", which_all)
 
     def responder(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        if argv[-1].startswith("docker inspect"):
-            return subprocess.CompletedProcess(argv, 0, "true\n", "")
-        return subprocess.CompletedProcess(argv, 255, "", f"Permission denied ({HOST})\n")
+        if "ls -1" in argv[-1]:
+            raise AssertionError("--force must skip the running/ probe")
+        return subprocess.CompletedProcess(argv, 0, "", "")
 
     fake_ssh(monkeypatch, responder)
-    result = remote.run_remote(RunConfig(name="smoke"), HOST, execute=True)
+    result = remote.launch_tmux(
+        RunConfig(name="smoke"), HOST, session=SESSION, force=True, execute=True
+    )
 
+    assert result["state"] == "started"
+    assert result["ok"] is True
+    assert result["executed"] is True
+
+
+# --- logs -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("body", "state", "rc", "tail"),
+    [
+        (
+            f"{remote.TMUX_STATE_MARK} exited 0\n{remote.TMUX_TAIL_MARK}\nhello\n",
+            "exited",
+            0,
+            "hello",
+        ),
+        (
+            f"{remote.TMUX_STATE_MARK} running\n{remote.TMUX_TAIL_MARK}\nhello\n",
+            "running",
+            None,
+            "hello",
+        ),
+        (f"{remote.TMUX_STATE_MARK} stopped\n{remote.TMUX_TAIL_MARK}\n", "stopped", None, ""),
+        (f"{remote.TMUX_STATE_MARK} lost\n{remote.TMUX_TAIL_MARK}\n", "lost", None, ""),
+    ],
+)
+def test_logs_tmux_parses_each_state(
+    monkeypatch: pytest.MonkeyPatch, body: str, state: str, rc: int | None, tail: str
+) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    fake_ssh(monkeypatch, lambda argv: subprocess.CompletedProcess(argv, 0, body, ""))
+    result = remote.logs_tmux(HOST, SESSION)
+
+    assert result["state"] == state
+    assert result["returncode"] == rc
+    assert result["tail"] == tail
+    assert result["ok"] is (state != "lost")
+    assert f"has-session -t ={SESSION}" in result["command"]
+
+
+def test_logs_tmux_wait_stops_at_the_rc_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    bodies = iter(
+        [
+            f"{remote.TMUX_STATE_MARK} running\n{remote.TMUX_TAIL_MARK}\n",
+            f"{remote.TMUX_STATE_MARK} exited 7\n{remote.TMUX_TAIL_MARK}\nboom\n",
+        ]
+    )
+    fake_ssh(monkeypatch, lambda argv: subprocess.CompletedProcess(argv, 0, next(bodies), ""))
+    sleeps: list[float] = []
+
+    result = remote.logs_tmux(
+        HOST, SESSION, wait=True, sleep=sleeps.append
+    )
+
+    assert result["state"] == "exited"
+    assert result["returncode"] == 7
+    assert sleeps == [remote.WAIT_INTERVAL_S]
+
+
+def test_logs_job_reads_the_done_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    body = (
+        f"{remote.TMUX_STATE_MARK} done\n"
+        '{"id": "train-1", "status": "done", "returncode": 0, "timed_out": false}\n'
+        f"{remote.TMUX_TAIL_MARK}\nline one\nline two\n"
+    )
+    fake_ssh(monkeypatch, lambda argv: subprocess.CompletedProcess(argv, 0, body, ""))
+
+    result = remote.logs_job(HOST, "train-1")
+
+    assert result["state"] == "done"
+    assert result["returncode"] == 0
+    assert result["tail"] == "line one\nline two"
+    assert "done/train-1.json" in result["command"]
+
+
+def test_logs_job_wait_polls_until_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    bodies = iter(
+        [
+            f"{remote.TMUX_STATE_MARK} pending\n{remote.TMUX_TAIL_MARK}\n",
+            f"{remote.TMUX_STATE_MARK} done\n"
+            '{"status": "failed", "returncode": 1, "timed_out": true}\n'
+            f"{remote.TMUX_TAIL_MARK}\nfailed\n",
+        ]
+    )
+    fake_ssh(monkeypatch, lambda argv: subprocess.CompletedProcess(argv, 0, next(bodies), ""))
+    sleeps: list[float] = []
+
+    result = remote.logs_job(HOST, "train-1", wait=True, sleep=sleeps.append)
+
+    assert result["state"] == "failed"
+    assert result["timed_out"] is True
     assert result["ok"] is False
-    assert result["returncode"] == 255
-    assert "buildbox" not in json.dumps(result)
-    assert MASKED in result["stderr"]
+    assert sleeps == [remote.WAIT_INTERVAL_S]
+
+
+# --- stop -----------------------------------------------------------------
+
+
+def test_stop_tmux_sends_ctrl_c_then_reports_graceful(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    fake = fake_ssh(
+        monkeypatch, lambda argv: subprocess.CompletedProcess(argv, 0, "graceful\n", "")
+    )
+
+    result = remote.stop_tmux(HOST, SESSION, grace=5)
+
+    command = fake.calls[0][0][-1]
+    assert f"send-keys -t ={SESSION} C-c" in command
+    assert f"kill-session -t ={SESSION}" in command
+    assert f"has-session -t ={SESSION}" in command
+    assert result["state"] == "graceful"
+    assert result["ok"] is True
+
+
+def test_stop_tmux_missing_session_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    fake_ssh(
+        monkeypatch,
+        lambda argv: subprocess.CompletedProcess(
+            argv, 3, "", f"{remote.TMUX_NO_SESSION}\n"
+        ),
+    )
+
+    result = remote.stop_tmux(HOST, SESSION)
+
+    assert result["state"] == "missing"
+    assert result["ok"] is False
+    assert result["error"] == "no such session"
+
+
+def test_stop_tmux_refuses_a_foreign_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    monkeypatch.setattr(subprocess, "run", Forbidden())
+    with pytest.raises(remote.MsftError, match="invalid tmux session"):
+        remote.stop_tmux(HOST, "someone-elses-session")

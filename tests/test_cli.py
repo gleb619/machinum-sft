@@ -48,6 +48,25 @@ def only_object(stdout: str) -> dict[str, Any]:
     return parsed
 
 
+def fake_popen(
+    monkeypatch: pytest.MonkeyPatch, lines: list[str], returncode: int = 0
+) -> list[tuple[list[str], dict]]:
+    """Stand in for `subprocess.Popen`; `stdout` yields the given lines."""
+    calls: list[tuple[list[str], dict]] = []
+
+    class Fake:
+        def __init__(self, argv: list[str], **kwargs: object) -> None:
+            calls.append((list(argv), dict(kwargs)))
+            self.stdout = iter([f"{line}\n" for line in lines])
+            self.returncode = returncode
+
+        def wait(self) -> int:
+            return returncode
+
+    monkeypatch.setattr(subprocess, "Popen", Fake)
+    return calls
+
+
 # --- parsing --------------------------------------------------------------
 
 
@@ -337,7 +356,7 @@ def test_remote_run_plan_still_exits_zero(
     monkeypatch.setattr(
         remote,
         "run_remote",
-        lambda cfg, host, execute=False, timeout_s=None: {
+        lambda cfg, host, **kwargs: {
             "executed": False,
             "host": "masked",
         },
@@ -483,3 +502,286 @@ def test_msft_error_prints_one_failure_object(
     assert code == 2
     assert captured.out.count("\n") == 1
     assert json.loads(captured.out)["ok"] is False
+
+
+# --- remote run: mode selection -------------------------------------------
+
+
+def test_remote_run_queue_and_tmux_are_mutually_exclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _remote_env(monkeypatch)
+    code = main(
+        ["--config", str(write_config(tmp_path)), "remote", "run", "--queue", "--tmux"]
+    )
+    assert code == 2
+    assert "--queue and --tmux are mutually exclusive" in capsys.readouterr().err
+
+
+def test_remote_run_session_requires_tmux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _remote_env(monkeypatch)
+    code = main(
+        [
+            "--config",
+            str(write_config(tmp_path)),
+            "remote",
+            "run",
+            "--session",
+            "msft-x",
+        ]
+    )
+    assert code == 2
+    assert "--session only applies to --tmux" in capsys.readouterr().err
+
+
+def test_remote_run_rejects_a_foreign_session_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _remote_env(monkeypatch)
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    code = main(
+        [
+            "--config",
+            str(write_config(tmp_path)),
+            "remote",
+            "run",
+            "--tmux",
+            "--session",
+            "someone-else",
+            "--execute",
+        ]
+    )
+    assert code == 2
+    assert "invalid tmux session" in capsys.readouterr().err
+
+
+def test_remote_run_tmux_missing_tmux_exits_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import msft.remote as remote
+    from msft.config import MsftError
+
+    _remote_env(monkeypatch)
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+
+    def missing(*args: object, **kwargs: object) -> dict[str, Any]:
+        raise MsftError("tmux is not installed on the box (apt install tmux)")
+
+    monkeypatch.setattr(remote, "launch_tmux", missing)
+    code = main(
+        ["--config", str(write_config(tmp_path)), "remote", "run", "--tmux", "--execute"]
+    )
+    assert code == 2
+    assert "tmux is not installed on the box" in capsys.readouterr().err
+
+
+# --- remote run: foreground verdicts --------------------------------------
+
+
+def _streaming_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    import msft.remote as remote
+
+    _remote_env(monkeypatch)
+    monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
+    monkeypatch.setattr(remote.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(remote, "_container_running", lambda host: True)
+
+
+def test_remote_run_sentinel_three_is_exit_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _streaming_env(monkeypatch)
+    fake_popen(monkeypatch, ["step one", "[msft-rc] 3"], returncode=3)
+
+    code = main(
+        [
+            "--json",
+            "--config",
+            str(write_config(tmp_path)),
+            "remote",
+            "run",
+            "--execute",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = only_object(captured.out)
+    assert code == 1
+    assert payload["failure"] == "remote"
+    assert payload["returncode"] == 3
+    assert "step one" in captured.err
+    assert captured.out.startswith("{")
+
+
+def test_remote_run_missing_sentinel_is_exit_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _streaming_env(monkeypatch)
+    fake_popen(monkeypatch, ["Permission denied"], returncode=255)
+
+    code = main(
+        [
+            "--json",
+            "--config",
+            str(write_config(tmp_path)),
+            "remote",
+            "run",
+            "--execute",
+        ]
+    )
+
+    payload = only_object(capsys.readouterr().out)
+    assert code == 2
+    assert payload["failure"] == "transport"
+    assert payload["returncode"] is None
+
+
+# --- remote run --queue ----------------------------------------------------
+
+
+def test_remote_run_queue_signals_with_a_locally_generated_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import msft.deploy as deploy
+
+    _remote_env(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    monkeypatch.setattr(deploy, "load_spec", lambda: deploy.WorkerSpec(host="user@box"))
+
+    def signal(
+        spec: Any,
+        kind: str,
+        *,
+        config: str | None = None,
+        job_id: str | None = None,
+        extra_args: list[str] | None = None,
+        timeout_s: int | None = None,
+        execute: bool = False,
+    ) -> dict[str, Any]:
+        seen.update(
+            spec=spec,
+            kind=kind,
+            config=config,
+            job_id=job_id,
+            extra_args=extra_args,
+            timeout_s=timeout_s,
+            execute=execute,
+        )
+        return {"executed": True, "ok": True, "returncode": 0, "command": f"--id {job_id}"}
+
+    monkeypatch.setattr(deploy, "signal", signal)
+
+    code = main(
+        [
+            "--json",
+            "--config",
+            str(write_config(tmp_path)),
+            "remote",
+            "run",
+            "--queue",
+            "--kind",
+            "merge",
+            "--arg=--inspect-mask",
+            "--timeout",
+            "15m",
+            "--execute",
+        ]
+    )
+
+    payload = only_object(capsys.readouterr().out)
+    assert code == 0
+    assert seen["kind"] == "merge"
+    assert seen["config"] == "configs/tiny.yaml"
+    assert seen["extra_args"] == ["--inspect-mask"]
+    assert seen["timeout_s"] == 900
+    assert seen["execute"] is True
+    assert seen["job_id"].startswith("merge-")
+    assert seen["job_id"] in payload["id"]
+    assert payload["state"] == "queued"
+
+
+def test_deploy_signal_forwards_each_arg_quoted(monkeypatch: pytest.MonkeyPatch) -> None:
+    import msft.deploy as deploy
+
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    spec = deploy.WorkerSpec(host="user@box")
+    deploy.signal(
+        spec,
+        "train",
+        config="configs/x.yaml",
+        job_id="train-1",
+        extra_args=["--inspect-mask", "a b"],
+        timeout_s=60,
+        execute=True,
+    )
+
+    command = calls[0][-1]
+    assert "--arg=--inspect-mask" in command
+    assert "--arg='a b'" in command
+    assert "train-1" in command
+
+
+# --- remote logs / stop dispatch ------------------------------------------
+
+
+def test_remote_logs_needs_a_selector(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _remote_env(monkeypatch)
+    assert main(["remote", "logs"]) == 2
+    assert "logs needs --tmux NAME or --job ID" in capsys.readouterr().err
+
+
+def test_remote_log_alias_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import msft.remote as remote
+
+    _remote_env(monkeypatch)
+    monkeypatch.setattr(
+        remote,
+        "logs_tmux",
+        lambda host, session, **kwargs: {
+            "mode": "tmux",
+            "session": session,
+            "state": "exited",
+            "returncode": 0,
+            "tail": "hello\n",
+            "ok": True,
+        },
+    )
+    code = main(["--json", "remote", "log", "--tmux", "msft-x"])
+    payload = only_object(capsys.readouterr().out)
+    assert code == 0
+    assert payload["state"] == "exited"
+
+
+def test_remote_stop_missing_session_exits_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import msft.remote as remote
+
+    _remote_env(monkeypatch)
+    monkeypatch.setattr(
+        remote,
+        "stop_tmux",
+        lambda host, session, **kwargs: {
+            "session": session,
+            "state": "missing",
+            "ok": False,
+            "error": "no such session",
+        },
+    )
+    code = main(["remote", "stop", "--tmux", "msft-x"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "no such session" in captured.out
