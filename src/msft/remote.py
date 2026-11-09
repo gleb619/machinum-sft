@@ -213,11 +213,18 @@ def remote_config(cfg: RunConfig) -> str:
 
 
 def remote_path(path: str) -> str:
-    """Quote a remote path for a shell, keeping a leading `~` expandable."""
-    if path == "~":
+    """Quote a remote path for a shell, keeping `~` and relative paths anchored at the login home.
+
+    A relative path is not a typo to be trusted against whatever directory the remote shell
+    happens to start in — that is how `cd WORKSPACE/machinum-sft` silently failed while the real
+    repo sat in the home directory.
+    """
+    if path == "~" or not path:
         return '"$HOME"'
     if path.startswith("~/"):
         return f'"$HOME"/{shlex.quote(path[2:])}'
+    if not path.startswith("/"):
+        return f'"$HOME"/{shlex.quote(path)}'
     return shlex.quote(path)
 
 

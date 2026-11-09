@@ -626,6 +626,15 @@ def test_validate_session_rejects_foreign_names(name: str) -> None:
         remote.validate_session(name)
 
 
+def test_a_relative_remote_path_is_anchored_at_the_login_home() -> None:
+    """The worker config holds `repo_dir: WORKSPACE/machinum-sft`, which is relative on purpose:
+    it must become $HOME/WORKSPACE/..., never a path relative to whatever cwd the remote shell
+    starts in (that made every launch die with "No such file or directory")."""
+    assert remote.remote_path("WORKSPACE/machinum-sft") == '"$HOME"/WORKSPACE/machinum-sft'
+    assert remote.remote_path("~/proj") == '"$HOME"/proj'
+    assert remote.remote_path("/srv/m") == "/srv/m"
+
+
 def test_launch_tmux_plan_builds_a_parseable_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
