@@ -71,13 +71,21 @@ export AI_MEMORY_AUTH_TOKEN=$(grep -m1 AI_MEMORY_AUTH_TOKEN deploy/memory/.env |
 ai-memory search "why did the 4B job die"      # or via the image, as the seed script does
 ```
 
-To give it to Hermes as a tool, register the MCP endpoint once (the tool then appears in every
-session):
+It is **already registered** with Hermes as the MCP server `ai-memory` (27 tools:
+`memory_search`, `memory_write_page`, `memory_read_page`, `memory_status`, handoffs, …), so a
+new session can query the journal directly:
 
 ```bash
-hermes mcp add ai-memory --url http://127.0.0.1:49374/mcp --auth header
-# header: Authorization: Bearer <token from deploy/memory/.env>
-hermes mcp list
+hermes mcp list        # ai-memory  http://127.0.0.1:49374/mcp  all  enabled
+hermes mcp test ai-memory
+```
+
+Existing sessions pick the tools up with `/reload-mcp`. The registration is one line in
+`~/.hermes/config.yaml`, and it was made non-interactively:
+
+```bash
+TOKEN=$(grep -m1 AI_MEMORY_AUTH_TOKEN deploy/memory/.env | cut -d= -f2-)
+printf 'y\n%s\ny\n' "$TOKEN" | hermes mcp add ai-memory --url http://127.0.0.1:49374/mcp --auth header
 ```
 
 The browser view at <http://127.0.0.1:49374/web> is the fastest way for a human to check what
