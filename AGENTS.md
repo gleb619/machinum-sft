@@ -34,6 +34,14 @@ working loop) before touching `src/msft/{train,merge,quantize,worker,deploy}.py`
    credentials; `[REDACTED]` is the convention for a key that must be mentioned. Do not
    `printenv` an API key into any output.
 
+9. **Only a fully working `main` is pushed.** `main` may be pushed only when the gate it
+   carries is green on that exact commit: `scripts/guard.sh` → `GUARD OK` here, and `typecheck` +
+   tests + `ci:local` in the pipeline repo. No "push now, fix on main later", no pushing a branch
+   and repairing it after the fact, no red `main` on the remote — a red `main` is worse than an
+   unpushed commit, because everyone else builds on it. Force-push is allowed only to replace a
+   broken remote `main` with a verified local one, and then only with `--force-with-lease`.
+   Everything else stays local until it is green.
+
 ## How to change things
 
 - **New behaviour → test first-ish, not last.** `pytest -q` must stay green; `ruff check .` is

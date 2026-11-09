@@ -6,7 +6,7 @@ Read `docs/memory.md` before changing anything: it is the same knowledge, organi
 ## 1. Shape of the system
 
 ```
-laptop /home/boris/WORKSPACE/machinum-sft     <- the only source of truth, git + guard + tests
+laptop <repo>/          <- the only source of truth, git + guard + tests
         |  git push
         v
 box    ~/WORKSPACE/machinum-sft               <- git clone, bind-mounted into the container

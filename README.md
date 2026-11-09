@@ -1,12 +1,17 @@
 # machinum-sft
 
 Fine-tuning CLI for the model that processes books in
-[`machinum-pipeline`](https://github.com/glebson/machinum-pipeline): translation EN→RU,
+[`machinum-pipeline`](https://github.com/gleb619/machinum-pipeline): translation EN→RU,
 proofreading and text normalization against a strict line/XML protocol.
 
 The point of this repo is a **repeatable, boring** run: dataset in, adapter out, GGUF out,
 gates green. Everything that touches hardware, paths or secrets is configuration; nothing is
 hardcoded.
+
+**Model card (public):** <https://gleb619.github.io/machinum-sft/> — how `machinum:4b` was built,
+what it costs and where it fails; `docs/pipeline-check.md` records it running through the real
+pipeline, and `docs/model-candidates.md` says which second model this project supports
+(`gemma-4-12B-it-heretic`) and why everything else was discarded.
 
 ```bash
 uv venv --python 3.11 && . .venv/bin/activate
