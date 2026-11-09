@@ -1,0 +1,42 @@
+# Project memory for machinum-sft: one container, one volume, no API key.
+#
+# Why this one (see docs/memory-stack.md for the full comparison): ai-memory keeps a
+# git-backed markdown wiki as the source of truth and derives an index over it, captures
+# nothing unless you write a page, and needs zero LLM calls. A coding agent reads it at
+# session start over MCP, so the next run begins where this one stopped instead of
+# rediscovering the same seven failures.
+#
+#   cd deploy/memory
+#   cp .env.example .env                       # then paste a token
+#   docker run --rm akitaonrails/ai-memory:3.4.4 generate-auth-token   # the token
+#   docker compose up -d
+#   curl -s localhost:49374/healthz            # {"status":"ok"}
+#
+# Images are pinned: `latest` has already broken this repo once (see docs/memory.md).
+
+name: msft-memory
+
+services:
+  ai-memory:
+    image: akitaonrails/ai-memory:3.4.4
+    container_name: msft-memory
+    restart: unless-stopped
+    ports:
+      # loopback only: this is a personal journal, not a service. Put a proxy in front if
+      # you ever need it from another machine.
+      - "127.0.0.1:49374:49374"
+    volumes:
+      # bind-mounted, not a named volume: the wiki is markdown, so `cp -a data/` is the
+      # whole backup and `git init data/wiki` is version control.
+      - ./data:/data
+    env_file:
+      - .env
+    environment:
+      AI_MEMORY_ALLOWED_HOSTS: "127.0.0.1,localhost,::1"
+      RUST_LOG: "ai_memory=info,ai_memory_store=info,ai_memory_wiki=info,ai_memory_mcp=info"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ai-memory", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

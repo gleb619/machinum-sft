@@ -47,6 +47,7 @@ hand JSONL to `msft data build`.
 | `docs/memory.md` | every trap that cost time, with its fix and the command that proves it |
 | `docs/handoff.md` | the working loop: setup, daily commands, stage timings, failure playbook |
 | `docs/run-2026-11-08.md` | one real run end to end, with numbers |
+| `docs/memory-stack.md` | the one-container project journal — start it, seed it, read it |
 
 ## Remote worker
 

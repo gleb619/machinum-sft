@@ -56,3 +56,7 @@ configs/worker.local.yaml
 configs/*.local.yaml
 worker.local.yaml
 .worker/
+
+# deploy/memory: the server token and the wiki data never get committed
+deploy/memory/.env
+deploy/memory/data/
