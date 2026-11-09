@@ -98,6 +98,17 @@ nothing until `pnpm --filter @mt/tools build` runs; `tsc` writes `dist` even whe
 non-zero (the active-record refactor leaves type errors behind), so a failed build is not proof
 that the change was not applied — check `grep reasoning_effort packages/tools/dist/core/llm-client.js`.
 
+**`glossary.json` arrives with `ru: null` on every term.** It is a human step by design; without
+the Russian forms `tagWithGlossary` has nothing to pin and names drift inside a page. Fill them
+with `npx tsx scripts/fill-glossary-ru.ts` (character/place/item, idempotent, atomic), then check
+the names of ships and brands by hand — the model renders a ship name as an adjective
+(«Пеларгический» for Pelargic) unless the prompt says otherwise.
+
+**A quantised multilingual model can emit the wrong script mid-word.** One line in 331 came back
+as «палубный甲板 магазина». Nothing ratio-based catches it; run
+`scripts/audit_translation.py` over the finished book, and keep the linter's `foreign-script`
+rule (added in `ce31a9d`) as the retry trigger.
+
 **`MT_OLLAMA_URL` must include `/v1`.** It is an OpenAI base URL, not a host. Without the suffix
 every call returns `404 page not found` from a server that answers `/api/tags` perfectly.
 

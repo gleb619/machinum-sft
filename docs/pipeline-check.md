@@ -76,6 +76,33 @@ The leaked `<terms>` block was a second, independent bug: `translateLines` never
 existing `cleanTranslation`, and when the model omits the closing tag — which it did on five
 lines — the pair-based regex matched nothing. Both fixed in `machinum-pipeline` `687411b`.
 
+## The book-length run
+
+The same job over the whole book (21 chapters, 331 lines of prose), `machinum:4b`, glossary first:
+
+| step | wall | result |
+| --- | --- | --- |
+| `runner:glossary` (whole book, one batch) | 26 s | 103 terms |
+| `fill-glossary-ru.ts` | 20 s | **97 of 103** filled; 6 left null (Coast Guard, Mayday, a date, three company names) |
+| `runner:chapters` (21 chapters, 5-way) | **437 s** | 21/21, no retries, 27.6 s (ch9) – 91.2 s (ch16) per chapter |
+| audit (`scripts/audit_translation.py`) | <1 s | 331/331 lines, 0 parity failures, 0 metadata leaks, 0 empty lines |
+
+Two defects survived to the audit and both are now fixed in the pipeline:
+
+- **one foreign-script token in 331 lines** — «палубный甲板 магазина» (Chinese for "deck" emitted
+  inside a Russian word, chapter 18). No ratio check can see it. `fix(parity)` now reports
+  `foreign-script` as an error, so the existing retry machinery re-asks that line; re-running
+  chapter 18 produced «продели его через старую палубу магазина» and the book audits clean.
+- **the ship's name** — the glossary filled `Pelargic` as «Пеларгический» (an adjective), which
+  then appeared 10 times. The fill prompt now says a ship keeps its transliterated noun
+  («Пеларгик»); the entry was corrected by hand — which is exactly the workflow the file's
+  comment describes — and the seven affected chapters re-ran in 4 minutes.
+
+Residual, measured honestly: **10 of 331 lines** still use a second spelling of a name
+(«Надия» ×2, «Доул» ×2, «Доули» ×1, «Дойл» ×5) against 97 × «Надя» and 24 × «Файона». The
+glossary pins most lines, not all; a proofreading pass over the finished book is the next step,
+not more training.
+
 ## What this means
 
 1. **The protocol is learned, the language is not.** Line parity 33/33 and no reasoning chatter:
