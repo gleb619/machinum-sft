@@ -332,6 +332,8 @@ def validate_config(cfg: RunConfig) -> list[str]:
         raise MsftError("lora.alpha must be positive")
     if cfg.train.max_seq_length < 256:
         raise MsftError("train.max_seq_length below 256 is not useful for chapters")
+    if cfg.train.packing:
+        raise MsftError("train.packing=true is not supported with the msft collator")
     for key, value in (
         ("train.epochs", cfg.train.epochs),
         ("train.grad_accum", cfg.train.grad_accum),

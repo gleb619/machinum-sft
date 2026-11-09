@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from msft import verify
+from msft import provenance, verify
 from msft.cli import main
 from msft.config import ModelCfg, QuantCfg, RunConfig
 
@@ -92,6 +92,7 @@ def test_all_good_artifacts_pass(
         "tokenizer",
         "chat_template",
         "gguf",
+        "provenance",
     ]
     assert result["sizes"]["ratio"] == 0.4
     assert result["sizes"]["merged_ratio"] is not None
@@ -101,7 +102,8 @@ def test_all_good_artifacts_pass(
     assert "PASS model_type" in report
     assert "PASS chat_template" in report
     assert "gguf = 40.0% of f16" in report
-    assert report.rstrip().endswith("artifacts ok (5 checks, 0 failed)")
+    assert "WARN provenance: no provenance sidecar" in report
+    assert report.rstrip().endswith("artifacts ok (6 checks, 0 failed)")
 
 
 def test_model_type_mismatch_names_the_previous_model(
@@ -288,6 +290,140 @@ def test_base_model_type_is_read_from_the_hub_cache(
     model_type, source = verify.base_model_type(cfg)
     assert model_type == "qwen3_5"
     assert "HF cache" in source
+
+
+def write_sidecar(cfg: RunConfig) -> Path:
+    """Write a provenance record that describes the current merged model and GGUF."""
+    gguf = verify.output_gguf(cfg)
+    record = provenance.build_record(
+        config_name=cfg.name,
+        model_id=cfg.model.id,
+        revision=cfg.model.revision,
+        merged=provenance.merged_snapshot(cfg.merged_path),
+        f16=verify.f16_gguf(cfg),
+        gguf=gguf,
+        method=cfg.quantize.method.upper(),
+        imatrix=False,
+        llama_cpp={"commit": None, "source": None},
+    )
+    return provenance.write(gguf, record)
+
+
+def ready(cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Base cache + merged dir + GGUF, with the tokenizer check stubbed out."""
+    monkeypatch.setenv("HF_HUB_CACHE", str(base_cache(tmp_path)))
+    merged(cfg)
+    ggufs(cfg)
+    monkeypatch.setattr(verify, "tokenizer_loads", lambda path: (True, "ok"))
+
+
+def test_a_matching_sidecar_passes_without_a_warning(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready(cfg, tmp_path, monkeypatch)
+    write_sidecar(cfg)
+
+    result = verify.run(cfg)
+
+    check = by_name(result)["provenance"]
+    assert result["ok"] is True
+    assert result["warnings"] == []
+    assert check["passed"] is True
+    assert check.get("warning") is not True
+    assert "matches the artifact and the merged model" in check["detail"]
+
+
+def test_an_absent_sidecar_is_a_warning_not_a_failure(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready(cfg, tmp_path, monkeypatch)
+
+    result = verify.run(cfg)
+
+    check = by_name(result)["provenance"]
+    assert result["ok"] is True
+    assert check["passed"] is True
+    assert check["warning"] is True
+    assert result["warnings"] == [check["detail"]]
+    assert "provenance not checked" in check["detail"]
+
+
+def test_a_mutated_config_json_fails_and_names_both_digests(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready(cfg, tmp_path, monkeypatch)
+    sidecar = write_sidecar(cfg)
+    recorded = json.loads(sidecar.read_text(encoding="utf-8"))["merged"]["config_sha256"]
+    config = cfg.merged_path / "config.json"
+    config.write_text(json.dumps({**BASE}) + "\n", encoding="utf-8")
+    actual = provenance.sha256_file(config)
+
+    result = verify.run(cfg)
+
+    check = by_name(result)["provenance"]
+    assert result["ok"] is False
+    assert check["passed"] is False
+    assert "provenance: merged config.json sha256" in check["detail"]
+    assert f"{recorded[:8]}…" in check["detail"]
+    assert f"{actual[:8]}…" in check["detail"]
+    assert "re-run quantize" in check["detail"]
+
+
+def test_changed_weight_files_fail(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready(cfg, tmp_path, monkeypatch)
+    write_sidecar(cfg)
+    (cfg.merged_path / "model-00002-of-00002.safetensors").write_bytes(b"extra shard")
+
+    check = by_name(verify.run(cfg))["provenance"]
+
+    assert check["passed"] is False
+    assert "merged weight files differ" in check["detail"]
+
+
+def test_a_corrupt_sidecar_fails(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready(cfg, tmp_path, monkeypatch)
+    provenance.sidecar_path(verify.output_gguf(cfg)).write_text("{oops", encoding="utf-8")
+
+    result = verify.run(cfg)
+
+    check = by_name(result)["provenance"]
+    assert result["ok"] is False
+    assert check["passed"] is False
+    assert "corrupt" in check["detail"]
+
+
+def test_require_provenance_turns_absence_into_a_failure(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready(cfg, tmp_path, monkeypatch)
+
+    result = verify.run(cfg, require_provenance=True)
+
+    assert result["ok"] is False
+    assert result["failures"] == ["provenance"]
+    assert "--require-provenance" in by_name(result)["provenance"]["detail"]
+
+
+def test_deep_catches_a_flipped_byte_in_the_gguf(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready(cfg, tmp_path, monkeypatch)
+    write_sidecar(cfg)
+    gguf = verify.output_gguf(cfg)
+    payload = bytearray(gguf.read_bytes())
+    payload[-1] ^= 0xFF  # same size, different content
+    gguf.write_bytes(payload)
+
+    shallow = verify.run(cfg)
+    deep = verify.run(cfg, deep=True)
+
+    assert shallow["ok"] is True
+    assert deep["ok"] is False
+    assert "sha256" in by_name(deep)["provenance"]["detail"]
 
 
 def cli_config(tmp_path: Path) -> Path:

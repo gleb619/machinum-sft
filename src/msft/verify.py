@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from msft import provenance
 from msft.config import RunConfig, redact
 from msft.quantize import f16_gguf, output_gguf
 
@@ -335,8 +336,62 @@ def _check_chat_template(cfg: RunConfig) -> dict[str, Any]:
     }
 
 
-def run(cfg: RunConfig) -> dict[str, Any]:
-    """Check merged config, tokenizer, chat template and GGUF; returns a JSON verdict."""
+def _check_provenance(
+    cfg: RunConfig, *, require: bool = False, deep: bool = False
+) -> dict[str, Any]:
+    """Check the sidecar next to the GGUF against the merged model and the GGUF itself."""
+    gguf = output_gguf(cfg)
+    sidecar = provenance.sidecar_path(gguf)
+    record, reason = provenance.load(gguf)
+    if record is None and reason == "absent":
+        detail = (
+            f"no provenance sidecar next to {gguf.name}; this GGUF predates sidecars or was "
+            "not produced by msft quantize — provenance not checked"
+        )
+        if require:
+            return {
+                "name": "provenance",
+                "passed": False,
+                "warning": False,
+                "detail": f"{detail} (--require-provenance)",
+            }
+        return {"name": "provenance", "passed": True, "warning": True, "detail": detail}
+    if record is None:
+        joiner = " is " if reason.startswith("corrupt") else ": "
+        return {
+            "name": "provenance",
+            "passed": False,
+            "warning": False,
+            "detail": f"provenance sidecar {sidecar.name}{joiner}{reason}",
+        }
+    problems = provenance.compare(
+        record,
+        gguf=gguf,
+        merged=cfg.merged_path,
+        f16=f16_gguf(cfg),
+        cfg_name=cfg.name,
+        method=cfg.quantize.method.upper(),
+        deep=deep,
+    )
+    if problems:
+        return {
+            "name": "provenance",
+            "passed": False,
+            "warning": False,
+            "detail": "provenance: " + "; ".join(problems),
+        }
+    return {
+        "name": "provenance",
+        "passed": True,
+        "warning": False,
+        "detail": f"sidecar {sidecar.name} matches the artifact and the merged model",
+    }
+
+
+def run(
+    cfg: RunConfig, *, require_provenance: bool = False, deep: bool = False
+) -> dict[str, Any]:
+    """Check merged config, tokenizer, chat template, GGUF and provenance; JSON verdict."""
     gguf_check, gguf_sizes = _check_gguf(cfg)
     checks = [
         _check_merged(cfg),
@@ -344,8 +399,10 @@ def run(cfg: RunConfig) -> dict[str, Any]:
         _check_tokenizer(cfg),
         _check_chat_template(cfg),
         gguf_check,
+        _check_provenance(cfg, require=require_provenance, deep=deep),
     ]
     failures = [check["name"] for check in checks if not check["passed"]]
+    warnings = [check["detail"] for check in checks if check.get("warning")]
     merged_bytes = _dir_size(cfg.merged_path) if cfg.merged_path.is_dir() else 0
     sizes = {
         "merged": {
@@ -356,7 +413,8 @@ def run(cfg: RunConfig) -> dict[str, Any]:
         **gguf_sizes,
     }
     for check in checks:
-        _log(f"{'PASS' if check['passed'] else 'FAIL'} {check['name']}: {check['detail']}")
+        label = "WARN" if check.get("warning") else ("PASS" if check["passed"] else "FAIL")
+        _log(f"{label} {check['name']}: {check['detail']}")
     return {
         "ok": not failures,
         "name": cfg.name,
@@ -367,6 +425,7 @@ def run(cfg: RunConfig) -> dict[str, Any]:
         "checks": checks,
         "sizes": sizes,
         "failures": failures,
+        "warnings": warnings,
     }
 
 
@@ -383,9 +442,8 @@ def format_report(result: dict[str, Any]) -> str:
         suffix = f"  (gguf = {ratio:.1%} of f16)" if ratio is not None else ""
         lines.append(f"  {'f16':<6} {sizes['f16']['label']:>9}  {sizes['f16']['path']}{suffix}")
     for check in result["checks"]:
-        lines.append(
-            f"  {'PASS' if check['passed'] else 'FAIL'} {check['name']}: {check['detail']}"
-        )
+        label = "WARN" if check.get("warning") else ("PASS" if check["passed"] else "FAIL")
+        lines.append(f"  {label} {check['name']}: {check['detail']}")
     failed = len(result["failures"])
     lines.append(
         f"artifacts {'ok' if result['ok'] else 'FAILED'}"

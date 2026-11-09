@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from msft import quantize
+from msft import provenance, quantize
 from msft.config import ModelCfg, MsftError, QuantCfg, RunConfig
 
 
@@ -182,16 +183,13 @@ def test_run_execute_runs_commands_in_order(
 
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
-        # convert_hf_to_gguf.py names its output; llama-quantize takes it as the last arg.
-        target = Path(
-            argv[argv.index("--outfile") + 1] if "--outfile" in argv else argv[-2]
-        )
-        target.write_bytes(b"GGUF" + b"\0" * 16)
+        _write_tool_output(argv, b"GGUF" + b"\0" * 16)
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(quantize.subprocess, "run", fake_run)
     result = quantize.run(cfg, execute=True)
-    assert calls == planned
+    # The planned tool commands run first; the provenance git probe follows them.
+    assert calls[: len(planned)] == planned
     assert result["executed"] is True
     assert (tmp_path / "out" / "model.gguf").is_file()
 
@@ -227,14 +225,25 @@ def test_run_execute_raises_on_non_zero_exit(
         quantize.run(cfg, execute=True)
 
 
+def _write_tool_output(argv: list[str], payload: bytes) -> None:
+    """Write `payload` where a convert/quantize command was told to write.
+
+    The provenance git probe is also a subprocess call; it must not be mistaken for a tool.
+    """
+    if "--outfile" in argv:
+        target = Path(argv[argv.index("--outfile") + 1])
+    elif argv and "quantize" in Path(argv[0]).name:
+        target = Path(argv[-2])
+    else:
+        return
+    target.write_bytes(payload)
+
+
 def _writer(payload: bytes = b"GGUF" + b"\0" * 16):
     """A fake subprocess.run that writes `payload` where the tool was told to write."""
 
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        target = Path(
-            argv[argv.index("--outfile") + 1] if "--outfile" in argv else argv[-2]
-        )
-        target.write_bytes(payload)
+        _write_tool_output(argv, payload)
         return subprocess.CompletedProcess(argv, 0)
 
     return fake_run
@@ -265,11 +274,9 @@ def test_run_execute_removes_a_stale_output_before_running(
     observed: dict[str, bool] = {}
 
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        observed["out_existed"] = out.exists()
-        target = Path(
-            argv[argv.index("--outfile") + 1] if "--outfile" in argv else argv[-2]
-        )
-        target.write_bytes(b"GGUF" + b"n" * 16)
+        if "--outfile" in argv or (argv and "quantize" in Path(argv[0]).name):
+            observed["out_existed"] = out.exists()
+        _write_tool_output(argv, b"GGUF" + b"n" * 16)
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(quantize.subprocess, "run", fake_run)
@@ -304,3 +311,102 @@ def test_run_execute_fails_when_the_partial_is_not_a_gguf(
     with pytest.raises(MsftError, match="not a valid GGUF"):
         quantize.run(cfg, execute=True)
     assert not (tmp_path / "out" / "model.gguf").exists()
+
+
+# --- provenance sidecar ---------------------------------------------------
+
+
+def test_plan_lists_the_sidecar_path(cfg: RunConfig, tmp_path: Path, monkeypatch) -> None:
+    _install_tools(monkeypatch, tmp_path / "llama.cpp")
+    plan = quantize.plan(cfg)
+    assert plan["sidecar"] == str(tmp_path / "out" / "model.gguf.provenance.json")
+
+
+def test_run_execute_writes_the_sidecar_after_the_rename(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_tools(monkeypatch, tmp_path / "llama.cpp")
+    _merged(cfg)
+    out = tmp_path / "out" / "model.gguf"
+    observed: dict[str, bool] = {}
+    real_replace = os.replace
+
+    def spy(source, destination, *args, **kwargs):
+        target = Path(destination)
+        if target == out:
+            observed["sidecar_at_rename"] = provenance.sidecar_path(target).exists()
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(quantize.os, "replace", spy)
+    monkeypatch.setattr(quantize.subprocess, "run", _writer())
+
+    result = quantize.run(cfg, execute=True)
+
+    sidecar = provenance.sidecar_path(out)
+    record, reason = provenance.load(out)
+    assert result["executed"] is True
+    assert observed["sidecar_at_rename"] is False
+    assert sidecar.is_file() and reason == ""
+    assert record["gguf"] == {
+        "name": "model.gguf",
+        "bytes": out.stat().st_size,
+        "sha256": provenance.sha256_file(out),
+    }
+    assert record["config_name"] == "ru-quant"
+    assert record["quantize"] == {"method": "Q4_K_M", "imatrix": False}
+
+
+def test_a_failed_command_leaves_no_sidecar(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_tools(monkeypatch, tmp_path / "llama.cpp")
+    _merged(cfg)
+    monkeypatch.setattr(
+        quantize.subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1)
+    )
+
+    with pytest.raises(MsftError, match="exited 1"):
+        quantize.run(cfg, execute=True)
+
+    assert not (tmp_path / "out" / "model.gguf").exists()
+    assert not provenance.sidecar_path(tmp_path / "out" / "model.gguf").exists()
+
+
+def test_a_stale_sidecar_is_deleted_with_its_output(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sidecar must never outlive the file it describes."""
+    _install_tools(monkeypatch, tmp_path / "llama.cpp")
+    _merged(cfg)
+    out = tmp_path / "out" / "model.gguf"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"GGUF old")
+    sidecar = provenance.sidecar_path(out)
+    sidecar.write_text('{"schema": 1, "stale": true}', encoding="utf-8")
+    monkeypatch.setattr(quantize.subprocess, "run", _writer())
+
+    quantize.run(cfg, execute=True)
+
+    record, reason = provenance.load(out)
+    assert reason == ""
+    assert record["gguf"]["bytes"] == out.stat().st_size
+    assert "stale" not in sidecar.read_text(encoding="utf-8")
+
+
+def test_a_merged_directory_mutated_mid_run_raises(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_tools(monkeypatch, tmp_path / "llama.cpp")
+    _merged(cfg)
+
+    def mutate(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        (cfg.merged_path / "model.safetensors").write_bytes(b"new weights")
+        _write_tool_output(argv, b"GGUF" + b"n" * 16)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(quantize.subprocess, "run", mutate)
+
+    with pytest.raises(MsftError, match="merged directory changed while quantizing"):
+        quantize.run(cfg, execute=True)
+
+    assert not provenance.sidecar_path(tmp_path / "out" / "model.gguf").exists()

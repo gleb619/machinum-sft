@@ -305,7 +305,13 @@ def _cmd_verify(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     """Check the merged model, its tokenizer and the quantised GGUF."""
     config = _require_config(cfg)
     verify = _impl("msft.verify")
-    result = _jsonable(_func(verify, "run")(config))
+    result = _jsonable(
+        _func(verify, "run")(
+            config,
+            require_provenance=bool(args.require_provenance),
+            deep=bool(args.deep),
+        )
+    )
     _emit(args.as_json, result, _func(verify, "format_report")(result))
     return EXIT_OK if result.get("ok") else 1
 
@@ -698,6 +704,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_verify = sub.add_parser(
         "verify", parents=[common], help="check merged config, tokenizer and GGUF size"
+    )
+    p_verify.add_argument(
+        "--require-provenance",
+        action="store_true",
+        help="fail when the GGUF has no provenance sidecar (default: warn)",
+    )
+    p_verify.add_argument(
+        "--deep",
+        action="store_true",
+        help="also re-hash the GGUF and compare it with the recorded sha256",
     )
     p_verify.set_defaults(handler=_cmd_verify)
 

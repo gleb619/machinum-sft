@@ -25,10 +25,6 @@ MIN_TRL = (0, 16)
 
 IGNORED_KNOBS: dict[str, str] = {
     "model.dtype": "the script passes dtype=None so Unsloth chooses the device dtype",
-    "train.packing": "the script hardcodes packing=False; enabling it needs a measured run",
-    "train.completion_only_loss": (
-        "the script trains on a `text` column, so TRL has no completion mask; it is hardcoded True"
-    ),
 }
 
 MASK_REPORT_SOURCE = '''\
@@ -243,6 +239,8 @@ RUN_META = Path($RUN_META)
 CHECKPOINT_DIR = Path($CHECKPOINT_DIR)
 TRAIN_FILE = $TRAIN_FILE
 VAL_FILE = $VAL_FILE
+PACKING = $PACKING
+COMPLETION_ONLY = $COMPLETION_ONLY
 MIN_TRL = $MIN_TRL
 
 
@@ -304,15 +302,98 @@ def render_row(tokenizer, messages) -> str:
     return out["text"][0] if isinstance(out.get("text"), list) else out["text"]
 
 
-def expected_prompt_len(tokenizer, messages) -> int:
-    """Token count of the longest common prefix of the prompt and the fully rendered row."""
-    prompt = render_row(tokenizer, messages[:-1])
+def render_prompt(tokenizer, messages) -> str:
+    """Render a conversation through the assistant's generation header (the masked region)."""
+    out = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    if isinstance(out, str):
+        return out
+    return out["text"][0] if isinstance(out.get("text"), list) else out["text"]
+
+
+def completion_split(tokenizer, messages):
+    """Token ids of the full row and the length of its prompt, through the assistant header.
+
+    The assistant header must be masked too, otherwise the model is trained to emit
+    `<|im_start|>assistant`. The split is only sound when the rendered prompt is a literal
+    prefix of the rendered row; a template that reorders or rewrites the prompt cannot be
+    masked by token count, so refuse rather than guess.
+    """
     full = render_row(tokenizer, messages)
-    limit = min(len(prompt), len(full))
-    shared = 0
-    while shared < limit and prompt[shared] == full[shared]:
-        shared += 1
-    return len(text_tokenizer(tokenizer)(prompt[:shared], add_special_tokens=False)["input_ids"])
+    prompt = render_prompt(tokenizer, messages[:-1])
+    if not full.startswith(prompt):
+        fail(
+            "cannot build a completion-only example: the chat template's prompt is not a "
+            "prefix of the full row, so the completion boundary cannot be located. "
+            f"prompt={prompt[:80]!r} full={full[:80]!r}"
+        )
+        raise SystemExit(1)
+    text_tok = text_tokenizer(tokenizer)
+    input_ids = list(text_tok(full, add_special_tokens=False)["input_ids"])
+    prompt_len = len(text_tok(prompt, add_special_tokens=False)["input_ids"])
+    if prompt_len > len(input_ids):
+        fail(
+            "cannot build a completion-only example: the prompt tokenises to more tokens "
+            f"({prompt_len}) than the full row ({len(input_ids)})"
+        )
+        raise SystemExit(1)
+    return input_ids, prompt_len
+
+
+def expected_prompt_len(tokenizer, messages) -> int:
+    """Token count of the prompt the collator masks, including the assistant header."""
+    return completion_split(tokenizer, messages)[1]
+
+
+def build_example(tokenizer, messages, *, completion_only_loss: bool) -> dict:
+    """Tokenise one chat row; mask the prompt when completion-only loss is requested."""
+    input_ids, prompt_len = completion_split(tokenizer, messages)
+    if not input_ids:
+        fail("the chat template rendered an empty row")
+        raise SystemExit(1)
+    if not completion_only_loss:
+        return {"input_ids": input_ids, "labels": list(input_ids)}
+    if prompt_len >= len(input_ids):
+        fail(
+            "completion_only_loss would mask every token: the row has no assistant reply "
+            f"({len(input_ids)} tokens, prompt {prompt_len})"
+        )
+        raise SystemExit(1)
+    return {"input_ids": input_ids, "labels": [-100] * prompt_len + input_ids[prompt_len:]}
+
+
+class MsftCollator:
+    """Right-pad `input_ids` with the pad token, `labels` with -100, and mask the padding.
+
+    Examples must already carry `input_ids` and `labels`; padding is only ever created here,
+    so an attention mask of 0 always means a pad slot and never a real token.
+    """
+
+    def __init__(self, tokenizer) -> None:
+        text_tok = text_tokenizer(tokenizer)
+        pad_id = getattr(text_tok, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(text_tok, "eos_token_id", None)
+        if pad_id is None:
+            raise ValueError("tokenizer has neither pad_token_id nor eos_token_id")
+        self.pad_id = int(pad_id)
+
+    def __call__(self, examples):
+        import torch
+
+        input_ids = [list(example["input_ids"]) for example in examples]
+        labels = [list(example["labels"]) for example in examples]
+        width = max(len(row) for row in input_ids)
+        attention_mask = []
+        for row, label_row in zip(input_ids, labels):
+            pad = width - len(row)
+            attention_mask.append([1] * len(row) + [0] * pad)
+            row.extend([self.pad_id] * pad)
+            label_row.extend([-100] * pad)
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        }
 
 
 def main() -> int:
@@ -341,6 +422,9 @@ def main() -> int:
     if trl_version() and trl_version() < MIN_TRL:
         return fail(f"trl {trl.__version__} is too old; completion_only_loss needs >= 0.16")
 
+    if PACKING:
+        return fail("train.packing=true is not supported with the msft collator")
+
     for path, split in ((TRAIN_FILE, "train"), (VAL_FILE, "validation")):
         if not Path(path).is_file():
             return fail(f"{split} dataset missing: {path}; run `msft data build` first")
@@ -362,8 +446,10 @@ def main() -> int:
     EXPECTED_PROMPT_LEN = expected_prompt_len(tokenizer, raw["train"][0]["messages"])
 
     def render(example: dict) -> dict:
-        """Render one conversation through the tokenizer's chat template."""
-        return {"text": render_row(tokenizer, example["messages"])}
+        """Tokenise one conversation, masking the prompt for completion-only loss."""
+        return build_example(
+            tokenizer, example["messages"], completion_only_loss=COMPLETION_ONLY
+        )
 
     train_ds = raw["train"].map(
         render, remove_columns=raw["train"].column_names, desc="chat template"
@@ -407,9 +493,8 @@ def main() -> int:
 
     args = SFTConfig(
         output_dir=str(CHECKPOINT_DIR),
-        dataset_text_field="text",
+        dataset_text_field=None,
         max_length=$MAX_SEQ,
-        completion_only_loss=True,
         packing=False,
         per_device_train_batch_size=$PER_DEVICE_BATCH,
         per_device_eval_batch_size=$PER_DEVICE_BATCH,
@@ -442,15 +527,17 @@ def main() -> int:
         processing_class=tokenizer,
         train_dataset=train_ds,
         eval_dataset=val_ds,
+        data_collator=MsftCollator(tokenizer),
         args=args,
     )
 
-    # Measure the loss mask before training: `completion_only_loss=True` with a `text` column
-    # has no completion mask to apply, and nobody has verified what it actually labels.
-    batch = next(iter(trainer.get_train_dataloader()))
+    # Measure the loss mask before training on the first training row, through the same
+    # collator the trainer uses. The training dataloader shuffles, so its first row is not
+    # necessarily row 0 and its prompt length would not match EXPECTED_PROMPT_LEN.
+    batch = MsftCollator(tokenizer)([train_ds[0]])
     ids = batch["input_ids"][0].tolist()
-    # Unsloth's collator may not carry an attention mask; a batch without one is unpadded, so
-    # every position is real. Inventing the mask keeps the report honest instead of crashing.
+    # MsftCollator always builds an attention mask; a hand-edited script might not, and a
+    # batch without one is unpadded, so every position is real.
     attn = batch["attention_mask"][0].tolist() if "attention_mask" in batch else [1] * len(ids)
     report = mask_report(
         ids,
@@ -477,12 +564,15 @@ def main() -> int:
         f"[msft] loss-mask: VERDICT {report['verdict']} — {notes[report['verdict']]}",
         flush=True,
     )
-    if report["verdict"] != "COMPLETION-ONLY":
+    expected = "COMPLETION-ONLY" if COMPLETION_ONLY else "FULL-SEQUENCE"
+    if report["verdict"] != expected:
         for line in (
             "!" * 78,
-            "!! msft: completion_only_loss=True but this batch is not completion-only.",
+            f"!! msft: completion_only_loss={COMPLETION_ONLY} but this batch is "
+            f"{report['verdict']}.",
             f"!! {report['labeled']} of {report['real_tokens']} real tokens are labeled;",
-            "!! system and user tokens are being trained. Measure before changing the format.",
+            "!! check the collator before spending GPU time on a mask that is not the one",
+            "!! the config asks for.",
             "!" * 78,
         ):
             print(line, file=sys.stderr, flush=True)
@@ -514,7 +604,7 @@ def main() -> int:
             "per_device_batch": $PER_DEVICE_BATCH,
             "grad_accum": $GRAD_ACCUM,
             "optim": $OPTIM,
-            "completion_only_loss": True,
+            "completion_only_loss": COMPLETION_ONLY,
             "packing": False,
             "load_best_model_at_end": True,
             "metric_for_best_model": "eval_loss",
@@ -561,6 +651,8 @@ def build_script(cfg: RunConfig) -> str:
         CHECKPOINT_DIR=json.dumps(str(cfg.output_path / CHECKPOINT_DIR_NAME)),
         TRAIN_FILE=json.dumps(str(paths["train"])),
         VAL_FILE=json.dumps(str(paths["val"])),
+        PACKING=cfg.train.packing,
+        COMPLETION_ONLY=cfg.train.completion_only_loss,
         MAX_SEQ=cfg.train.max_seq_length,
         PER_DEVICE_BATCH=cfg.train.per_device_batch,
         GRAD_ACCUM=cfg.train.grad_accum,

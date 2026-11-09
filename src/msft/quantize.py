@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from msft import provenance
 from msft.config import MsftError, RunConfig
 
 CONVERT_NAME = "convert_hf_to_gguf.py"
@@ -207,6 +208,7 @@ def plan(cfg: RunConfig, *, require_tools: bool = True) -> dict[str, Any]:
         "output": str(output_gguf(cfg)),
         "partial": str(partial_gguf(cfg)),
         "f16": str(f16_gguf(cfg)),
+        "sidecar": str(provenance.sidecar_path(output_gguf(cfg))),
         "method": cfg.quantize.method.upper(),
         "imatrix": (
             {
@@ -266,9 +268,13 @@ def run(cfg: RunConfig, *, execute: bool = False) -> dict[str, Any]:
     out = output_gguf(cfg)
     partial = partial_gguf(cfg)
     out.parent.mkdir(parents=True, exist_ok=True)
-    # A previous run's artefact must never be exported as if this run produced it.
+    # A previous run's artefact must never be exported as if this run produced it. The
+    # sidecar goes with it: provenance must never outlive the file it describes.
     out.unlink(missing_ok=True)
     partial.unlink(missing_ok=True)
+    sidecar = provenance.sidecar_path(out)
+    sidecar.unlink(missing_ok=True)
+    merged_before = provenance.merged_snapshot(cfg.merged_path)
     for index, argv in enumerate(result["commands"], start=1):
         _log(f"[{index}/{len(result['commands'])}] $ {' '.join(argv)}")
         completed = subprocess.run(argv, stdout=sys.stderr, check=False)
@@ -292,5 +298,23 @@ def run(cfg: RunConfig, *, execute: bool = False) -> dict[str, Any]:
             "llama-quantize failed without a non-zero exit"
         )
     os.replace(partial, out)
+    # The GGUF now exists; only then may a sidecar vouch for it. A merged directory that
+    # changed mid-run means the f16 was converted from weights the snapshot no longer names.
+    merged_after = provenance.merged_snapshot(cfg.merged_path)
+    if merged_after != merged_before:
+        raise MsftError("merged directory changed while quantizing")
+    convert = result["tools"].get("convert")
+    record = provenance.build_record(
+        config_name=cfg.name,
+        model_id=cfg.model.id,
+        revision=cfg.model.revision,
+        merged=merged_before,
+        f16=f16_gguf(cfg),
+        gguf=out,
+        method=cfg.quantize.method.upper(),
+        imatrix=bool(cfg.quantize.imatrix),
+        llama_cpp=provenance.llama_cpp_info(str(Path(convert).parent) if convert else None),
+    )
+    provenance.write(out, record)
     result["executed"] = True
     return result

@@ -7,6 +7,7 @@ import dataclasses
 import json
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -104,9 +105,11 @@ def test_script_carries_the_recipe_arguments(cfg: RunConfig) -> None:
         'use_gradient_checkpointing="unsloth"',
         'load_dataset("json"',
         "apply_chat_template",
-        'dataset_text_field="text"',
+        "dataset_text_field=None",
         "max_length=4096",
-        "completion_only_loss=True",
+        "build_example(",
+        "data_collator=MsftCollator(tokenizer)",
+        "MsftCollator",
         "packing=False",
         "per_device_train_batch_size=1",
         "gradient_accumulation_steps=32",
@@ -311,11 +314,170 @@ def test_the_script_measures_the_mask_before_training(cfg: RunConfig) -> None:
     script = train.build_script(cfg)
     ast.parse(script)
     assert "mask_report(" in script
-    assert "batch = next(iter(trainer.get_train_dataloader()))" in script
+    assert "MsftCollator(tokenizer)([train_ds[0]])" in script
     assert "MSFT_INSPECT_MASK" in script
     assert "loss-mask: VERDICT" in script
     assert script.index("SFTTrainer(") < script.index("= mask_report(")
     assert script.index("= mask_report(") < script.index("trainer.train()")
+
+
+# --- our own collator: what completion_only_loss actually masks ----------
+
+
+class WordTokenizer:
+    """Whitespace tokenizer with a fake Qwen-style template; each word is one token."""
+
+    def __init__(self) -> None:
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+        self._ids: dict[str, int] = {}
+
+    def token_id(self, word: str) -> int:
+        """Stable id for one word, assigning new ids in first-seen order."""
+        if word not in self._ids:
+            self._ids[word] = len(self._ids) + 10
+        return self._ids[word]
+
+    def __call__(self, text: str, add_special_tokens: bool = False) -> dict[str, list[int]]:
+        return {"input_ids": [self.token_id(word) for word in text.split()]}
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+    ) -> str:
+        text = " ".join(f"<|{m['role']}|> {m['content']} <|end|>" for m in messages)
+        return f"{text} <|assistant|>" if add_generation_prompt else text
+
+
+class ReorderedTokenizer(WordTokenizer):
+    """A template that rewrites the prompt, so it is not a prefix of the full row."""
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+    ) -> str:
+        text = super().apply_chat_template(messages, tokenize, False)
+        return f"PREFIX> {text}" if add_generation_prompt else text
+
+
+MESSAGES = [
+    {"role": "system", "content": "be terse"},
+    {"role": "user", "content": "hello there"},
+    {"role": "assistant", "content": "bonjour"},
+]
+
+
+def _extract_script_helpers(cfg: RunConfig) -> dict[str, object]:
+    """Exec the generated helper functions without importing unsloth or torch."""
+    script = train.build_script(cfg)
+    start = script.index("def fail(")
+    end = script.index("def main(")
+    namespace: dict[str, object] = {"sys": sys}
+    exec(script[start:end], namespace)
+    return namespace
+
+
+class _FakeTensor(list):
+    """Just enough of a tensor for the collator's assertions."""
+
+    def tolist(self) -> list[object]:
+        return list(self)
+
+
+def _fake_torch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make a bare `import torch` succeed without the real 2 GB dependency."""
+    module = types.ModuleType("torch")
+    module.long = "long"
+    module.tensor = lambda data, dtype=None: _FakeTensor(data)
+    monkeypatch.setitem(sys.modules, "torch", module)
+
+
+def test_build_example_masks_the_prompt_for_completion_only(cfg: RunConfig) -> None:
+    helpers = _extract_script_helpers(cfg)
+    tokenizer = WordTokenizer()
+    example = helpers["build_example"](tokenizer, MESSAGES, completion_only_loss=True)
+
+    prompt_len = len(helpers["render_prompt"](tokenizer, MESSAGES[:-1]).split())
+    assert prompt_len > 0
+    assert example["labels"][:prompt_len] == [-100] * prompt_len
+    assert all(label != -100 for label in example["labels"][prompt_len:])
+    # The response and its end marker are trained; the assistant header is not.
+    assert example["labels"][prompt_len] == tokenizer.token_id("bonjour")
+    assert example["labels"][-1] == tokenizer.token_id("<|end|>")
+
+
+def test_build_example_labels_every_token_without_completion_only(cfg: RunConfig) -> None:
+    helpers = _extract_script_helpers(cfg)
+    example = helpers["build_example"](
+        WordTokenizer(), MESSAGES, completion_only_loss=False
+    )
+    assert example["labels"] == example["input_ids"]
+    assert -100 not in example["labels"]
+
+
+def test_build_example_fails_when_the_prompt_is_not_a_prefix(
+    cfg: RunConfig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    helpers = _extract_script_helpers(cfg)
+    with pytest.raises(SystemExit):
+        helpers["build_example"](
+            ReorderedTokenizer(), MESSAGES, completion_only_loss=True
+        )
+    assert "not a prefix" in capsys.readouterr().err
+
+
+def test_collator_pads_a_ragged_batch(
+    cfg: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_torch(monkeypatch)
+    helpers = _extract_script_helpers(cfg)
+    collator = helpers["MsftCollator"](WordTokenizer())
+
+    batch = collator(
+        [
+            {"input_ids": [5, 6, 7], "labels": [-100, 6, 7]},
+            {"input_ids": [8, 9], "labels": [8, 9]},
+        ]
+    )
+
+    assert batch["input_ids"].tolist() == [[5, 6, 7], [8, 9, 0]]
+    assert batch["labels"].tolist() == [[-100, 6, 7], [8, 9, -100]]
+    assert batch["attention_mask"].tolist() == [[1, 1, 1], [1, 1, 0]]
+
+
+def test_script_never_passes_completion_only_loss_to_trl(cfg: RunConfig) -> None:
+    script = train.build_script(cfg)
+    block = script[script.index("args = SFTConfig(") : script.index("trainer = SFTTrainer(")]
+    assert "completion_only_loss" not in block
+    assert "dataset_text_field=None" in block
+    assert "MsftCollator" in script
+
+
+def test_the_collator_output_reports_completion_only(
+    cfg: RunConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generated script's own report must call this batch COMPLETION-ONLY."""
+    _fake_torch(monkeypatch)
+    helpers = _extract_script_helpers(cfg)
+    tokenizer = WordTokenizer()
+    example = helpers["build_example"](tokenizer, MESSAGES, completion_only_loss=True)
+    batch = helpers["MsftCollator"](tokenizer)([example])
+    prompt_len = len(helpers["render_prompt"](tokenizer, MESSAGES[:-1]).split())
+
+    report = helpers["mask_report"](
+        list(batch["input_ids"][0]),
+        list(batch["labels"][0]),
+        list(batch["attention_mask"][0]),
+        prompt_len=prompt_len,
+    )
+
+    assert report["verdict"] == "COMPLETION-ONLY"
+    assert report["masked_leading"] == prompt_len
+    assert report["last_real_labeled"] is True
 
 
 def test_inspect_mask_sets_the_env_and_skips_the_adapter_assertion(
@@ -342,15 +504,15 @@ def test_plan_lists_the_ignored_knobs(cfg: RunConfig) -> None:
     assert train.plan(cfg)["optim"]["ignored_knobs"] == train.IGNORED_KNOBS
 
 
-def test_validate_config_warns_about_an_ignored_knob(tmp_path: Path) -> None:
+def test_validate_config_rejects_packing_with_the_msft_collator(tmp_path: Path) -> None:
     cfg = RunConfig(
         name="model",
         base_dir=str(tmp_path),
         train=TrainCfg(packing=True),
         quantize=QuantCfg(output="out/model.gguf"),
     )
-    warnings = validate_config(cfg)
-    assert any("train.packing is ignored" in warning for warning in warnings)
+    with pytest.raises(MsftError, match="msft collator"):
+        validate_config(cfg)
 
 
 def _sentinel_for(value: object) -> object:

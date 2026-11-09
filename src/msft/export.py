@@ -18,6 +18,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from msft import provenance
 from msft.config import MsftError, RunConfig, redact
 
 MIN_GGUF_BYTES = 500_000_000
@@ -67,6 +68,54 @@ def _size_label(count: int) -> str:
             return f"{value:.0f} B" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024.0
     return f"{count} B"  # pragma: no cover - the loop always returns
+
+
+def _digest(value: Any) -> str:
+    """First eight hex characters of a recorded digest, for a readable refusal."""
+    text = str(value) if value is not None else ""
+    return f"{text[:8]}…" if text else "<missing>"
+
+
+def _provenance_check(path: Path) -> dict[str, Any]:
+    """Compare the GGUF on disk with its sidecar, independently of any run config."""
+    record, reason = provenance.load(path)
+    if record is None and reason == "absent":
+        return {
+            "status": "absent",
+            "detail": (
+                f"no provenance sidecar next to {path.name}; this GGUF predates sidecars or "
+                "was not produced by msft quantize — provenance not checked"
+            ),
+            "commit": None,
+        }
+    if record is None:
+        return {
+            "status": "unreadable",
+            "detail": f"refusing to export {path.name}: its provenance sidecar is {reason}",
+            "commit": None,
+        }
+    recorded = record.get("gguf") if isinstance(record.get("gguf"), dict) else {}
+    actual_bytes = path.stat().st_size
+    actual_sha = provenance.sha256_file(path)
+    recorded_bytes = recorded.get("bytes")
+    recorded_sha = recorded.get("sha256")
+    llama = record.get("llama_cpp")
+    commit = llama.get("commit") if isinstance(llama, dict) else None
+    if actual_bytes != recorded_bytes or actual_sha != recorded_sha:
+        detail = (
+            f"refusing to export {path.name}: its provenance sidecar records "
+            f"{recorded_bytes} bytes / sha256 {_digest(recorded_sha)}, but this file is "
+            f"{actual_bytes} bytes / sha256 {_digest(actual_sha)}. It is not what msft "
+            "quantize produced (replaced, truncated or mixed up). Re-run "
+            f"`msft quantize --execute`, or delete {provenance.sidecar_path(path).name} if "
+            "you accept the risk."
+        )
+        return {"status": "mismatch", "detail": detail, "commit": commit}
+    return {
+        "status": "ok",
+        "detail": f"sidecar matches {path.name}",
+        "commit": commit,
+    }
 
 
 def build_modelfile(source: str) -> str:
@@ -167,10 +216,9 @@ def run(
 
     use_container = bool(container)
     binary = "docker" if use_container else "ollama"
-    if shutil.which(binary) is None:
-        raise MsftError(
-            f"{binary} is not on PATH; install it or pass --container '' for host ollama"
-        )
+    prov = _provenance_check(path)
+    if prov["status"] == "absent":
+        _log(f"warning: {prov['detail']}")
 
     target = f"{namespace}/{name}" if namespace else name
     result: dict[str, Any] = {
@@ -184,11 +232,23 @@ def run(
         "mode": "container" if use_container else "host",
         "container": container if use_container else None,
         "verify": None,
+        "provenance": prov,
         "listed": None,
         "steps": [],
         "error": None,
     }
     steps: list[dict[str, Any]] = result["steps"]
+
+    # A file that is not the one msft quantize wrote must not reach docker at all.
+    if prov["status"] in ("mismatch", "unreadable"):
+        result["error"] = prov["detail"]
+        _log(f"error: {result['error']}")
+        return result
+
+    if shutil.which(binary) is None:
+        raise MsftError(
+            f"{binary} is not on PATH; install it or pass --container '' for host ollama"
+        )
 
     if config is not None:
         from msft import verify as verify_mod
@@ -316,6 +376,11 @@ def format_report(result: dict[str, Any]) -> str:
     if verification is not None:
         verdict = "PASS" if verification["ok"] else f"FAIL ({', '.join(verification['failures'])})"
         lines.append(f"  verify: {verdict}")
+    prov = result.get("provenance")
+    if prov:
+        lines.append(f"  provenance: {prov['status']}")
+        if prov.get("commit"):
+            lines.append(f"  llama.cpp: {prov['commit']}")
     lines.append(f"  listed: {'yes' if result['listed'] else 'no'}")
     if result.get("error"):
         lines.append(f"  error: {result['error']}")

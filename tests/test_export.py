@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from msft import export
+from msft import export, provenance
 from msft.cli import main
 from msft.config import MsftError
 
@@ -371,3 +371,137 @@ def test_a_namespaced_target_must_appear_in_the_listing(
 
     assert result["ok"] is False
     assert "me/machinum-book-ru:4b did not appear" in result["error"]
+
+
+# --- provenance gate ------------------------------------------------------
+
+
+class Forbidden:
+    """A subprocess stand-in that fails the test if docker is called at all."""
+
+    def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise AssertionError(f"docker must not run before the provenance check: {argv}")
+
+
+def write_record(
+    tmp_path: Path,
+    path: Path,
+    *,
+    recorded_bytes: int | None = None,
+    recorded_sha: str | None = None,
+) -> dict[str, Any]:
+    """Write a real sidecar for `path`, optionally lying about one gguf field."""
+    merged = tmp_path / "merged-run"
+    merged.mkdir(exist_ok=True)
+    (merged / "config.json").write_text("{}", encoding="utf-8")
+    (merged / "model.safetensors").write_bytes(b"w" * 5)
+    f16 = tmp_path / "model-run-f16.gguf"
+    f16.write_bytes(b"GGUF f16")
+    record = provenance.build_record(
+        config_name="run",
+        model_id="org/tiny",
+        revision=None,
+        merged=provenance.merged_snapshot(merged),
+        f16=f16,
+        gguf=path,
+        method="Q4_K_S",
+        imatrix=False,
+        llama_cpp={"commit": "deadbeef", "source": "git"},
+    )
+    if recorded_bytes is not None:
+        record["gguf"]["bytes"] = recorded_bytes
+    if recorded_sha is not None:
+        record["gguf"]["sha256"] = recorded_sha
+    provenance.write(path, record)
+    return record
+
+
+def test_export_refuses_a_byte_count_mismatch_before_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = gguf_file(tmp_path)
+    write_record(tmp_path, path, recorded_bytes=999)
+    monkeypatch.setattr(export.subprocess, "run", Forbidden())
+
+    result = export.run(path, "tiny")
+
+    assert result["ok"] is False
+    assert result["provenance"]["status"] == "mismatch"
+    assert result["provenance"]["commit"] == "deadbeef"
+    assert f"refusing to export {path.name}" in result["error"]
+    assert "999 bytes" in result["error"]
+    assert f"{path.stat().st_size} bytes" in result["error"]
+    assert provenance.sidecar_path(path).name in result["error"]
+
+
+def test_export_refuses_a_sha256_mismatch_and_names_both_digests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = gguf_file(tmp_path)
+    recorded = "0123456789abcdef" * 4
+    write_record(tmp_path, path, recorded_sha=recorded)
+    monkeypatch.setattr(export.subprocess, "run", Forbidden())
+
+    result = export.run(path, "tiny")
+
+    actual = provenance.sha256_file(path)
+    assert result["ok"] is False
+    assert result["provenance"]["status"] == "mismatch"
+    assert f"{recorded[:8]}…" in result["error"]
+    assert f"{actual[:8]}…" in result["error"]
+
+
+def test_export_refuses_a_corrupt_sidecar_before_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = gguf_file(tmp_path)
+    provenance.sidecar_path(path).write_text("{oops", encoding="utf-8")
+    monkeypatch.setattr(export.subprocess, "run", Forbidden())
+
+    result = export.run(path, "tiny")
+
+    assert result["ok"] is False
+    assert result["provenance"]["status"] == "unreadable"
+    assert "refusing to export" in result["error"]
+    assert "corrupt" in result["error"]
+
+
+def test_export_refuses_an_unknown_sidecar_schema_before_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = gguf_file(tmp_path)
+    provenance.sidecar_path(path).write_text('{"schema": 9}', encoding="utf-8")
+    monkeypatch.setattr(export.subprocess, "run", Forbidden())
+
+    result = export.run(path, "tiny")
+
+    assert result["ok"] is False
+    assert result["provenance"]["status"] == "unreadable"
+    assert "schema 9 unsupported" in result["error"]
+
+
+def test_export_proceeds_when_the_sidecar_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = gguf_file(tmp_path)
+    monkeypatch.setattr(export.subprocess, "run", FakeRun())
+
+    result = export.run(path, "tiny")
+
+    assert result["ok"] is True
+    assert result["provenance"]["status"] == "absent"
+    assert "warning: no provenance sidecar" in capsys.readouterr().err
+
+
+def test_export_proceeds_when_the_sidecar_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = gguf_file(tmp_path)
+    write_record(tmp_path, path)
+    monkeypatch.setattr(export.subprocess, "run", FakeRun())
+
+    result = export.run(path, "tiny")
+
+    assert result["ok"] is True
+    assert result["provenance"]["status"] == "ok"
+    assert result["provenance"]["commit"] == "deadbeef"
