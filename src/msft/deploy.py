@@ -106,6 +106,16 @@ def up(spec: WorkerSpec, *, execute: bool = False, build: bool = True) -> dict[s
     )
 
 
+def restart(spec: WorkerSpec, *, execute: bool = False) -> dict[str, Any]:
+    """Restart the worker container in place (after a pull that changed worker code)."""
+    return _ssh(
+        spec,
+        f"cd {shlex.quote(spec.repo)} && docker compose -f {shlex.quote(spec.compose_file)}"
+        " restart worker",
+        execute=execute,
+    )
+
+
 def down(spec: WorkerSpec, *, execute: bool = False) -> dict[str, Any]:
     """Stop and remove the worker container (the image and the mount stay)."""
     return _ssh(

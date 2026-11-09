@@ -70,6 +70,7 @@ Merged:  $MERGED_DIR (bfloat16, $SAVE_METHOD)
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,11 +87,39 @@ SAVE_METHOD = $SAVE_METHOD
 MAX_SEQ_LENGTH = $MAX_SEQ
 LOAD_IN_4BIT = $LOAD_IN_4BIT
 
+# save_pretrained_merged can write a tokenizer this transformers cannot load. These are the
+# files the GGUF converter needs, copied from the base snapshot as a last resort.
+TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt")
+
 
 def fail(message: str) -> int:
     """Report a fatal problem without a traceback."""
     print(f"error: {message}", file=sys.stderr)
     return 1
+
+
+def copy_base_tokenizer_files() -> list[str]:
+    """Copy the base snapshot's tokenizer files over MERGED_DIR; return what was copied."""
+    from huggingface_hub import snapshot_download
+
+    source = Path(
+        snapshot_download(
+            BASE_MODEL,
+            revision=REVISION,
+            allow_patterns=list(TOKENIZER_FILES),
+            local_files_only=True,
+        )
+    )
+    copied = []
+    for name in TOKENIZER_FILES:
+        candidate = source / name
+        if not candidate.is_file():
+            print(f"merge: {name} is not in the base snapshot; skipped", file=sys.stderr)
+            continue
+        shutil.copy2(candidate, MERGED_DIR / name)
+        copied.append(name)
+        print(f"merge: copied {name} from {candidate}", file=sys.stderr)
+    return copied
 
 
 def main() -> int:
@@ -138,15 +167,30 @@ def main() -> int:
 
     from transformers import AutoTokenizer
 
+    def load_tokenizer():
+        return AutoTokenizer.from_pretrained(str(MERGED_DIR))
+
     try:
-        AutoTokenizer.from_pretrained(str(MERGED_DIR))
-    except Exception as exc:  # noqa: BLE001 - any failure here breaks the GGUF step
-        print(
-            "merge: the merged tokenizer does not load; copy the base tokenizer files over it:"
-            f" {exc}",
-            file=sys.stderr,
-        )
-        return 1
+        load_tokenizer()
+    except Exception as first_error:
+        print(f"merge: merged tokenizer does not load: {first_error}", file=sys.stderr)
+        try:
+            copied = copy_base_tokenizer_files()
+        except Exception as copy_error:
+            print(f"merge: cannot copy the base tokenizer files: {copy_error}", file=sys.stderr)
+            return 1
+        if not copied:
+            print("merge: no tokenizer files were copied from the base snapshot", file=sys.stderr)
+        try:
+            load_tokenizer()
+        except Exception as second_error:
+            print(
+                "merge: tokenizer still does not load after copying the base files: "
+                f"{second_error}",
+                file=sys.stderr,
+            )
+            return 1
+        print("merge: tokenizer loads after the base files were copied", file=sys.stderr)
 
     meta = {
         "model": declared or BASE_MODEL,

@@ -262,6 +262,56 @@ def _cmd_eval(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     return EXIT_OK if passed else 1
 
 
+def _cmd_fetch(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Download the base model with resume and retries (config or --model)."""
+    fetch = _impl("msft.fetch")
+    model = args.model
+    revision = None
+    if not model:
+        config = _require_config(cfg)
+        model = config.model.id
+        revision = config.model.revision
+    result = _jsonable(fetch.run(model, revision=revision, attempts=args.attempts))
+    _emit(args.as_json, result, _func(fetch, "format_report")(result))
+    return EXIT_OK if result.get("ok") else 1
+
+
+def _cmd_verify(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Check the merged model, its tokenizer and the quantised GGUF."""
+    config = _require_config(cfg)
+    verify = _impl("msft.verify")
+    result = _jsonable(_func(verify, "run")(config))
+    _emit(args.as_json, result, _func(verify, "format_report")(result))
+    return EXIT_OK if result.get("ok") else 1
+
+
+def _cmd_export(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Create (and optionally push) an ollama model from a GGUF."""
+    export = _impl("msft.export")
+    result = _jsonable(
+        _func(export, "run")(
+            args.gguf,
+            args.name,
+            namespace=args.namespace,
+            push=bool(args.push),
+            container=args.container,
+        )
+    )
+    _emit(args.as_json, result, _func(export, "format_report")(result))
+    return EXIT_OK if result.get("ok") else 1
+
+
+def _cmd_probe(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Chat through the serve path with think:false, then run the eval gates."""
+    probe = _impl("msft.probe")
+    system = args.system or str(getattr(probe, "SYSTEM_PROMPT", ""))
+    result = _jsonable(
+        _func(probe, "run")(args.endpoint, args.model, args.cases, system=system)
+    )
+    _emit(args.as_json, result, _func(probe, "format_report")(result))
+    return EXIT_OK if result.get("ok") else 1
+
+
 def _cmd_remote_preflight(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     """Check the remote host over ssh before syncing or training."""
     remote = _impl("msft.remote")
@@ -351,17 +401,27 @@ def _common_flags() -> argparse.ArgumentParser:
 
 
 def _cmd_remote_deploy(cfg: RunConfig | None, args: argparse.Namespace) -> int:
-    """Pull the pushed branch on the box and bring the worker container up."""
+    """Pull the pushed branch on the box, then rebuild or restart the worker container."""
     deploy = _impl("msft.deploy")
     spec = deploy.load_spec()
+    restart = bool(getattr(args, "restart", False))
+    if restart and args.no_build:
+        raise MsftError("--restart and --no-build are mutually exclusive")
     pulled = _jsonable(deploy.pull(spec, execute=bool(args.execute)))
-    up = _jsonable(deploy.up(spec, execute=bool(args.execute), build=not args.no_build))
-    payload = {"spec": deploy.spec_json(spec), "pull": pulled, "up": up}
+    if restart:
+        action = _jsonable(deploy.restart(spec, execute=bool(args.execute)))
+        mode = "restart"
+    else:
+        action = _jsonable(deploy.up(spec, execute=bool(args.execute), build=not args.no_build))
+        mode = "up --no-build" if args.no_build else "up --build"
+    payload = {"mode": mode, "spec": deploy.spec_json(spec), "pull": pulled, "up": action}
+    pull_line = "rc=" + str(pulled.get("returncode")) if pulled.get("executed") else "plan"
+    action_line = "rc=" + str(action.get("returncode")) if action.get("executed") else "plan"
     text = "\n".join(
         [
             f"remote {deploy.spec_json(spec)['host']}  {spec.repo}",
-            f"pull   {'rc=' + str(pulled.get('returncode')) if pulled.get('executed') else 'plan'}",
-            f"up     {'rc=' + str(up.get('returncode')) if up.get('executed') else 'plan'}",
+            f"pull    {pull_line}",
+            f"{mode:<7} {action_line}",
         ]
     )
     _emit(args.as_json, payload, text)
@@ -543,6 +603,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_eval.set_defaults(handler=_cmd_eval)
 
+    p_fetch = sub.add_parser(
+        "fetch", parents=[common], help="resumable HF weight download (retries, checks incomplete)"
+    )
+    p_fetch.add_argument(
+        "--model",
+        metavar="HF_ID",
+        default=None,
+        help="model id to download (default: the config's model.id)",
+    )
+    p_fetch.add_argument("--attempts", type=int, default=8, help="download attempts (default: 8)")
+    p_fetch.set_defaults(handler=_cmd_fetch)
+
+    p_verify = sub.add_parser(
+        "verify", parents=[common], help="check merged config, tokenizer and GGUF size"
+    )
+    p_verify.set_defaults(handler=_cmd_verify)
+
+    p_export = sub.add_parser(
+        "export", parents=[common], help="create (and optionally push) an ollama model from a GGUF"
+    )
+    p_export.add_argument(
+        "--gguf", required=True, metavar="PATH", help="quantised GGUF to export"
+    )
+    p_export.add_argument(
+        "--name", required=True, help="ollama model name, e.g. machinum-book-ru:4b"
+    )
+    p_export.add_argument(
+        "--namespace", metavar="USER", default=None, help="ollama.com namespace for cp/push"
+    )
+    p_export.add_argument(
+        "--push", action="store_true", help="push <namespace>/<name> after create"
+    )
+    p_export.add_argument(
+        "--container",
+        default="ollama",
+        metavar="NAME",
+        help="ollama container to copy into (default: ollama; pass '' for a host binary)",
+    )
+    p_export.set_defaults(handler=_cmd_export)
+
+    p_probe = sub.add_parser(
+        "probe", parents=[common], help="chat through the serve path, then run the eval gates"
+    )
+    p_probe.add_argument("--endpoint", required=True, metavar="URL", help="ollama base URL")
+    p_probe.add_argument("--model", required=True, help="served model name")
+    p_probe.add_argument("--cases", required=True, metavar="PATH", help="cases JSONL")
+    p_probe.add_argument(
+        "--system", metavar="TEXT", default=None, help="system prompt (default: translation)"
+    )
+    p_probe.set_defaults(handler=_cmd_probe)
+
     p_remote = sub.add_parser("remote", parents=[common], help="ssh orchestration on a GPU box")
     remote_sub = p_remote.add_subparsers(dest="remote_command", metavar="ACTION", required=True)
     p_preflight = remote_sub.add_parser(
@@ -563,11 +674,18 @@ def build_parser() -> argparse.ArgumentParser:
         "deploy", parents=[common], help="pull on the box and bring the worker container up"
     )
     p_deploy.add_argument("--no-build", action="store_true", help="skip the image rebuild")
+    p_deploy.add_argument(
+        "--restart",
+        action="store_true",
+        help="pull, then restart the worker container (use after worker code changed)",
+    )
     p_deploy.set_defaults(handler=_cmd_remote_deploy)
     p_down = remote_sub.add_parser("down", parents=[common], help="stop the worker container")
     p_down.set_defaults(handler=_cmd_remote_down)
     p_signal = remote_sub.add_parser(
-        "signal", parents=[common], help="queue a job on the box (train|merge|quantize|eval)"
+        "signal",
+        parents=[common],
+        help="queue a job on the box (train|merge|quantize|eval|fetch|verify|data)",
     )
     p_signal.add_argument("kind")
     p_signal.add_argument("--id", dest="job_id", default=None)
@@ -592,7 +710,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_w_serve.add_argument("--once", action="store_true", help="run one job and exit")
     p_w_serve.set_defaults(handler=_cmd_worker_serve)
     p_w_signal = worker_sub.add_parser("signal", parents=[common], help="queue a job")
-    p_w_signal.add_argument("kind", help="train | merge | quantize | eval | data | doctor")
+    p_w_signal.add_argument(
+        "kind", help="train | merge | quantize | eval | fetch | verify | data | doctor"
+    )
     p_w_signal.add_argument("--dir", metavar="PATH", default=None, help="worker directory")
     p_w_signal.add_argument(
         "--id", dest="job_id", default=None, help="job id (default: time-based)"

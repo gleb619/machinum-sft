@@ -34,7 +34,7 @@ from typing import Any
 
 from msft.config import MsftError, redact
 
-JOB_KINDS = ("train", "merge", "quantize", "eval", "data", "doctor")
+JOB_KINDS = ("train", "merge", "quantize", "eval", "data", "doctor", "fetch", "verify")
 PENDING = "pending"
 RUNNING = "running"
 DONE = "done"
@@ -129,7 +129,8 @@ def _heartbeat(root: Path, state: str, job: str | None = None) -> None:
 def build_command(job: Job, argv0: list[str]) -> list[str]:
     """`python -m msft <kind> [--config ...] --execute` plus any extra args.
 
-    `data` needs its `build` action; the other kinds are leaves of the CLI.
+    `data` needs its `build` action; `fetch` and `verify` are leaves of the CLI like the
+    training stages, so the generic mapping covers them.
     """
     cmd = [*argv0, "-m", "msft", *([job.kind, "build"] if job.kind == "data" else [job.kind])]
     if job.config:
