@@ -287,17 +287,32 @@ def gpu_name() -> str | None:
 $MASK_REPORT_SOURCE
 
 
+def text_tokenizer(tokenizer):
+    """The real text tokenizer behind a processor.
+
+    A Processor wraps one and treats a positional string as *image* input, which fails with
+    "Incorrect image source ... Got <|im_start|>system" for a plain chat row.
+    """
+    return getattr(tokenizer, "tokenizer", tokenizer)
+
+
+def render_row(tokenizer, messages) -> str:
+    """Render one conversation to text, unwrapping a Processor if the model ships one."""
+    out = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    if isinstance(out, str):
+        return out
+    return out["text"][0] if isinstance(out.get("text"), list) else out["text"]
+
+
 def expected_prompt_len(tokenizer, messages) -> int:
     """Token count of the longest common prefix of the prompt and the fully rendered row."""
-    prompt = tokenizer.apply_chat_template(
-        messages[:-1], tokenize=False, add_generation_prompt=True
-    )
-    full = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    prompt = render_row(tokenizer, messages[:-1])
+    full = render_row(tokenizer, messages)
     limit = min(len(prompt), len(full))
     shared = 0
     while shared < limit and prompt[shared] == full[shared]:
         shared += 1
-    return len(tokenizer(prompt[:shared], add_special_tokens=False)["input_ids"])
+    return len(text_tokenizer(tokenizer)(prompt[:shared], add_special_tokens=False)["input_ids"])
 
 
 def main() -> int:
@@ -348,11 +363,7 @@ def main() -> int:
 
     def render(example: dict) -> dict:
         """Render one conversation through the tokenizer's chat template."""
-        return {
-            "text": tokenizer.apply_chat_template(
-                example["messages"], tokenize=False, add_generation_prompt=False
-            )
-        }
+        return {"text": render_row(tokenizer, example["messages"])}
 
     train_ds = raw["train"].map(
         render, remove_columns=raw["train"].column_names, desc="chat template"
