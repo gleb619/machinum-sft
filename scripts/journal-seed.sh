@@ -30,6 +30,8 @@ PAGES=(
   "$REPO/docs/cli-audit.md|projects/machinum-sft/cli-audit.md|decision|cli,audit,automation"
   "$REPO/docs/model-choice.md|projects/machinum-sft/model-choice.md|decision|model,qwen,gemma,vram"
   "$REPO/AGENTS.md|projects/machinum-sft/agents-rules.md|rule|agents,rules,guard"
+  "$REPO/docs/pipeline-check.md|projects/machinum-sft/pipeline-check.md|fact|mt,pipeline,quality,eval"
+  "$REPO/docs/model-candidates.md|projects/machinum-sft/model-candidates.md|decision|models,vram,registry"
 )
 
 if [ "$DRY_RUN" -eq 1 ]; then

@@ -80,6 +80,27 @@ inside a running container is a temporary fix that the next recreate undoes.
 
 ## Serving with ollama
 
+**`think: false` does nothing on the OpenAI-compatible endpoint.** Ollama's `/api/chat` honours
+it; `/v1/chat/completions` does not, and a thinking model (Qwen3.5/3.8, Gemma 4) then returns
+`content: ""` with the whole budget spent in `reasoning`. Through `mt` that surfaces as
+`LineParityError: Cyrillic ratio 0.00` after three 30-second retries, with nothing pointing at the
+cause. Send `reasoning_effort: "none"` instead:
+```
+curl -s localhost:7869/v1/chat/completions -d '{"model":"machinum:4b","reasoning_effort":"none", …}'
+MT_LLM_REASONING_EFFORT=none pnpm run runner:chapters      # mt ≥ 65b8fe5
+```
+Proving command: same payload with and without the field — without it `content` is empty and
+`reasoning` starts with "Thinking Process:"; with it the translation comes back and costs ~28 s
+per chapter on a 4B.
+
+**`mt` imports the built `@mt/tools`, not its source.** Editing `packages/tools/src/**` changes
+nothing until `pnpm --filter @mt/tools build` runs; `tsc` writes `dist` even when the build exits
+non-zero (the active-record refactor leaves type errors behind), so a failed build is not proof
+that the change was not applied — check `grep reasoning_effort packages/tools/dist/core/llm-client.js`.
+
+**`MT_OLLAMA_URL` must include `/v1`.** It is an OpenAI base URL, not a host. Without the suffix
+every call returns `404 page not found` from a server that answers `/api/tags` perfectly.
+
 **Never hand-write a chat template.** The GGUF carries the tokenizer's own `chat_template`, and
 `ollama` renders it. This repo shipped a hand-copied **Gemma `<|turn>`** template to a Qwen3.5
 model; prompted in a format it never saw, it answered with `Thinking Process: 1. **Analyze the

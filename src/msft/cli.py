@@ -627,7 +627,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--gguf", required=True, metavar="PATH", help="quantised GGUF to export"
     )
     p_export.add_argument(
-        "--name", required=True, help="ollama model name, e.g. machinum-book-ru:4b"
+        "--name", required=True, help="ollama model name, e.g. machinum:4b"
     )
     p_export.add_argument(
         "--namespace", metavar="USER", default=None, help="ollama.com namespace for cp/push"
