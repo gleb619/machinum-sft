@@ -448,10 +448,14 @@ def main() -> int:
     # Measure the loss mask before training: `completion_only_loss=True` with a `text` column
     # has no completion mask to apply, and nobody has verified what it actually labels.
     batch = next(iter(trainer.get_train_dataloader()))
+    ids = batch["input_ids"][0].tolist()
+    # Unsloth's collator may not carry an attention mask; a batch without one is unpadded, so
+    # every position is real. Inventing the mask keeps the report honest instead of crashing.
+    attn = batch["attention_mask"][0].tolist() if "attention_mask" in batch else [1] * len(ids)
     report = mask_report(
-        batch["input_ids"][0].tolist(),
+        ids,
         batch["labels"][0].tolist(),
-        batch["attention_mask"][0].tolist(),
+        attn,
         prompt_len=EXPECTED_PROMPT_LEN,
         tokenizer=tokenizer,
     )
