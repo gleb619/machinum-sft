@@ -170,7 +170,7 @@ def test_run_execute_writes_script_and_runs_it_under_this_python(
     """Execution writes output/train_script.py and runs it with sys.executable."""
     calls: list[list[str]] = []
 
-    def fake_run(argv: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
         cfg.adapter_path.mkdir(parents=True, exist_ok=True)
         (cfg.adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
@@ -191,7 +191,7 @@ def test_run_execute_raises_on_non_zero_exit(
 ) -> None:
     """A failing child becomes MsftError, not a silent success."""
 
-    def fake_run(argv: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(argv, 3)
 
     monkeypatch.setattr(train.subprocess, "run", fake_run)
@@ -204,9 +204,48 @@ def test_run_execute_rejects_a_silent_no_op(
 ) -> None:
     """Exit 0 without an adapter on disk is still a failure."""
 
-    def fake_run(argv: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(train.subprocess, "run", fake_run)
     with pytest.raises(MsftError, match="adapter_config.json"):
         train.run(cfg, execute=True)
+
+
+def test_execute_sends_the_child_output_to_stderr(
+    cfg: RunConfig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A script printing to stdout would corrupt a `--json` result; it inherits our stderr."""
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: list[str], stdout=None, check: bool = False, **kwargs: object):
+        captured["stdout"] = stdout
+        cfg.adapter_path.mkdir(parents=True, exist_ok=True)
+        (cfg.adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(train.subprocess, "run", fake_run)
+    train.run(cfg, execute=True)
+
+    assert captured["stdout"] is sys.stderr
+    assert capsys.readouterr().out == ""
+
+
+def test_merge_sends_the_child_output_to_stderr(
+    cfg: RunConfig, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg.adapter_path.mkdir(parents=True, exist_ok=True)
+    (cfg.adapter_path / "adapter_config.json").write_text("{}", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: list[str], stdout=None, check: bool = False, **kwargs: object):
+        captured["stdout"] = stdout
+        cfg.merged_path.mkdir(parents=True, exist_ok=True)
+        (cfg.merged_path / "config.json").write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(merge.subprocess, "run", fake_run)
+    merge.run(cfg, execute=True)
+
+    assert captured["stdout"] is sys.stderr
+    assert capsys.readouterr().out == ""

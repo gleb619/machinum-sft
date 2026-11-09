@@ -18,6 +18,8 @@ from msft.config import MsftError, RunConfig
 CONVERT_NAME = "convert_hf_to_gguf.py"
 QUANTIZE_NAMES = ("llama-quantize", "quantize")
 IMATRIX_NAMES = ("llama-imatrix", "imatrix")
+PARTIAL_SUFFIX = ".partial"
+GGUF_MAGIC = b"GGUF"
 CORPUS_ENV = "MSFT_IMATRIX_CORPUS"
 LLAMA_DIR_ENV = "LLAMA_CPP_DIR"
 BUILD_DIRS = ("", "build/bin", "build")
@@ -84,6 +86,12 @@ def output_gguf(cfg: RunConfig) -> Path:
     return out if out.is_absolute() else Path(cfg.base_dir) / out
 
 
+def partial_gguf(cfg: RunConfig) -> Path:
+    """Where `llama-quantize` writes before the finished file is atomically renamed."""
+    out = output_gguf(cfg)
+    return out.with_name(out.name + PARTIAL_SUFFIX)
+
+
 def f16_gguf(cfg: RunConfig) -> Path:
     """Intermediate float16 GGUF written by `convert_hf_to_gguf.py`."""
     out = output_gguf(cfg)
@@ -137,7 +145,7 @@ def _commands(
         argv = [str(quantize_bin)]
         if cfg.quantize.imatrix and corpus is not None:
             argv += ["--imatrix", str(imatrix_gguf(cfg))]
-        argv += [str(f16), str(output_gguf(cfg)), cfg.quantize.method.upper()]
+        argv += [str(f16), str(partial_gguf(cfg)), cfg.quantize.method.upper()]
         commands.append(argv)
     return commands
 
@@ -197,6 +205,7 @@ def plan(cfg: RunConfig, *, require_tools: bool = True) -> dict[str, Any]:
         "name": cfg.name,
         "model_dir": str(cfg.merged_path),
         "output": str(output_gguf(cfg)),
+        "partial": str(partial_gguf(cfg)),
         "f16": str(f16_gguf(cfg)),
         "method": cfg.quantize.method.upper(),
         "imatrix": (
@@ -254,20 +263,34 @@ def run(cfg: RunConfig, *, execute: bool = False) -> dict[str, Any]:
             f"{cfg.merged_path} holds no merged model; run `msft merge --execute` first"
         )
 
-    output_gguf(cfg).parent.mkdir(parents=True, exist_ok=True)
+    out = output_gguf(cfg)
+    partial = partial_gguf(cfg)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # A previous run's artefact must never be exported as if this run produced it.
+    out.unlink(missing_ok=True)
+    partial.unlink(missing_ok=True)
     for index, argv in enumerate(result["commands"], start=1):
         _log(f"[{index}/{len(result['commands'])}] $ {' '.join(argv)}")
-        completed = subprocess.run(argv, check=False)
+        completed = subprocess.run(argv, stdout=sys.stderr, check=False)
         if completed.returncode != 0:
             raise MsftError(
                 f"command {index} exited {completed.returncode}: {argv[0]}; read the log "
                 "above and re-run `msft quantize --execute`"
             )
 
-    if not output_gguf(cfg).is_file():
+    if not partial.is_file():
         raise MsftError(
-            f"llama-quantize reported success but {output_gguf(cfg)} is missing; "
+            f"llama-quantize reported success but {partial} is missing; "
             "check that the method name is supported by your llama.cpp build"
         )
+    size = partial.stat().st_size
+    with partial.open("rb") as handle:
+        magic = handle.read(len(GGUF_MAGIC))
+    if size <= 0 or magic != GGUF_MAGIC:
+        raise MsftError(
+            f"{partial} is not a valid GGUF ({size} bytes, magic {magic!r}); "
+            "llama-quantize failed without a non-zero exit"
+        )
+    os.replace(partial, out)
     result["executed"] = True
     return result

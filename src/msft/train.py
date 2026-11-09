@@ -483,7 +483,7 @@ def run(cfg: RunConfig, *, execute: bool = False) -> dict[str, Any]:
     _log(f"wrote {script_path}")
     _log(f"$ {sys.executable} {script_path}")
 
-    completed = subprocess.run([sys.executable, str(script_path)], check=False)
+    completed = subprocess.run([sys.executable, str(script_path)], stdout=sys.stderr, check=False)
     if completed.returncode != 0:
         raise MsftError(
             f"training script exited {completed.returncode}; read the log above, fix the "

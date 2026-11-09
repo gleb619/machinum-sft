@@ -104,6 +104,23 @@ def _snapshot_root(snapshot: Path) -> Path:
     return snapshot
 
 
+def _fatal(exc: BaseException, hub: Any) -> bool:
+    """True for failures another attempt cannot fix: gated, missing, bad revision, bad call."""
+    if isinstance(exc, TypeError):
+        return True
+    for name in ("RepositoryNotFoundError", "RevisionNotFoundError", "GatedRepoError"):
+        error_type = getattr(hub, name, None)
+        if isinstance(error_type, type) and isinstance(exc, error_type):
+            return True
+    http_error = getattr(hub, "HfHubHTTPError", None)
+    if isinstance(http_error, type) and isinstance(exc, http_error):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if status in (401, 403, 404):
+            return True
+    return False
+
+
 def run(
     model: str,
     *,
@@ -144,8 +161,11 @@ def run(
         result["attempts"] = attempt
         try:
             snapshot = Path(hub.snapshot_download(model, **kwargs))
-        except Exception as exc:  # noqa: BLE001 - every hub failure is worth another attempt
-            result["error"] = redact(f"{type(exc).__name__}: {exc}")
+        except Exception as exc:  # noqa: BLE001 - retry only what another attempt can fix
+            message = redact(f"{type(exc).__name__}: {exc}")
+            if _fatal(exc, hub):
+                raise MsftError(f"cannot download {model}: {message}") from exc
+            result["error"] = message
             partial = _dir_size(root) if root.exists() else 0
             _log(
                 f"attempt {attempt}/{attempts}: {human_bytes(partial)} downloaded, "

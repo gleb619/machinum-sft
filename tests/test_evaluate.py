@@ -178,3 +178,40 @@ def test_thinking_chatter_is_caught() -> None:
         "The user wants the text normalised, so I will",
     ):
         assert _CHATTER_RE.match(opening), opening
+
+
+def test_russian_chatter_openers_are_caught() -> None:
+    """The real model answered in Russian: `Вот перевод:` passed every gate before this."""
+    from msft.evaluate import _CHATTER_RE
+
+    for opening in (
+        "Вот перевод:",
+        "Конечно, вот перевод.",
+        "Перевод:\n<result><id>1</id>",
+        "Хорошо, я перевёл текст.",
+    ):
+        assert _CHATTER_RE.match(opening), opening
+
+
+def test_russian_preamble_before_the_first_result_fails(tmp_path: Path) -> None:
+    reply = "Конечно, вот перевод.\n" + GOOD_XML
+    gates = by_gate(run_gates(write_predictions(tmp_path, [record(reply, expected_lines=2)])))
+    assert gates["no_chatter"].passed is False
+    assert "chatty opener" in gates["no_chatter"].detail
+
+
+def test_think_block_anywhere_in_the_reply_fails(tmp_path: Path) -> None:
+    """A reasoning transcript after a plausible first line is still a transcript."""
+    reply = "<result><id>1</id><text>x</text></result>\nThink: I should have used id 2\n"
+    gates = by_gate(run_gates(write_predictions(tmp_path, [record(reply, expected_lines=2)])))
+    assert gates["no_chatter"].passed is False
+    assert "reasoning transcript" in gates["no_chatter"].detail
+
+
+@pytest.mark.parametrize("expected", [2.7, True, "2"])
+def test_non_integer_expected_lines_fails(tmp_path: Path, expected: Any) -> None:
+    """2.7 and True both compare equal to a line count without this guard."""
+    path = write_predictions(tmp_path, [record(GOOD_XML, expected_lines=expected)])
+    gate = by_gate(run_gates(path))["line_parity"]
+    assert gate.passed is False
+    assert "not an integer" in gate.detail

@@ -34,9 +34,12 @@ _PROPERTIES_RE = re.compile(r"^\s*(\d+)\s*=(.*)$")
 _FENCE_RE = re.compile(r"```|~~~")
 _CHATTER_RE = re.compile(
     r"^(?:sure|certainly|of course|here(?:'s| is| are)|below is"
-    r"|thinking process|analy[sz]e the request|the user wants|let me )",
+    r"|thinking process|think\b|analy[sz]e the request|the user wants|let me "
+    r"|вот |конечно|перевод:|хорошо,)",
     re.I,
 )
+# A reasoning transcript can appear anywhere, not only as the first line.
+_THINK_BLOCK_RE = re.compile(r"(?:^|\n)\s*(?:thinking process\b|think\s*:)", re.I)
 _XML_TERMS = ("text", "origin", "translation", "proofread")
 
 
@@ -88,12 +91,16 @@ def _first_content_line(reply: str, mode: str) -> tuple[int, str]:
 
 
 def _check_no_chatter(reply: str, mode: str) -> Outcome:
-    """Fail on empty replies, code fences, chatty openers and text before the first token."""
+    """Fail on empty replies, code fences, chatty openers, think blocks and preamble text."""
     if not reply.strip():
         return False, "reply is empty"
     match = _FENCE_RE.search(reply)
     if match:
         return False, f"reply contains a code fence at offset {match.start()}"
+    think = _THINK_BLOCK_RE.search(reply)
+    if think:
+        excerpt = reply[think.start() : think.start() + 60]
+        return False, f"reasoning transcript at offset {think.start()}: {excerpt!r}"
     lines = [line.strip() for line in reply.splitlines() if line.strip()]
     if lines and _CHATTER_RE.match(lines[0]):
         return False, f"chatty opener: {lines[0][:60]!r}"
@@ -159,10 +166,9 @@ def _check_line_parity(reply: str, expected: Any) -> Outcome:
     """Compare the number of non-empty output lines with the expected count."""
     if expected is None:
         return None, "expected_lines not set"
-    try:
-        want = int(expected)
-    except (TypeError, ValueError):
+    if isinstance(expected, bool) or not isinstance(expected, int):
         return False, f"expected_lines is not an integer: {expected!r}"
+    want = expected
     stripped, _ = _split_terms(reply)
     got = len([line for line in stripped.splitlines() if line.strip()])
     if got != want:

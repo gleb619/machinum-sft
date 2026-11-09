@@ -79,6 +79,7 @@ def _ssh(spec: WorkerSpec, command: str, *, execute: bool) -> dict[str, Any]:
     result = {
         **plan,
         "executed": True,
+        "ok": proc.returncode == 0,
         "returncode": proc.returncode,
         "stdout": redact(proc.stdout)[-4000:],
         "stderr": redact(proc.stderr)[-2000:],

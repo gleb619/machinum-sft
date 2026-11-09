@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from msft.config import MsftError, redact
+from msft.config import MsftError, RunConfig, redact
 
 MIN_GGUF_BYTES = 500_000_000
 DEFAULT_CONTAINER = "ollama"
@@ -26,6 +26,32 @@ NUM_CTX = 8192
 TEMPERATURE = 0
 TOP_P = 0.95
 REPEAT_PENALTY = 1.05
+TAIL_LINES = 50
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+_TAG_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _clean(text: str, limit: int = TAIL_LINES) -> str:
+    """Strip ANSI colour and keep the last ``limit`` lines; docker logs are long and noisy."""
+    plain = _ANSI_RE.sub("", text or "")
+    lines = [line.rstrip() for line in plain.splitlines() if line.strip()]
+    if len(lines) > limit:
+        dropped = len(lines) - limit
+        return "\n".join([f"... {dropped} earlier line(s) omitted", *lines[-limit:]])
+    return "\n".join(lines)
+
+
+def _check_name(value: str, what: str) -> str:
+    """Reject names that cannot safely be passed to docker/ollama as one argument."""
+    base, sep, tag = value.partition(":")
+    if not _NAME_RE.fullmatch(base) or (sep and not _TAG_RE.fullmatch(tag)):
+        raise MsftError(
+            f"invalid {what} {value!r}: use letters, digits, '.', '_' or '-' "
+            "(a single ':' separates an optional tag)"
+        )
+    return value
 
 
 def _log(message: str) -> None:
@@ -74,30 +100,31 @@ def _step(argv: list[str], steps: list[dict[str, Any]]) -> subprocess.CompletedP
         {
             "argv": list(argv),
             "returncode": proc.returncode,
-            "stderr": (proc.stderr or "").strip(),
+            "stderr": _clean(proc.stderr or ""),
         }
     )
     return proc
 
 
 def _failure(argv: list[str], proc: subprocess.CompletedProcess[str]) -> str:
-    """Verbatim failure text: the command, its exit code and its own stderr."""
-    detail = (proc.stderr or proc.stdout or "").strip()
+    """Verbatim failure text: the command, its exit code and the tail of its own output."""
+    detail = _clean(proc.stderr or proc.stdout or "")
     message = f"{' '.join(argv)} exited {proc.returncode}"
-    return f"{message}: {detail}" if detail else message
+    return redact(f"{message}: {detail}" if detail else message)
 
 
-def _listed(listing: str, model: str) -> bool:
-    """Whether ``ollama list`` shows ``model``; ``ollama create tiny`` stores ``tiny:latest``.
+def _listed(listing: str, target: str) -> bool:
+    """Whether ``ollama list`` shows ``target``; ``ollama create tiny`` stores ``tiny:latest``.
 
     Match row names, not the whole table: a substring test over the blob accepted a different
-    model whose name merely contains ours.
+    model whose name merely contains ours. When a namespace is used, the namespaced target is
+    what must appear, not the bare name it was copied from.
     """
     rows = [line.split() for line in listing.splitlines()[1:]]
     names = {row[0] for row in rows if row}
-    if model in names:
+    if target in names:
         return True
-    return ":" not in model and f"{model}:latest" in names
+    return ":" not in target and f"{target}:latest" in names
 
 
 def _remote_modelfile(name: str) -> str:
@@ -112,20 +139,30 @@ def run(
     namespace: str | None = None,
     push: bool = False,
     container: str = DEFAULT_CONTAINER,
+    config: RunConfig | None = None,
 ) -> dict[str, Any]:
-    """Create ``name`` from ``gguf`` in ollama; returns a JSON-serialisable result."""
+    """Create ``name`` from ``gguf`` in ollama; returns a JSON-serialisable result.
+
+    When ``config`` is given, `msft verify` must pass first: an artifact that fails its own
+    checks must never reach ``ollama create`` and look healthy in ``ollama list``.
+    """
     path = Path(gguf)
     if not path.is_file():
         raise MsftError(f"no such GGUF: {path}")
-    size = path.stat().st_size
-    if size < MIN_GGUF_BYTES:
-        raise MsftError(
-            f"refusing {path}: {_size_label(size)} is not a finished quant "
-            "(a Q4_K_S GGUF is at least 500 MB)"
-        )
+    name = _check_name(name, "model name")
+    if namespace is not None:
+        namespace = _check_name(namespace, "namespace")
     if push and not namespace:
         raise MsftError(
             "--push needs --namespace: a bare name targets library/ and ollama refuses it"
+        )
+    size = path.stat().st_size
+    # With a config, verify's band against the merged weights replaces this fixed floor: it is
+    # the same rule for a 0.8B smoke run and a 12B release.
+    if config is None and size < MIN_GGUF_BYTES:
+        raise MsftError(
+            f"refusing {path}: {_size_label(size)} is not a finished quant "
+            "(a Q4_K_S GGUF is at least 500 MB)"
         )
 
     use_container = bool(container)
@@ -146,34 +183,89 @@ def run(
         "target": target,
         "mode": "container" if use_container else "host",
         "container": container if use_container else None,
+        "verify": None,
         "listed": None,
         "steps": [],
         "error": None,
     }
     steps: list[dict[str, Any]] = result["steps"]
 
+    if config is not None:
+        from msft import verify as verify_mod
+
+        verification = verify_mod.run(config)
+        result["verify"] = {
+            "ok": verification["ok"],
+            "failures": verification["failures"],
+            "checks": verification["checks"],
+        }
+        if not verification["ok"]:
+            failed = ", ".join(verification["failures"])
+            result["error"] = (
+                f"verify failed ({failed}); refusing to export {path.name} — "
+                "run `msft verify` with the same --config for the details"
+            )
+            _log(f"error: {result['error']}")
+            return result
+
+    if use_container:
+        proc = _step(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container], steps
+        )
+        if proc.returncode != 0:
+            result["error"] = _failure(
+                ["docker", "inspect", "-f", "{{.State.Running}}", container], proc
+            )
+            _log(f"error: {result['error']}")
+            return result
+        if (proc.stdout or "").strip() != "true":
+            result["error"] = (
+                f"container {container!r} is not running; start it before exporting"
+            )
+            _log(f"error: {result['error']}")
+            return result
+
     with tempfile.TemporaryDirectory(prefix="msft-export-") as tmp:
         local_modelfile = Path(tmp) / "Modelfile"
         source = f"/models/{path.name}" if use_container else str(path.resolve())
         local_modelfile.write_text(build_modelfile(source), encoding="utf-8")
+        copied: list[str] = []
         if use_container:
-            remote_modelfile = _remote_modelfile(name)
-            create = ["docker", "exec", container, "ollama", "create", name, "-f", remote_modelfile]
+            remote_modelfile = _remote_modelfile(target)
+            create = [
+                "docker",
+                "exec",
+                container,
+                "ollama",
+                "create",
+                name,
+                "-f",
+                remote_modelfile,
+            ]
             sequence = [
                 ["docker", "exec", container, "mkdir", "-p", "/models"],
                 ["docker", "cp", str(path), f"{container}:/models/{path.name}"],
                 ["docker", "cp", str(local_modelfile), f"{container}:{remote_modelfile}"],
                 create,
             ]
+            copied = [f"/models/{path.name}", remote_modelfile]
         else:
             sequence = [["ollama", "create", name, "-f", str(local_modelfile)]]
 
-        for argv in sequence:
-            proc = _step(argv, steps)
-            if proc.returncode != 0:
-                result["error"] = _failure(argv, proc)
-                _log(f"error: {result['error']}")
-                return result
+        try:
+            for argv in sequence:
+                proc = _step(argv, steps)
+                if proc.returncode != 0:
+                    result["error"] = _failure(argv, proc)
+                    _log(f"error: {result['error']}")
+                    return result
+        finally:
+            if copied:
+                # A stale copy in the container looks current and is not; always remove it.
+                try:
+                    _step(["docker", "exec", container, "rm", "-f", *copied], steps)
+                except OSError as exc:  # cleanup must not mask the real failure
+                    _log(f"warning: could not remove the container copies: {exc}")
 
     prefix = ["docker", "exec", container, "ollama"] if use_container else ["ollama"]
     if namespace:
@@ -199,9 +291,9 @@ def run(
         result["error"] = _failure(argv, proc)
         return result
     listing = proc.stdout or ""
-    result["listed"] = _listed(listing, name)
+    result["listed"] = _listed(listing, target)
     if not result["listed"]:
-        result["error"] = f"{name} did not appear in `ollama list`"
+        result["error"] = f"{target} did not appear in `ollama list`"
         return result
     result["ok"] = True
     return result
@@ -220,6 +312,10 @@ def format_report(result: dict[str, Any]) -> str:
     ]
     for step in result["steps"]:
         lines.append(f"  rc={step['returncode']} {' '.join(step['argv'])}")
+    verification = result.get("verify")
+    if verification is not None:
+        verdict = "PASS" if verification["ok"] else f"FAIL ({', '.join(verification['failures'])})"
+        lines.append(f"  verify: {verdict}")
     lines.append(f"  listed: {'yes' if result['listed'] else 'no'}")
     if result.get("error"):
         lines.append(f"  error: {result['error']}")

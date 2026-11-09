@@ -3,9 +3,10 @@
 Only argparse is used here, and every implementation module is imported *inside* its handler,
 so `python -m msft --help` stays usable on a machine without torch, unsloth or trl.
 
-Exit codes: 0 success, 1 red eval gates, 2 user/config error (`error: ...` on stderr), 3 the
-requested implementation module is not written yet. Every step that would train or download is a
-printed plan unless `--execute` is passed.
+Exit codes: 0 success, 1 red gates or a command that failed, 2 user/config error or an
+internal error that prevented the run (`error: ...` on stderr), 3 the requested implementation
+module is not written yet. Every step that would train or download is a printed plan unless
+`--execute` is passed.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import importlib
 import json
 import os
 import sys
+import traceback
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -125,6 +127,15 @@ def _render(title: str, data: dict[str, Any]) -> str:
         else:
             lines.append(f"  {key}: {_scalar(value)}")
     return "\n".join(lines)
+
+
+def _exit_for(result: dict[str, Any]) -> int:
+    """Exit code for a result mapping: a plan is ok, an executed step follows ok/returncode."""
+    if result.get("executed") is False:
+        return EXIT_OK
+    if "ok" in result:
+        return EXIT_OK if result["ok"] else 1
+    return EXIT_OK if result.get("returncode", 0) == 0 else 1
 
 
 # --- configuration --------------------------------------------------------
@@ -288,6 +299,9 @@ def _cmd_verify(cfg: RunConfig | None, args: argparse.Namespace) -> int:
 def _cmd_export(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     """Create (and optionally push) an ollama model from a GGUF."""
     export = _impl("msft.export")
+    # Only an explicit --config asks for the verify gate; a default config picked up from the
+    # cwd must not silently change what `export` does.
+    gate = cfg if getattr(args, "config", None) else None
     result = _jsonable(
         _func(export, "run")(
             args.gguf,
@@ -295,6 +309,7 @@ def _cmd_export(cfg: RunConfig | None, args: argparse.Namespace) -> int:
             namespace=args.namespace,
             push=bool(args.push),
             container=args.container,
+            config=gate,
         )
     )
     _emit(args.as_json, result, _func(export, "format_report")(result))
@@ -323,7 +338,7 @@ def _cmd_remote_preflight(cfg: RunConfig | None, args: argparse.Namespace) -> in
         f"{row.get('status', '?'):<4} {row.get('name')}: {row.get('detail')}" for row in checks
     )
     _emit(args.as_json, payload, f"remote {display}:\n{text}")
-    return EXIT_OK
+    return 1 if any(row.get("status") == "fail" for row in checks) else EXIT_OK
 
 
 def _cmd_remote_sync(cfg: RunConfig | None, args: argparse.Namespace) -> int:
@@ -340,7 +355,7 @@ def _cmd_remote_sync(cfg: RunConfig | None, args: argparse.Namespace) -> int:
         _func(remote_mod, "sync")(host, Path(local), str(remote_path), execute=bool(args.execute))
     )
     _emit(args.as_json, result, _render("remote sync", result))
-    return EXIT_OK
+    return _exit_for(result)
 
 
 def _cmd_remote_run(cfg: RunConfig | None, args: argparse.Namespace) -> int:
@@ -350,7 +365,7 @@ def _cmd_remote_run(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     host = _remote_host()
     result = _jsonable(_func(remote, "run_remote")(config, host, execute=bool(args.execute)))
     _emit(args.as_json, result, _render("remote run", result))
-    return EXIT_OK
+    return _exit_for(result)
 
 
 def _cmd_config_show(cfg: RunConfig | None, args: argparse.Namespace) -> int:
@@ -407,13 +422,29 @@ def _cmd_remote_deploy(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     restart = bool(getattr(args, "restart", False))
     if restart and args.no_build:
         raise MsftError("--restart and --no-build are mutually exclusive")
+    mode = "restart" if restart else ("up --no-build" if args.no_build else "up --build")
     pulled = _jsonable(deploy.pull(spec, execute=bool(args.execute)))
+    if pulled.get("executed") and _exit_for(pulled) != EXIT_OK:
+        payload = {
+            "mode": mode,
+            "spec": deploy.spec_json(spec),
+            "pull": pulled,
+            "up": None,
+            "error": "pull failed; not rebuilding on stale code",
+        }
+        text = "\n".join(
+            [
+                f"remote {deploy.spec_json(spec)['host']}  {spec.repo}",
+                f"pull    rc={pulled.get('returncode')}",
+                f"{mode:<7} skipped: the pull failed, so the box was not rebuilt",
+            ]
+        )
+        _emit(args.as_json, payload, text)
+        return 1
     if restart:
         action = _jsonable(deploy.restart(spec, execute=bool(args.execute)))
-        mode = "restart"
     else:
         action = _jsonable(deploy.up(spec, execute=bool(args.execute), build=not args.no_build))
-        mode = "up --no-build" if args.no_build else "up --build"
     payload = {"mode": mode, "spec": deploy.spec_json(spec), "pull": pulled, "up": action}
     pull_line = "rc=" + str(pulled.get("returncode")) if pulled.get("executed") else "plan"
     action_line = "rc=" + str(action.get("returncode")) if action.get("executed") else "plan"
@@ -425,7 +456,7 @@ def _cmd_remote_deploy(cfg: RunConfig | None, args: argparse.Namespace) -> int:
         ]
     )
     _emit(args.as_json, payload, text)
-    return EXIT_OK
+    return _exit_for(action)
 
 
 def _cmd_remote_down(cfg: RunConfig | None, args: argparse.Namespace) -> int:
@@ -434,7 +465,7 @@ def _cmd_remote_down(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     spec = deploy.load_spec()
     result = _jsonable(deploy.down(spec, execute=bool(args.execute)))
     _emit(args.as_json, result, f"down rc={result.get('returncode', 'plan')}")
-    return EXIT_OK
+    return _exit_for(result)
 
 
 def _cmd_remote_signal(cfg: RunConfig | None, args: argparse.Namespace) -> int:
@@ -451,7 +482,7 @@ def _cmd_remote_signal(cfg: RunConfig | None, args: argparse.Namespace) -> int:
         )
     )
     _emit(args.as_json, result, f"signal {args.kind} -> rc={result.get('returncode', 'plan')}")
-    return EXIT_OK
+    return _exit_for(result)
 
 
 def _cmd_remote_status(cfg: RunConfig | None, args: argparse.Namespace) -> int:
@@ -460,7 +491,7 @@ def _cmd_remote_status(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     spec = deploy.load_spec()
     result = _jsonable(deploy.status(spec, execute=bool(args.execute)))
     _emit(args.as_json, result, result.get("stdout") or "plan")
-    return EXIT_OK
+    return _exit_for(result)
 
 
 def _worker_dir(cfg: RunConfig | None, explicit: str | None) -> str:
@@ -765,6 +796,8 @@ def main(argv: list[str] | None = None) -> int:
         return int(handler(_resolve_config(args), args))
     except MsftError as exc:
         _log(f"error: {exc}")
+        if args.as_json:
+            _emit(True, {"ok": False, "error": redact(str(exc))}, "")
         return EXIT_ERROR
     except _NotImplementedYet as exc:
         payload = {"status": "not_implemented", "module": exc.module, "error": exc.message}
@@ -775,4 +808,15 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_NOT_IMPLEMENTED
     except KeyboardInterrupt:
         _log("error: interrupted")
+        if args.as_json:
+            _emit(True, {"ok": False, "error": "interrupted"}, "")
         return 130
+    except Exception as exc:  # noqa: BLE001 - never let a traceback be the only output
+        # An internal failure means "cannot run", not "the gates are red": exit 2, and keep
+        # the --json contract with one object on stdout.
+        message = redact(f"internal {type(exc).__name__}: {exc}")
+        _log(message)
+        print(redact(traceback.format_exc()), file=sys.stderr)
+        if args.as_json:
+            _emit(True, {"ok": False, "error": message}, "")
+        return EXIT_ERROR

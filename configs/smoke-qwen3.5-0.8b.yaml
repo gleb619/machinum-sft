@@ -55,6 +55,6 @@ data:
 quantize:
   method: q4_k_s
   imatrix: false
-  output: out-smoke/model.gguf
+  output: out-smoke/model-smoke-qwen3.5-0.8b.gguf
 
 output_dir: out-smoke

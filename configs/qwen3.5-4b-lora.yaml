@@ -56,6 +56,6 @@ data:
 quantize:
   method: q4_k_s
   imatrix: false
-  output: out/model-4b.gguf
+  output: out/model-qwen3.5-4b-lora.gguf
 
 output_dir: out

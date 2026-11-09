@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -117,15 +117,134 @@ class RunConfig:
         return asdict(self)
 
 
+_KNOWN_VALUES = {
+    "dtype": {"bfloat16", "float16", "float32", "auto"},
+    "scheduler": {
+        "linear",
+        "cosine",
+        "cosine_with_restarts",
+        "polynomial",
+        "constant",
+        "constant_with_warmup",
+        "inverse_sqrt",
+        "reduce_lr_on_plateau",
+    },
+    "optim": {
+        "adamw_8bit",
+        "paged_adamw_8bit",
+        "adamw_torch",
+        "adamw_torch_fused",
+        "paged_adamw_32bit",
+        "adafactor",
+        "sgd",
+    },
+}
+_QUANT_METHODS = {
+    "q2_k",
+    "q3_k_s",
+    "q3_k_m",
+    "q3_k_l",
+    "q4_0",
+    "q4_1",
+    "q4_k_s",
+    "q4_k_m",
+    "q5_0",
+    "q5_1",
+    "q5_k_s",
+    "q5_k_m",
+    "q6_k",
+    "q8_0",
+    "f16",
+    "bf16",
+    "f32",
+    "copy",
+    "iq1_s",
+    "iq1_m",
+    "iq2_xxs",
+    "iq2_xs",
+    "iq2_s",
+    "iq2_m",
+    "iq3_xxs",
+    "iq3_xs",
+    "iq3_s",
+    "iq3_m",
+    "iq4_nl",
+    "iq4_xs",
+}
+_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _coerce(section: str, key: str, annotation: str, value: Any) -> Any:
+    """Check and coerce one YAML value to the dataclass field's annotated type."""
+    where = f"config section '{section}' key '{key}'"
+    if value is None:
+        if annotation.endswith("| None"):
+            return None
+        raise MsftError(f"{where} must not be null")
+    if annotation == "bool":
+        # YAML `"false"` is a truthy string; an unquoted false is already a bool.
+        if not isinstance(value, bool):
+            raise MsftError(f"{where} must be true or false, not {value!r}")
+        return value
+    if annotation == "int":
+        if isinstance(value, bool):
+            raise MsftError(f"{where} must be an integer, not {value!r}")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                pass
+        raise MsftError(f"{where} must be an integer, not {value!r}")
+    if annotation == "float":
+        if isinstance(value, bool):
+            raise MsftError(f"{where} must be a number, not {value!r}")
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                pass
+        raise MsftError(f"{where} must be a number, not {value!r}")
+    if annotation == "str":
+        if not isinstance(value, str):
+            raise MsftError(f"{where} must be a string, not {value!r}")
+        return value
+    if annotation == "list[str]":
+        if isinstance(value, str) or not isinstance(value, (list, tuple)):
+            raise MsftError(f"{where} must be a list of strings")
+        items = list(value)
+        if not all(isinstance(item, str) for item in items):
+            raise MsftError(f"{where} must contain only strings")
+        return items
+    return value
+
+
 def _section(data: dict[str, Any], key: str, cls: type) -> Any:
-    raw = data.get(key) or {}
+    raw = data.get(key)
+    if raw is None:
+        raw = {}
     if not isinstance(raw, dict):
         raise MsftError(f"config section '{key}' must be a mapping")
-    allowed = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-    unknown = sorted(set(raw) - allowed)
+    allowed = {field.name: field for field in fields(cls)}
+    unknown = sorted(set(raw) - set(allowed))
     if unknown:
         raise MsftError(f"unknown key(s) in '{key}': {', '.join(unknown)}")
-    return cls(**raw)
+    for spec in allowed.values():
+        required = spec.default is MISSING and spec.default_factory is MISSING
+        if required and spec.name not in raw:
+            raise MsftError(f"config section '{key}' is missing required key '{spec.name}'")
+    coerced = {
+        name: _coerce(key, name, allowed[name].type, value) for name, value in raw.items()
+    }
+    try:
+        return cls(**coerced)
+    except TypeError as exc:
+        raise MsftError(f"config section '{key}': {exc}") from exc
 
 
 def load_config(path: str | Path) -> RunConfig:
@@ -166,14 +285,51 @@ def load_config(path: str | Path) -> RunConfig:
 def validate_config(cfg: RunConfig) -> list[str]:
     """Return warnings; raise MsftError on anything that cannot work."""
     warnings: list[str] = []
+    if not _NAME_RE.fullmatch(cfg.name):
+        raise MsftError(
+            f"name '{cfg.name}' must match [A-Za-z0-9._-]+; it names directories and files"
+        )
     if not cfg.model.id or "/" not in cfg.model.id:
         raise MsftError("model.id must look like 'org/name'")
+    if cfg.model.dtype not in _KNOWN_VALUES["dtype"]:
+        raise MsftError(
+            f"model.dtype '{cfg.model.dtype}' is not one of "
+            f"{', '.join(sorted(_KNOWN_VALUES['dtype']))}"
+        )
     if cfg.lora.r <= 0:
         raise MsftError("lora.r must be positive")
     if cfg.lora.alpha <= 0:
         raise MsftError("lora.alpha must be positive")
     if cfg.train.max_seq_length < 256:
         raise MsftError("train.max_seq_length below 256 is not useful for chapters")
+    for key, value in (
+        ("train.epochs", cfg.train.epochs),
+        ("train.grad_accum", cfg.train.grad_accum),
+        ("train.per_device_batch", cfg.train.per_device_batch),
+        ("train.lr", cfg.train.lr),
+    ):
+        if value <= 0:
+            raise MsftError(f"{key} must be positive, not {value!r}")
+    if cfg.train.scheduler not in _KNOWN_VALUES["scheduler"]:
+        raise MsftError(
+            f"train.scheduler '{cfg.train.scheduler}' is not one of "
+            f"{', '.join(sorted(_KNOWN_VALUES['scheduler']))}"
+        )
+    if cfg.train.optim not in _KNOWN_VALUES["optim"]:
+        raise MsftError(
+            f"train.optim '{cfg.train.optim}' is not one of "
+            f"{', '.join(sorted(_KNOWN_VALUES['optim']))}"
+        )
+    if cfg.quantize.method.lower() not in _QUANT_METHODS:
+        raise MsftError(
+            f"quantize.method '{cfg.quantize.method}' is not a known llama.cpp quantisation type"
+        )
+    if cfg.name not in Path(cfg.quantize.output).name:
+        raise MsftError(
+            f"quantize.output '{cfg.quantize.output}' does not contain the run name "
+            f"'{cfg.name}'; two configs writing the same GGUF is how a 0.8B model once "
+            "shipped as model-4b.gguf"
+        )
     if not 0.0 < cfg.data.val_ratio < 0.5:
         raise MsftError("data.val_ratio must be between 0 and 0.5")
     if cfg.train.per_device_batch * cfg.train.grad_accum < 8:
@@ -195,8 +351,10 @@ def validate_config(cfg: RunConfig) -> list[str]:
     return warnings
 
 
+# Explicit credential prefixes only: a generic 32+ character rule also masked checksums,
+# so fetch/verify lost the sha256 they exist to report.
 _SECRET = re.compile(
-    r"(?i)(hf_[a-z0-9]{8,}|sk-[a-z0-9]{8,}|gh[pousr]_[a-z0-9]{8,}|[A-Za-z0-9_-]{32,})"
+    r"(?i)(hf_[a-z0-9]{8,}|sk-[a-z0-9]{8,}|gh[pousr]_[a-z0-9]{8,}|xox[baprs]-[a-z0-9-]{8,})"
 )
 _HOST = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 _HOME = re.compile(r"/(?:home|Users)/[^/\s]+")

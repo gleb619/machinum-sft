@@ -16,6 +16,7 @@ from msft.config import MsftError
 LISTING = (
     "NAME                     ID    SIZE    MODIFIED\n"
     "machinum-book-ru:4b  abc  2.6 GB  now\n"
+    "me/machinum-book-ru:4b  abc  2.6 GB  now\n"
     # ollama tags a bare name, so `ollama create tiny` shows up as `tiny:latest`.
     "tiny:latest  def  2.6 GB  now\n"
 )
@@ -30,10 +31,12 @@ class FakeRun:
         listing: str = LISTING,
         fail_on: str | None = None,
         stderr: str = "",
+        running: str = "true",
     ) -> None:
         self.listing = listing
         self.fail_on = fail_on
         self.stderr = stderr
+        self.running = running
         self.calls: list[list[str]] = []
         self.modelfile: str | None = None
 
@@ -50,6 +53,8 @@ class FakeRun:
                 self.modelfile = candidate.read_text(encoding="utf-8")
         if self.fail_on is not None and self.fail_on in argv:
             return subprocess.CompletedProcess(argv, 1, "", self.stderr)
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, f"{self.running}\n", "")
         if argv[-1] == "list":
             return subprocess.CompletedProcess(argv, 0, self.listing, "")
         return subprocess.CompletedProcess(argv, 0, "", "")
@@ -80,12 +85,13 @@ def test_container_flow_creates_the_model_without_a_template(
     assert result["ok"] is True
     assert result["listed"] is True
     assert result["mode"] == "container"
-    assert fake.calls[0] == ["docker", "exec", "ollama", "mkdir", "-p", "/models"]
-    assert fake.calls[1] == ["docker", "cp", str(path), "ollama:/models/model-4b.gguf"]
-    assert fake.calls[2][0:2] == ["docker", "cp"]
-    assert fake.calls[2][2].endswith("Modelfile")
-    assert fake.calls[2][3].startswith("ollama:/tmp/Modelfile.machinum-book-ru_4b")
-    assert fake.calls[3] == [
+    assert fake.calls[0] == ["docker", "inspect", "-f", "{{.State.Running}}", "ollama"]
+    assert fake.calls[1] == ["docker", "exec", "ollama", "mkdir", "-p", "/models"]
+    assert fake.calls[2] == ["docker", "cp", str(path), "ollama:/models/model-4b.gguf"]
+    assert fake.calls[3][0:2] == ["docker", "cp"]
+    assert fake.calls[3][2].endswith("Modelfile")
+    assert fake.calls[3][3].startswith("ollama:/tmp/Modelfile.machinum-book-ru_4b")
+    assert fake.calls[4] == [
         "docker",
         "exec",
         "ollama",
@@ -93,6 +99,15 @@ def test_container_flow_creates_the_model_without_a_template(
         "create",
         "machinum-book-ru:4b",
         "-f",
+        "/tmp/Modelfile.machinum-book-ru_4b",
+    ]
+    assert fake.calls[5] == [
+        "docker",
+        "exec",
+        "ollama",
+        "rm",
+        "-f",
+        "/models/model-4b.gguf",
         "/tmp/Modelfile.machinum-book-ru_4b",
     ]
     assert fake.calls[-1] == ["docker", "exec", "ollama", "ollama", "list"]
@@ -251,3 +266,108 @@ def test_modelfile_never_contains_a_hand_written_template() -> None:
     assert "TEMPLATE" not in text
     assert text.startswith("FROM /models/model.gguf\n")
     assert "num_ctx 8192" in text
+
+
+# --- hygiene and the verify gate -----------------------------------------
+
+
+def test_verify_gate_refuses_a_failed_artifact_before_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An artifact that fails `msft verify` must never reach `ollama create`."""
+    from msft.config import ModelCfg, RunConfig
+
+    path = gguf_file(tmp_path)
+    fake = FakeRun()
+    monkeypatch.setattr(export.subprocess, "run", fake)
+
+    import msft.verify as verify_mod
+
+    monkeypatch.setattr(
+        verify_mod,
+        "run",
+        lambda cfg: {"ok": False, "failures": ["gguf"], "checks": []},
+    )
+    result = export.run(path, "tiny", config=RunConfig(model=ModelCfg(id="org/tiny")))
+
+    assert result["ok"] is False
+    assert "verify failed (gguf)" in result["error"]
+    assert fake.calls == []
+    assert result["verify"] == {"ok": False, "failures": ["gguf"], "checks": []}
+
+
+def test_a_name_with_shell_characters_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(MsftError, match="invalid model name"):
+        export.run(gguf_file(tmp_path), "x; rm -rf /")
+
+
+def test_a_namespace_with_a_slash_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(MsftError, match="invalid namespace"):
+        export.run(gguf_file(tmp_path), "tiny", namespace="me/other")
+
+
+def test_ansi_and_long_stderr_are_cleaned_and_tailed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = gguf_file(tmp_path)
+    noise = "\n".join(f"line {index}" for index in range(120))
+    fake = FakeRun(fail_on="create", stderr=f"\x1b[31mError:\x1b[0m {noise}")
+    monkeypatch.setattr(export.subprocess, "run", fake)
+
+    result = export.run(path, "tiny")
+
+    assert result["ok"] is False
+    assert "\x1b" not in result["error"]
+    assert "line 119" in result["error"]
+    assert "line 10\n" not in result["error"]
+    assert "earlier line(s) omitted" in result["error"]
+
+
+def test_copied_files_are_removed_even_when_create_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale GGUF left in /models looks current on the next export and is not."""
+    path = gguf_file(tmp_path)
+    fake = FakeRun(fail_on="create", stderr="create failed")
+    monkeypatch.setattr(export.subprocess, "run", fake)
+
+    result = export.run(path, "tiny")
+
+    assert result["ok"] is False
+    removals = [
+        call
+        for call in fake.calls
+        if call[:3] == ["docker", "exec", "ollama"] and "rm" in call
+    ]
+    assert removals
+    assert f"/models/{path.name}" in removals[-1]
+    assert any(arg.startswith("/tmp/Modelfile.") for arg in removals[-1])
+
+
+def test_a_stopped_container_is_refused_before_copying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = gguf_file(tmp_path)
+    fake = FakeRun(running="false")
+    monkeypatch.setattr(export.subprocess, "run", fake)
+
+    result = export.run(path, "tiny")
+
+    assert result["ok"] is False
+    assert "is not running" in result["error"]
+    assert not any(call[1:2] == ["cp"] for call in fake.calls)
+
+
+def test_a_namespaced_target_must_appear_in_the_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`cp` can succeed while `list` still shows only the bare name; that is not exported."""
+    path = gguf_file(tmp_path)
+    listing = "NAME ID SIZE MODIFIED\nmachinum-book-ru:4b  abc  2.6 GB  now\n"
+    fake = FakeRun(listing=listing)
+    monkeypatch.setattr(export.subprocess, "run", fake)
+
+    result = export.run(path, "machinum-book-ru:4b", namespace="me")
+
+    assert result["ok"] is False
+    assert "me/machinum-book-ru:4b did not appear" in result["error"]

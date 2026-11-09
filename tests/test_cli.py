@@ -27,6 +27,8 @@ train:
   max_seq_length: 1024
 data:
   val_ratio: 0.05
+quantize:
+  output: out/model-tiny.gguf
 """
 
 
@@ -242,3 +244,160 @@ def test_python_m_msft_help_exits_zero() -> None:
     assert proc.returncode == 0
     assert "usage: msft" in proc.stdout.lower()
     assert proc.stderr == ""
+
+
+# --- remote exit codes ----------------------------------------------------
+
+
+def _remote_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MSFT_REMOTE_HOST", "user@buildbox.test")
+
+
+def test_remote_preflight_exits_one_when_a_check_fails(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import msft.remote as remote
+
+    _remote_env(monkeypatch)
+    monkeypatch.setattr(
+        remote, "preflight", lambda host, execute=False: [
+            {"name": "ssh", "status": "fail", "detail": "unreachable"}
+        ]
+    )
+    code = main(["--json", "remote", "preflight", "--execute"])
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["checks"][0]["status"] == "fail"
+
+
+def test_remote_sync_exit_code_follows_the_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import msft.remote as remote
+
+    _remote_env(monkeypatch)
+    path = write_config(tmp_path)
+    monkeypatch.setattr(
+        remote,
+        "sync",
+        lambda host, local, dest, execute=False: {
+            "executed": True,
+            "ok": False,
+            "returncode": 23,
+            "stderr": "rsync failed",
+        },
+    )
+    code = main(["--config", str(path), "remote", "sync", "--execute"])
+    assert code == 1
+    assert "rsync failed" in capsys.readouterr().out
+
+
+def test_remote_run_plan_still_exits_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import msft.remote as remote
+
+    _remote_env(monkeypatch)
+    path = write_config(tmp_path)
+    monkeypatch.setattr(
+        remote,
+        "run_remote",
+        lambda cfg, host, execute=False: {"executed": False, "host": "masked"},
+    )
+    assert main(["--config", str(path), "remote", "run"]) == 0
+
+
+def test_remote_status_exits_one_when_ssh_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import msft.deploy as deploy
+
+    monkeypatch.setattr(deploy, "load_spec", lambda: deploy.WorkerSpec(host="user@box"))
+    monkeypatch.setattr(
+        deploy,
+        "status",
+        lambda spec, execute=False: {
+            "executed": True,
+            "ok": False,
+            "returncode": 255,
+            "stdout": "",
+            "stderr": "connection refused",
+        },
+    )
+    assert main(["--json", "remote", "status", "--execute"]) == 1
+
+
+def test_deploy_stops_before_up_when_the_pull_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import msft.deploy as deploy
+
+    monkeypatch.setattr(deploy, "load_spec", lambda: deploy.WorkerSpec(host="user@box"))
+    monkeypatch.setattr(
+        deploy,
+        "pull",
+        lambda spec, execute=False: {"executed": True, "ok": False, "returncode": 128},
+    )
+
+    def boom(*args: object, **kwargs: object) -> dict[str, Any]:
+        raise AssertionError("up must not run after a failed pull")
+
+    monkeypatch.setattr(deploy, "up", boom)
+    assert main(["--json", "remote", "deploy", "--execute"]) == 1
+
+
+def test_deploy_up_failure_is_exit_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    import msft.deploy as deploy
+
+    monkeypatch.setattr(deploy, "load_spec", lambda: deploy.WorkerSpec(host="user@box"))
+    monkeypatch.setattr(
+        deploy,
+        "pull",
+        lambda spec, execute=False: {"executed": True, "ok": True, "returncode": 0},
+    )
+    monkeypatch.setattr(
+        deploy,
+        "up",
+        lambda spec, execute=False, build=True: {
+            "executed": True,
+            "ok": False,
+            "returncode": 1,
+        },
+    )
+    assert main(["--json", "remote", "deploy", "--execute"]) == 1
+
+
+# --- unexpected failures keep the JSON contract --------------------------
+
+
+def test_internal_error_prints_one_failure_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import msft.worker as worker
+
+    def crash(directory: str) -> dict[str, Any]:
+        raise RuntimeError("boom from a library")
+
+    monkeypatch.setattr(worker, "status", crash)
+    code = main(["--json", "worker", "status", "--dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out.count("\n") == 1
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert "internal RuntimeError: boom from a library" in payload["error"]
+    assert "Traceback" in captured.err
+
+
+def test_msft_error_prints_one_failure_object(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        ["--json", "--config", str(tmp_path / "absent.yaml"), "config", "show"]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out.count("\n") == 1
+    assert json.loads(captured.out)["ok"] is False

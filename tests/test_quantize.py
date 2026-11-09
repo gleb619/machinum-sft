@@ -67,7 +67,6 @@ def test_plan_builds_exact_convert_and_quantize_argv(
     plan = quantize.plan(cfg)
 
     f16 = tmp_path / "out" / "model-f16.gguf"
-    out = tmp_path / "out" / "model.gguf"
     assert plan["ready"] is True
     assert plan["missing"] == []
     assert plan["method"] == "Q4_K_M"
@@ -81,7 +80,8 @@ def test_plan_builds_exact_convert_and_quantize_argv(
         "--outtype",
         "f16",
     ]
-    assert plan["commands"][1] == ["/fake/bin/llama-quantize", str(f16), str(out), "Q4_K_M"]
+    partial = tmp_path / "out" / "model.gguf.partial"
+    assert plan["commands"][1] == ["/fake/bin/llama-quantize", str(f16), str(partial), "Q4_K_M"]
 
 
 def test_plan_orders_convert_then_imatrix_then_quantize(
@@ -113,7 +113,7 @@ def test_plan_orders_convert_then_imatrix_then_quantize(
         "--imatrix",
         str(imatrix),
         str(f16),
-        str(tmp_path / "out" / "model.gguf"),
+        str(tmp_path / "out" / "model.gguf.partial"),
         "Q4_K_M",
     ]
     assert plan["imatrix"] == {
@@ -180,9 +180,13 @@ def test_run_execute_runs_commands_in_order(
     planned = quantize.plan(cfg)["commands"]
     calls: list[list[str]] = []
 
-    def fake_run(argv: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
-        Path(argv[-2]).write_text("gguf", encoding="utf-8")
+        # convert_hf_to_gguf.py names its output; llama-quantize takes it as the last arg.
+        target = Path(
+            argv[argv.index("--outfile") + 1] if "--outfile" in argv else argv[-2]
+        )
+        target.write_bytes(b"GGUF" + b"\0" * 16)
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(quantize.subprocess, "run", fake_run)
@@ -215,9 +219,88 @@ def test_run_execute_raises_on_non_zero_exit(
     _install_tools(monkeypatch, tmp_path / "llama.cpp")
     _merged(cfg)
 
-    def fake_run(argv: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(argv, 1)
 
     monkeypatch.setattr(quantize.subprocess, "run", fake_run)
     with pytest.raises(MsftError, match="exited 1"):
         quantize.run(cfg, execute=True)
+
+
+def _writer(payload: bytes = b"GGUF" + b"\0" * 16):
+    """A fake subprocess.run that writes `payload` where the tool was told to write."""
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        target = Path(
+            argv[argv.index("--outfile") + 1] if "--outfile" in argv else argv[-2]
+        )
+        target.write_bytes(payload)
+        return subprocess.CompletedProcess(argv, 0)
+
+    return fake_run
+
+
+def test_plan_writes_the_quantizer_output_to_a_partial(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final name must never exist until the quant is complete and checked."""
+    _install_tools(monkeypatch, tmp_path / "llama.cpp")
+    plan = quantize.plan(cfg)
+    assert plan["output"] == str(tmp_path / "out" / "model.gguf")
+    assert plan["partial"] == str(tmp_path / "out" / "model.gguf.partial")
+    assert plan["commands"][-1][-2] == plan["partial"]
+
+
+def test_run_execute_removes_a_stale_output_before_running(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A previous run's GGUF must not survive a failed quant and look current."""
+    _install_tools(monkeypatch, tmp_path / "llama.cpp")
+    _merged(cfg)
+    out = tmp_path / "out" / "model.gguf"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"GGUF old model")
+    partial = tmp_path / "out" / "model.gguf.partial"
+    partial.write_bytes(b"GGUF stale partial")
+    observed: dict[str, bool] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed["out_existed"] = out.exists()
+        target = Path(
+            argv[argv.index("--outfile") + 1] if "--outfile" in argv else argv[-2]
+        )
+        target.write_bytes(b"GGUF" + b"n" * 16)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(quantize.subprocess, "run", fake_run)
+    result = quantize.run(cfg, execute=True)
+
+    assert observed["out_existed"] is False
+    assert result["executed"] is True
+    assert out.read_bytes().startswith(b"GGUF")
+    assert not partial.exists()
+
+
+def test_run_execute_fails_when_the_partial_is_missing(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """rc=0 without an artifact is not success; the final file must not appear."""
+    _install_tools(monkeypatch, tmp_path / "llama.cpp")
+    _merged(cfg)
+    monkeypatch.setattr(
+        quantize.subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0)
+    )
+    with pytest.raises(MsftError, match="missing"):
+        quantize.run(cfg, execute=True)
+    assert not (tmp_path / "out" / "model.gguf").exists()
+
+
+def test_run_execute_fails_when_the_partial_is_not_a_gguf(
+    cfg: RunConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_tools(monkeypatch, tmp_path / "llama.cpp")
+    _merged(cfg)
+    monkeypatch.setattr(quantize.subprocess, "run", _writer(b"not a gguf at all"))
+    with pytest.raises(MsftError, match="not a valid GGUF"):
+        quantize.run(cfg, execute=True)
+    assert not (tmp_path / "out" / "model.gguf").exists()

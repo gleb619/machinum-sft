@@ -12,6 +12,7 @@ services:
     image: machinum-sft:cu128
     container_name: msft-worker
     restart: unless-stopped
+    stop_grace_period: 60s
     gpus: all
     shm_size: "8gb"
     working_dir: /workspace

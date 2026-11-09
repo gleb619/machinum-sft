@@ -222,3 +222,67 @@ def test_cli_fetch_exit_two_without_dependencies(
     assert code == 2
     assert captured.out == ""
     assert "uv pip install -e '.[train]'" in captured.err
+
+
+def test_a_404_is_fatal_and_never_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing or gated repo cannot be fixed by waiting; one attempt, then the error."""
+    calls: list[str] = []
+
+    class HfHubHTTPError(Exception):
+        def __init__(self, status: int) -> None:
+            super().__init__(f"{status} Client Error")
+            self.response = types.SimpleNamespace(status_code=status)
+
+    class RepositoryNotFoundError(HfHubHTTPError):
+        pass
+
+    def download(model: str, **kwargs: Any) -> str:
+        calls.append(model)
+        raise RepositoryNotFoundError(404)
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = download  # type: ignore[attr-defined]
+    hub.HfHubHTTPError = HfHubHTTPError  # type: ignore[attr-defined]
+    hub.RepositoryNotFoundError = RepositoryNotFoundError  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    slept: list[float] = []
+
+    with pytest.raises(MsftError, match="cannot download org/missing"):
+        fetch.run("org/missing", attempts=5, sleep=slept.append)
+
+    assert calls == ["org/missing"]
+    assert slept == []
+
+
+def test_a_transient_http_error_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = cache_layout(tmp_path)
+    attempts: list[int] = []
+
+    class HfHubHTTPError(Exception):
+        def __init__(self, status: int) -> None:
+            super().__init__(f"{status} Server Error")
+            self.response = types.SimpleNamespace(status_code=status)
+
+    def download(model: str, **kwargs: Any) -> str:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise HfHubHTTPError(503)
+        return str(snapshot)
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = download  # type: ignore[attr-defined]
+    hub.HfHubHTTPError = HfHubHTTPError  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+
+    result = fetch.run("org/tiny", attempts=2, sleep=lambda seconds: None)
+
+    assert result["ok"] is True
+    assert result["attempts"] == 2
+    assert len(attempts) == 2

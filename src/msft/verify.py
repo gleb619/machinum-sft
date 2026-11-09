@@ -17,9 +17,12 @@ from typing import Any
 from msft.config import RunConfig, redact
 from msft.quantize import f16_gguf, output_gguf
 
-MIN_GGUF_BYTES = 500_000_000
 RATIO_MIN = 0.25
 RATIO_MAX = 0.45
+MERGED_BAND_MIN = 0.15
+MERGED_BAND_MAX = 0.65
+GGUF_MAGIC = b"GGUF"
+CONFIG_KEYS = ("model_type", "hidden_size", "num_hidden_layers", "vocab_size")
 
 
 def _log(message: str) -> None:
@@ -88,16 +91,17 @@ def _cached_base_config(model_id: str) -> Path | None:
     return max(present, key=lambda path: path.stat().st_mtime)
 
 
-def base_model_type(cfg: RunConfig) -> tuple[str | None, str]:
-    """The base model's ``model_type`` from the local cache; returns (type, where it came from)."""
+def base_config(cfg: RunConfig) -> tuple[dict[str, Any] | None, str]:
+    """The base model's ``config.json`` as a dict, and where it came from."""
     cached = _cached_base_config(cfg.model.id)
     if cached is not None:
         try:
             data = json.loads(cached.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             return None, f"cannot read cached base config {cached}: {exc}"
-        if isinstance(data, dict) and data.get("model_type"):
-            return str(data["model_type"]), f"HF cache {cached}"
+        if isinstance(data, dict):
+            return data, f"HF cache {cached}"
+        return None, f"cached base config {cached} is not a mapping"
     try:
         from transformers import AutoConfig
     except ImportError:
@@ -110,12 +114,22 @@ def base_model_type(cfg: RunConfig) -> tuple[str | None, str]:
         kwargs["revision"] = cfg.model.revision
     try:
         config = AutoConfig.from_pretrained(cfg.model.id, **kwargs)
-    except Exception as exc:  # noqa: BLE001 - any failure means the type is unknown
+    except Exception as exc:  # noqa: BLE001 - any failure means the config is unknown
         return None, f"no cached config.json for {cfg.model.id}: {exc}"
-    model_type = getattr(config, "model_type", "") or ""
+    if not getattr(config, "model_type", ""):
+        return None, f"{cfg.model.id} config has no model_type"
+    return dict(config.to_dict()), "transformers AutoConfig"
+
+
+def base_model_type(cfg: RunConfig) -> tuple[str | None, str]:
+    """The base model's ``model_type`` from the local cache; returns (type, where it came from)."""
+    data, source = base_config(cfg)
+    if data is None:
+        return None, source
+    model_type = data.get("model_type")
     if not model_type:
         return None, f"{cfg.model.id} config has no model_type"
-    return str(model_type), "transformers AutoConfig"
+    return str(model_type), source
 
 
 def tokenizer_loads(merged: Path) -> tuple[bool, str]:
@@ -142,6 +156,11 @@ def _check_merged(cfg: RunConfig) -> dict[str, Any]:
 
 
 def _check_model_type(cfg: RunConfig) -> dict[str, Any]:
+    """Compare the merged config with the base: model_type and the size-bearing fields.
+
+    ``model_type`` alone is identical for every size in a family — that is why a 0.8B model
+    once passed as a 4B. ``hidden_size``, ``num_hidden_layers`` and ``vocab_size`` are not.
+    """
     config_path = cfg.merged_path / "config.json"
     if not config_path.is_file():
         return {
@@ -157,29 +176,42 @@ def _check_model_type(cfg: RunConfig) -> dict[str, Any]:
             "passed": False,
             "detail": f"cannot read {config_path}: {exc}",
         }
-    merged_type = data.get("model_type") if isinstance(data, dict) else None
-    if not merged_type:
+    if not isinstance(data, dict):
         return {
             "name": "model_type",
             "passed": False,
-            "detail": f"{config_path} has no model_type",
+            "detail": f"{config_path} does not hold a JSON object",
         }
-    base_type, source = base_model_type(cfg)
-    if not base_type:
+    base, source = base_config(cfg)
+    if base is None:
         return {"name": "model_type", "passed": False, "detail": source}
-    if str(merged_type) == base_type:
+
+    problems: list[str] = []
+    compared: list[str] = []
+    for key in CONFIG_KEYS:
+        expected = base.get(key)
+        actual = data.get(key)
+        if expected is None:
+            continue
+        compared.append(key)
+        if actual is None:
+            problems.append(f"merged config has no {key}")
+        elif actual != expected:
+            problems.append(f"{key} {actual} != base {expected}")
+    if problems:
         return {
             "name": "model_type",
-            "passed": True,
-            "detail": f"merged {merged_type} equals base {base_type} ({source})",
+            "passed": False,
+            "detail": (
+                f"{'; '.join(problems)} ({source}); this is another model under this "
+                "artifact's filename"
+            ),
         }
+    checked = ", ".join(compared) or "no size fields present in the base config"
     return {
         "name": "model_type",
-        "passed": False,
-        "detail": (
-            f"merged {merged_type} != base {base_type} ({source}); this is another model "
-            "under this artifact's filename"
-        ),
+        "passed": True,
+        "detail": f"merged matches base for {checked} ({source})",
     }
 
 
@@ -194,47 +226,123 @@ def _check_tokenizer(cfg: RunConfig) -> dict[str, Any]:
     return {"name": "tokenizer", "passed": passed, "detail": detail}
 
 
+def _gguf_magic(path: Path) -> bytes:
+    """The first four bytes of a file, or b'' when it cannot be read."""
+    try:
+        with path.open("rb") as handle:
+            return handle.read(len(GGUF_MAGIC))
+    except OSError:
+        return b""
+
+
 def _check_gguf(cfg: RunConfig) -> tuple[dict[str, Any], dict[str, Any]]:
     """One check plus the size table row for the quantised GGUF and its f16 source."""
     gguf = output_gguf(cfg)
     f16 = f16_gguf(cfg)
     gguf_bytes = _file_size(gguf)
     f16_bytes = _file_size(f16)
+    merged_bytes = _dir_size(cfg.merged_path) if cfg.merged_path.is_dir() else 0
     ratio = gguf_bytes / f16_bytes if f16_bytes else None
+    merged_ratio = gguf_bytes / merged_bytes if merged_bytes else None
 
     problems: list[str] = []
     if not gguf.is_file():
         problems.append(f"{gguf} is missing; run `msft quantize --execute`")
-    elif gguf_bytes <= MIN_GGUF_BYTES:
-        problems.append(
-            f"{gguf} is only {_size_label(gguf_bytes)}; a finished Q4 is at least 500 MB"
-        )
+    else:
+        magic = _gguf_magic(gguf)
+        if magic != GGUF_MAGIC:
+            problems.append(f"{gguf} does not start with the GGUF magic ({magic!r})")
+        if merged_ratio is not None and not MERGED_BAND_MIN <= merged_ratio <= MERGED_BAND_MAX:
+            problems.append(
+                f"{gguf.name} is {merged_ratio:.1%} of the merged weights "
+                f"({_size_label(merged_bytes)}); a Q4 lands between "
+                f"{MERGED_BAND_MIN:.0%} and {MERGED_BAND_MAX:.0%}"
+            )
     if ratio is not None and not RATIO_MIN <= ratio <= RATIO_MAX:
         problems.append(
             f"{gguf.name} is {ratio:.1%} of {f16.name}; Q4_K_S lands between 25 % and 45 %"
         )
     if problems:
         detail = "; ".join(problems)
-    elif ratio is None:
-        detail = f"{_size_label(gguf_bytes)}; f16 source absent, ratio not checked"
-    else:
+    elif merged_ratio is not None:
+        detail = (
+            f"{_size_label(gguf_bytes)}, {merged_ratio:.1%} of the merged weights"
+            + (f", {ratio:.1%} of {f16.name}" if ratio is not None else "")
+            + ("" if ratio is not None else "; f16 source absent, ratio not checked")
+        )
+    elif ratio is not None:
         detail = f"{_size_label(gguf_bytes)}, {ratio:.1%} of {f16.name}"
+    else:
+        detail = f"{_size_label(gguf_bytes)}; merged weights absent, size band not checked"
 
     sizes = {
         "gguf": {"path": str(gguf), "bytes": gguf_bytes, "label": _size_label(gguf_bytes)},
         "f16": {"path": str(f16), "bytes": f16_bytes, "label": _size_label(f16_bytes)},
         "ratio": round(ratio, 4) if ratio is not None else None,
+        "merged_ratio": round(merged_ratio, 4) if merged_ratio is not None else None,
     }
     return {"name": "gguf", "passed": not problems, "detail": detail}, sizes
 
 
+def _check_chat_template(cfg: RunConfig) -> dict[str, Any]:
+    """The GGUF must carry the tokenizer's own chat template; check the merged files.
+
+    Reading GGUF metadata is more code than this earns, and the merged directory is the
+    source the converter copies from. An empty or absent template makes ollama fall back to
+    a hand-written one — the failure rule 4 in AGENTS.md exists to prevent.
+    """
+    tokenizer_config = cfg.merged_path / "tokenizer_config.json"
+    if tokenizer_config.is_file():
+        try:
+            data = json.loads(tokenizer_config.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return {
+                "name": "chat_template",
+                "passed": False,
+                "detail": f"cannot read {tokenizer_config}: {exc}",
+            }
+        template = data.get("chat_template") if isinstance(data, dict) else None
+        if isinstance(template, str) and template.strip():
+            return {
+                "name": "chat_template",
+                "passed": True,
+                "detail": "tokenizer_config.json carries a non-empty chat_template",
+            }
+        if isinstance(template, list) and template:
+            return {
+                "name": "chat_template",
+                "passed": True,
+                "detail": "tokenizer_config.json carries a chat_template list",
+            }
+    for name in ("chat_template.jinja", "chat_template.txt"):
+        candidate = cfg.merged_path / name
+        try:
+            if candidate.is_file() and candidate.read_text(encoding="utf-8").strip():
+                return {
+                    "name": "chat_template",
+                    "passed": True,
+                    "detail": f"{name} is non-empty",
+                }
+        except OSError:
+            continue
+    return {
+        "name": "chat_template",
+        "passed": False,
+        "detail": (
+            f"{cfg.merged_path} has no non-empty chat_template; the GGUF would carry none "
+            "and ollama would need a hand-written one"
+        ),
+    }
+
+
 def run(cfg: RunConfig) -> dict[str, Any]:
-    """Check merged config, tokenizer and GGUF; returns a JSON-serialisable verdict."""
+    """Check merged config, tokenizer, chat template and GGUF; returns a JSON verdict."""
     gguf_check, gguf_sizes = _check_gguf(cfg)
     checks = [
         _check_merged(cfg),
         _check_model_type(cfg),
         _check_tokenizer(cfg),
+        _check_chat_template(cfg),
         gguf_check,
     ]
     failures = [check["name"] for check in checks if not check["passed"]]

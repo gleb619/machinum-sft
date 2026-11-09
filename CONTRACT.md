@@ -27,7 +27,10 @@ change in someone else's file, write it in your report instead of editing.
    Use `tmp_path`, monkeypatch `subprocess.run`, and tiny 3–5 record fixtures.
 6. **Style:** `ruff check .` clean, line length 100, type hints everywhere, one-line docstring
    per public function. Errors are raised as `MsftError` (defined in `config.py`) and the CLI
-   catches them, printing `error: <msg>` to stderr and returning exit code 2.
+   catches them, printing `error: <msg>` to stderr and returning exit code 2. An unexpected
+   exception is not a red gate: it is logged with a traceback, reported the same way and also
+   returns 2, so a CI wrapper cannot confuse "the code crashed" with "the gates failed" (1).
+   A command that ran and failed — a failed rsync, a non-zero training run — returns 1.
 7. **Every command supports `--json`** and prints a single JSON object when it is set.
 
 ## Interfaces (do not change signatures without telling the others)

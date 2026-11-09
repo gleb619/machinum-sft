@@ -21,11 +21,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import secrets
 import shutil
 import signal as _sig
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -39,10 +42,35 @@ PENDING = "pending"
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
+HEARTBEAT_INTERVAL_S = 30.0
+STOP_POLL_S = 1.0
+STOP_GRACE_S = 30.0
+INTERRUPTED_ERROR = "interrupted (worker restarted)"
+
+_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _validate_id(ident: str) -> str:
+    """Reject ids that cannot safely become a filename inside the queue directory."""
+    if not isinstance(ident, str) or not _ID_RE.fullmatch(ident):
+        raise MsftError(
+            f"invalid job id {ident!r}: use letters, digits, '.', '_' or '-' "
+            "(at most 80 characters, starting with a letter or digit)"
+        )
+    return ident
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write a JSON record atomically, so a reader never sees half a file."""
+    # The heartbeat thread and the job loop can write the same path; a shared temp name would
+    # let one rename the file the other is still writing.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def worker_dir(path: str | Path) -> Path:
@@ -69,6 +97,7 @@ class Job:
     duration_s: float | None = None
     log: str | None = None
     error: str | None = None
+    pid: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -88,14 +117,23 @@ def signal(
     """
     if kind not in JOB_KINDS:
         raise MsftError(f"unknown job kind '{kind}'; pick one of {', '.join(JOB_KINDS)}")
+    if job_id is not None:
+        _validate_id(job_id)
     root = worker_dir(directory)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    ident = job_id or f"{kind}-{stamp}"
+    ident = job_id or f"{kind}-{stamp}-{secrets.token_hex(2)}"
     job = Job(id=ident, kind=kind, config=config, extra_args=list(extra_args or []))
     target = root / "inbox" / f"{ident}.json"
-    tmp = target.with_suffix(".json.tmp")
+    tmp = target.with_name(target.name + f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(job.to_dict(), indent=2), encoding="utf-8")
-    os.replace(tmp, target)
+    try:
+        os.link(tmp, target)
+    except FileExistsError as exc:
+        raise MsftError(
+            f"job '{ident}' already exists in {root / 'inbox'}; pass a different --id"
+        ) from exc
+    finally:
+        tmp.unlink(missing_ok=True)
     return ident
 
 
@@ -112,18 +150,39 @@ def _next_job(root: Path) -> Path | None:
     return pending[0] if pending else None
 
 
-def _heartbeat(root: Path, state: str, job: str | None = None) -> None:
+def _heartbeat(root: Path, state: str, job: str | None = None, pid: int | None = None) -> None:
     payload = {
         "pid": os.getpid(),
+        "child_pid": pid,
         "host": socket.gethostname(),
         "updated": _now(),
         "state": state,
         "job": job,
         "python": sys.version.split()[0],
     }
-    tmp = root / "heartbeat.json.tmp"
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    os.replace(tmp, root / "heartbeat.json")
+    _write_json(root / "heartbeat.json", payload)
+
+
+class _Heartbeat(threading.Thread):
+    """Refresh the heartbeat while a job runs, so `status` and healthchecks stay honest."""
+
+    def __init__(
+        self, root: Path, job_id: str, interval: float = HEARTBEAT_INTERVAL_S
+    ) -> None:
+        super().__init__(name=f"msft-heartbeat-{job_id}", daemon=True)
+        self.root = root
+        self.job_id = job_id
+        self.interval = interval
+        self.pid: int | None = None
+        self.stop_event = threading.Event()
+
+    def run(self) -> None:
+        while not self.stop_event.wait(self.interval):
+            _heartbeat(self.root, RUNNING, self.job_id, pid=self.pid)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.join(timeout=max(1.0, self.interval))
 
 
 def build_command(job: Job, argv0: list[str]) -> list[str]:
@@ -141,43 +200,122 @@ def build_command(job: Job, argv0: list[str]) -> list[str]:
     return cmd
 
 
+def _wait_for_child(proc: subprocess.Popen[Any], stop: threading.Event | None) -> tuple[int, bool]:
+    """Wait for a child, forwarding a stop request as SIGTERM (then SIGKILL)."""
+    while True:
+        try:
+            return proc.wait(timeout=STOP_POLL_S), False
+        except subprocess.TimeoutExpired:
+            if stop is None or not stop.is_set():
+                continue
+            proc.terminate()
+            try:
+                proc.wait(timeout=STOP_GRACE_S)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            return proc.returncode if proc.returncode is not None else -1, True
+
+
+def _record_failure(
+    root: Path, job_file: Path, ident: str, kind: str, error: str
+) -> Job:
+    """Move a job that could not run to done/ with status=failed and the reason."""
+    job = Job(id=ident, kind=kind)
+    job.status = FAILED
+    job.error = redact(error)
+    job.finished = _now()
+    _write_json(root / "done" / job_file.name, job.to_dict())
+    for folder in ("inbox", "running"):
+        (root / folder / job_file.name).unlink(missing_ok=True)
+    return job
+
+
+def _job_details(path: Path) -> tuple[str, str]:
+    """Best-effort (id, kind) from a job file, falling back to its filename."""
+    try:
+        data = _read(path)
+    except MsftError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return str(data.get("id") or path.stem), str(data.get("kind") or "unknown")
+
+
 def run_job(
-    root: Path, job_file: Path, *, argv0: list[str] | None = None, cwd: str | None = None
+    root: Path,
+    job_file: Path,
+    *,
+    argv0: list[str] | None = None,
+    cwd: str | None = None,
+    stop: threading.Event | None = None,
 ) -> Job:
     """Execute one job file, moving it through running → done, logging everything."""
     data = _read(job_file)
     job = Job(**{key: data[key] for key in Job.__dataclass_fields__ if key in data})
+    _validate_id(job.id)
+    if job.kind not in JOB_KINDS:
+        raise MsftError(
+            f"job '{job.id}' has unknown kind '{job.kind}'; "
+            f"pick one of {', '.join(JOB_KINDS)}"
+        )
     running = root / "running" / job_file.name
     os.replace(job_file, running)
     job.status = RUNNING
     job.started = _now()
+    _write_json(running, job.to_dict())
     log_path = root / "logs" / f"{job.id}.log"
     cmd = build_command(job, argv0 or [sys.executable])
     started = time.monotonic()
-    with log_path.open("w", encoding="utf-8") as log:
-        log.write(f"# {_now()} {job.kind} {job.config or ''}\n# cmd: {redact(' '.join(cmd))}\n")
-        log.flush()
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=cwd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=False,
+    heartbeat = _Heartbeat(root, job.id)
+    heartbeat.start()
+    _heartbeat(root, RUNNING, job.id)
+    interrupted = False
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            log.write(
+                f"# {_now()} {job.kind} {job.config or ''}\n# cmd: {redact(' '.join(cmd))}\n"
             )
-            job.returncode = proc.returncode
-        except OSError as exc:  # missing interpreter, permissions
-            log.write(f"error: {exc}\n")
-            job.returncode = 127
-            job.error = str(exc)
+            log.flush()
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=cwd,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+            except OSError as exc:  # missing interpreter, permissions
+                log.write(f"error: {exc}\n")
+                job.returncode = 127
+                job.error = str(exc)
+            else:
+                job.pid = proc.pid
+                heartbeat.pid = proc.pid
+                # Persist the child pid now that it exists; the file must not say "pending".
+                _write_json(running, job.to_dict())
+                job.returncode, interrupted = _wait_for_child(proc, stop)
+                if interrupted:
+                    job.error = "interrupted (worker stopped); the child was terminated"
+    finally:
+        heartbeat.stop()
     job.duration_s = round(time.monotonic() - started, 1)
     job.finished = _now()
     job.log = str(log_path)
-    job.status = DONE if job.returncode == 0 else FAILED
-    target = root / "done" / job_file.name
-    target.write_text(json.dumps(job.to_dict(), indent=2), encoding="utf-8")
+    job.status = DONE if job.returncode == 0 and not interrupted else FAILED
+    _write_json(root / "done" / job_file.name, job.to_dict())
     running.unlink(missing_ok=True)
     return job
+
+
+def _recover_running(root: Path) -> int:
+    """Fail jobs left in running/ by a previous worker process; never requeue them."""
+    recovered = 0
+    for path in sorted((root / "running").glob("*.json")):
+        ident, kind = _job_details(path)
+        job = _record_failure(root, path, ident, kind, INTERRUPTED_ERROR)
+        recovered += 1
+        print(f"worker: {job.id} was left running; marked failed", flush=True)
+    return recovered
 
 
 def gpu_note() -> str:
@@ -209,12 +347,12 @@ def gpu_note() -> str:
     return "GPU: " + " | ".join(gpus)
 
 
-def _install_stop_handler() -> Any:
+def _install_stop_handler() -> threading.Event:
     """Turn SIGTERM/SIGINT into a clean loop exit so a job is not left 'running'."""
-    stop = {"flag": False}
+    stop = threading.Event()
 
     def handler(_signum: int, _frame: Any) -> None:
-        stop["flag"] = True
+        stop.set()
 
     _sig.signal(_sig.SIGTERM, handler)
     _sig.signal(_sig.SIGINT, handler)
@@ -232,18 +370,35 @@ def serve(
     """Poll the inbox forever (or until `once`), running jobs one at a time."""
     root = worker_dir(directory)
     stop = _install_stop_handler()
+    recovered = _recover_running(root)
+    if recovered:
+        print(
+            f"worker: marked {recovered} job(s) left running by a previous process as failed",
+            flush=True,
+        )
     _heartbeat(root, "idle")
     print(f"worker: serving {root} (interval {interval:g}s)", flush=True)
     print(f"worker: {gpu_note()}", flush=True)
-    while not stop["flag"]:
+    while not stop.is_set():
         job_file = _next_job(root)
         if job_file is None:
             if once:
                 break
             _heartbeat(root, "idle")
-            time.sleep(interval)
+            if stop.wait(interval):
+                break
             continue
-        job = run_job(root, job_file, argv0=argv0, cwd=cwd)
+        try:
+            job = run_job(root, job_file, argv0=argv0, cwd=cwd, stop=stop)
+        except (MsftError, TypeError, KeyError) as exc:
+            # A corrupt job file must not crash-loop the worker: record it and move on.
+            ident, kind = _job_details(job_file)
+            job = _record_failure(root, job_file, ident, kind, f"{type(exc).__name__}: {exc}")
+            _heartbeat(root, "idle", job.id)
+            print(f"worker: {job.id} -> failed: {job.error}", flush=True)
+            if once:
+                break
+            continue
         state = "idle" if job.status == DONE else job.status
         _heartbeat(root, state, job.id)
         print(
@@ -305,6 +460,8 @@ def status(directory: str | Path) -> dict[str, Any]:
 def tail_log(directory: str | Path, job_id: str | None = None, lines: int = 40) -> str:
     """Return the tail of a job log (latest job when `job_id` is omitted)."""
     root = Path(directory).expanduser()
+    if job_id is not None:
+        _validate_id(job_id)
     logs = sorted((root / "logs").glob("*.log"), key=lambda p: p.stat().st_mtime)
     if not logs:
         return ""
