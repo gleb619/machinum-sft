@@ -52,6 +52,30 @@ Names stay stable, agreement is right, «портовые документы» r
 decoding artefacts: «Корمאك» (an Arabic letter inside a Cyrillic name — the exact kind of token
 the Q4 quantiser's tail can emit) and «льявной насос» (not a word).
 
+## The glossary, and what filling it did
+
+`chapters/glossary.json` came out of `runner:glossary` with **103 terms and `ru: null` on every
+one** — the pipeline's own comment says the Russian forms are a human step. They are also the
+whole point: `tagWithGlossary` can only pin a name if it knows the target form.
+
+`fill-glossary-ru.ts` fills them (character / place / item, temperature 0, no reasoning), 97 terms
+in about 90 s. Re-running chapter 1 afterwards:
+
+| | before | after |
+| --- | --- | --- |
+| spellings of Fiona Doyle | «Файона Доул», «Фиона Доули», «Дойл» | **«Файона Доул» ×8** |
+| spellings of Nadia | «Надя», «Надия» | **«Надя» ×7** |
+| spellings of Cormac | «Кормак Доули», «Кормак Доул» | **«Кормак» ×5, «Доул» ×3** |
+| `<terms>` metadata leaking into prose | 5 of 33 lines | **0** |
+| wall | 28 s | 30 s |
+
+Two model-level defects survive, and they are what a bigger model buys: «химический дыхание»
+(agreement) and «в багажаре» (a non-word for "trunk") — the 27B says «в багаже», correctly.
+
+The leaked `<terms>` block was a second, independent bug: `translateLines` never called the
+existing `cleanTranslation`, and when the model omits the closing tag — which it did on five
+lines — the pair-based regex matched nothing. Both fixed in `machinum-pipeline` `687411b`.
+
 ## What this means
 
 1. **The protocol is learned, the language is not.** Line parity 33/33 and no reasoning chatter:
