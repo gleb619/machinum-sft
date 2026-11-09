@@ -212,11 +212,10 @@ def _require_config(cfg: RunConfig | None) -> RunConfig:
 
 
 def _remote_host() -> str:
-    """Read the ssh target from the environment; never hardcode a host."""
-    host = os.environ.get("MSFT_REMOTE_HOST", "").strip()
-    if not host:
-        raise MsftError("MSFT_REMOTE_HOST is not set; export it or add it to your .env file")
-    return host
+    """Read the ssh target from the environment or the git-ignored worker config."""
+    from msft.remote import remote_host
+
+    return remote_host()
 
 
 # --- handlers -------------------------------------------------------------

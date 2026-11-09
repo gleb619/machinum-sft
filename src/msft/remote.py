@@ -8,6 +8,7 @@ leak the box. A missing `ssh`/`rsync` binary is reported, never raised.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -179,6 +180,33 @@ def remote_repo_dir() -> str:
     )
 
 
+def remote_host() -> str:
+    """The ssh target: `$MSFT_REMOTE_HOST`, else `host` from the worker config.
+
+    One source of truth. `remote run` used to demand the environment variable while every other
+    command read the git-ignored worker config, so the same box was reachable from one command and
+    invisible to the next.
+    """
+    env = os.environ.get("MSFT_REMOTE_HOST", "").strip()
+    if env:
+        return env
+    for candidate in WORKER_CONFIG_CANDIDATES:
+        path = Path(candidate)
+        if not path.is_file():
+            continue
+        try:
+            import yaml
+
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:  # pragma: no cover - malformed local file
+            raise MsftError(f"cannot read {path}: {exc}") from exc
+        if isinstance(data, dict) and str(data.get("host") or "").strip():
+            return str(data["host"]).strip()
+    raise MsftError(
+        "no remote host: set host in configs/worker.local.yaml or export MSFT_REMOTE_HOST"
+    )
+
+
 def remote_config(cfg: RunConfig) -> str:
     """Config path on the remote host: `$MSFT_REMOTE_CONFIG`, else `configs/<name>.yaml`."""
     return os.environ.get("MSFT_REMOTE_CONFIG") or f"configs/{cfg.name}.yaml"
@@ -204,13 +232,15 @@ def container_command(
     """`docker exec [it] msft-worker python -m msft <kind> --config … --execute`, quoted.
 
     The builder stays wrapper-free: `run_remote` applies any `timeout` around the result.
-    `tty` is for a launch under tmux, where the pty forwards a `send-keys C-c` to the
-    training process; the foreground stream must not ask docker for a terminal.
+    `tty` only controls `-i`, which keeps docker attached to a stdin we feed from /dev/null.
+    A terminal (`-t`) is never requested: a detached tmux pane has no foreground process group,
+    so the first read from its pty stops docker dead with SIGTTIN (state `T`), and `-t` refuses a
+    redirected stdin outright ("cannot attach stdin to a TTY-enabled container").
     """
     action = "data build" if kind == "data" else kind
     parts = ["docker", "exec"]
     if tty:
-        parts.append("-it")
+        parts.append("-i")
     parts += [CONTAINER, "python", "-m", "msft", *action.split()]
     if config_rel:
         parts += ["--config", config_rel]
@@ -669,17 +699,37 @@ def _running_jobs(host: str, repo: str) -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def _tmux_launch_command(session: str, repo: str, record: dict[str, Any]) -> str:
-    """One shell command that checks tmux, records the session and starts it detached."""
-    log, rc, meta, _marker = _tmux_paths(session)
-    command = str(record["command"])
-    script = (
-        f"set -o pipefail; {{ {command} ; }} 2>&1 | tee -a {shlex.quote(log)} ; "
-        f"rc=${{PIPESTATUS[0]}} ; echo $rc > {shlex.quote(rc)}.tmp && "
-        f"mv {shlex.quote(rc)}.tmp {shlex.quote(rc)} ; "
-        f'printf "\\n[msft-rc] %s\\n" $rc >> {shlex.quote(log)}'
+def _tmux_script(session: str, command: str, timeout_s: int | None) -> str:
+    """The bash script a session runs, written to a file so it is quoted exactly once.
+
+    Building this inline means quoting a command that already contains quotes, and the second
+    round turns `exec` into literal text. A file has no such problem: the single quotes below are
+    just characters in it.
+    """
+    log, rc, _meta, _marker = _tmux_paths(session)
+    pidfile = f"{TMUX_STATE_DIR}/{session}.pid"
+    inner = command.split(f" {CONTAINER} ", 1)[-1]  # `python -m msft <kind> …`
+    pid_prefix = f"echo $$ > {pidfile}; exec "
+    container = f"docker exec -i {CONTAINER} sh -c '{pid_prefix}{inner}'"
+    if timeout_s is not None:
+        container = f"timeout --signal=TERM --kill-after=30 {timeout_s} {container}"
+    return (
+        "#!/bin/bash\n"
+        "set -o pipefail\n"
+        f"{container} < /dev/null 2>&1 | tee -a {log}\n"
+        "rc=${PIPESTATUS[0]}\n"
+        f'echo "$rc" > {rc}.tmp && mv {rc}.tmp {rc}\n'
+        f'printf \'\\n[msft-rc] %s\\n\' "$rc" >> {log}\n'
     )
-    session_cmd = f"bash -c {shlex.quote(script)}"
+
+
+def _tmux_launch_command(session: str, repo: str, record: dict[str, Any]) -> str:
+    """One shell command: check tmux, record the session, upload its script, start it detached."""
+    _log, _rc, meta, _marker = _tmux_paths(session)
+    command = str(record["command"])
+    script = _tmux_script(session, command, record.get("timeout_s"))
+    encoded = base64.b64encode(script.encode()).decode()
+    script_path = f"{TMUX_STATE_DIR}/{session}.sh"
     payload = shlex.quote(json.dumps(record, ensure_ascii=False, sort_keys=True))
     return (
         f"command -v tmux >/dev/null || {{ echo '{TMUX_MISSING}' >&2; exit 127; }}; "
@@ -687,9 +737,11 @@ def _tmux_launch_command(session: str, repo: str, record: dict[str, Any]) -> str
         f"if tmux has-session -t ={shlex.quote(session)} 2>/dev/null; then "
         f"echo 'MSFT_ERR=session-exists' >&2; exit 4; fi; "
         f"mkdir -p {shlex.quote(TMUX_STATE_DIR)}; "
-        f"printf '%s\\n' {payload} > {shlex.quote(meta)}; "
+        f"printf '%s\n' {payload} > {shlex.quote(meta)}; "
+        f"printf '%s' {shlex.quote(encoded)} | base64 -d > {shlex.quote(script_path)}; "
+        f"chmod +x {shlex.quote(script_path)}; "
         f"tmux new-session -d -s {shlex.quote(session)} -c {remote_path(repo)} "
-        f"{shlex.quote(session_cmd)}"
+        f"{shlex.quote('bash ' + script_path)}"
     )
 
 
@@ -1015,12 +1067,17 @@ def stop_tmux(
         raise MsftError(f"invalid --grace {grace}: use 0 or more seconds")
     repo = remote_repo_dir()
     _log, _rc, _meta, marker = _tmux_paths(session)
+    pidfile = f"{TMUX_STATE_DIR}/{session}.pid"
+    _stop_inner = f"p=$(cat {pidfile} 2>/dev/null); [ -n \"$p\" ] && kill -TERM \"$p\""
     target = shlex.quote(session)
     command = (
         f"cd {remote_path(repo)} || exit 1; "
         f"if ! tmux has-session -t ={target} 2>/dev/null; then "
         f"echo '{TMUX_NO_SESSION}' >&2; exit 3; fi; "
-        f"tmux send-keys -t ={target} C-c; "
+        # No tty in the pane, so C-c has nothing to forward: read the pid the job wrote and
+        # signal that one process, then let the session finish on its own.
+        f"docker exec {CONTAINER} bash -lc "
+        f"{shlex.quote(_stop_inner)} 2>/dev/null; "
         f"i=0; while tmux has-session -t ={target} 2>/dev/null; do "
         f'if [ "$i" -ge {int(grace)} ]; then '
         f"tmux kill-session -t ={target} 2>/dev/null; "

@@ -634,15 +634,26 @@ def test_launch_tmux_plan_builds_a_parseable_command(
     command = result["argv"][-1]
 
     assert "command -v tmux" in command
-    assert "docker exec -it msft-worker python -m msft train" in command
+    # `-t` is impossible here: a detached tmux pane has no foreground process group, so the
+    # first read from its pty suspends docker with SIGTTIN. `-i` on a redirected stdin works.
+    # The session runs a script file, so the job command is not quoted into the launch line.
+    assert f"base64 -d > .worker/tmux/{SESSION}.sh" in command
+    assert f"tmux new-session -d -s {SESSION}" in command
+    assert "-it " not in command
     assert f"has-session -t ={SESSION}" in command
-    assert f"tee -a .worker/tmux/{SESSION}.log" in command
+    assert f"tee -a .worker/tmux/{SESSION}.log" in remote._tmux_script(
+        SESSION, "docker exec -i msft-worker python -m msft train", None
+    )
     assert "timeout --signal" not in command
     assert shlex.split(shlex.join(result["argv"])) == result["argv"]
-    session_cmd = next(tok for tok in shlex.split(command) if tok.startswith("bash -c "))
-    assert shlex.split(session_cmd)[:2] == ["bash", "-c"]
-    assert "docker exec -it" in shlex.split(session_cmd)[2]
     assert subprocess.run(["bash", "-n", "-c", command], check=False).returncode == 0
+
+    # The written script is where the container command lives, and it must parse as bash.
+    script = remote._tmux_script(SESSION, "docker exec -i msft-worker python -m msft train", None)
+    assert "docker exec -i msft-worker sh -c 'echo $$ > " in script
+    assert "exec python -m msft train" in script
+    assert "< /dev/null" in script
+    assert subprocess.run(["bash", "-n", "-c", script], check=False).returncode == 0
 
     assert result["state"] == "plan"
     assert result["session"] == SESSION
@@ -658,15 +669,13 @@ def test_launch_tmux_timeout_prefix_only_with_timeout(
 ) -> None:
     monkeypatch.setenv("MSFT_REMOTE_DIR", "~/proj")
     without = remote.launch_tmux(RunConfig(name="smoke"), HOST, session=SESSION)
-    with_timeout = remote.launch_tmux(
-        RunConfig(name="smoke"), HOST, session=SESSION, timeout_s=900
-    )
+    remote.launch_tmux(RunConfig(name="smoke"), HOST, session=SESSION, timeout_s=900)
 
+    plain = remote._tmux_script(SESSION, "docker exec -i msft-worker python -m msft train", None)
+    timed = remote._tmux_script(SESSION, "docker exec -i msft-worker python -m msft train", 900)
+    assert "timeout --signal" not in plain
+    assert "timeout --signal=TERM --kill-after=30 900 docker exec -i msft-worker" in timed
     assert "timeout --signal" not in without["argv"][-1]
-    assert (
-        "timeout --signal=TERM --kill-after=30 900 docker exec -it msft-worker"
-        in with_timeout["argv"][-1]
-    )
 
 
 def test_launch_tmux_missing_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -825,8 +834,11 @@ def test_stop_tmux_sends_ctrl_c_then_reports_graceful(
 
     result = remote.stop_tmux(HOST, SESSION, grace=5)
 
+    # No tty in a detached pane, so C-c has nothing to forward: the stop path signals the pid
+    # the job itself wrote inside the container.
     command = fake.calls[0][0][-1]
-    assert f"send-keys -t ={SESSION} C-c" in command
+    assert f"cat .worker/tmux/{SESSION}.pid" in command
+    assert "kill -TERM" in command
     assert f"kill-session -t ={SESSION}" in command
     assert f"has-session -t ={SESSION}" in command
     assert result["state"] == "graceful"
