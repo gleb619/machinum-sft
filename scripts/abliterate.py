@@ -199,7 +199,9 @@ def ablate(model: Any, dirs: Any) -> int:
     import torch
 
     changed = 0
-    layers = model.model.language_model.layers
+    # The loader unwraps the multimodal wrapper, so `model.model` may be the text model itself.
+    container = getattr(model.model, "language_model", model.model)
+    layers = container.layers
     for index, layer in enumerate(layers):
         if index >= dirs.shape[0]:
             break
