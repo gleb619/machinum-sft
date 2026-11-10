@@ -59,7 +59,7 @@ Both keep `completion_only_loss: true`, bf16 LoRA, the seven projections and `lm
 choices `docs/memory.md` defends. The winner is tagged `machinum:4b-v2`; the loser is kept as a
 tag too, because a comparison nobody can re-run is not a comparison.
 
-## How it will be judged
+## How it was judged
 
 `msft arena` on `docs/arena-cases.example.jsonl`, same endpoint, same judge, `--seed 7`:
 
@@ -68,6 +68,31 @@ msft arena --models machinum:4b,machinum:4b-v2-data,machinum:4b-v2-tuned \
            --cases docs/arena-cases.example.jsonl --judge <third-model> --out out/arena/v2
 ```
 
-Success is `schema_validity` 1.000 for the new arms — the two multi-line cases answered with the
-same number of lines — and chrF no worse than 63.1. A higher chrF that keeps collapsing lines is
-not a win.
+Success was defined before the run as `schema_validity` 1.000 for the new arms — the two multi-line
+cases answered with the same number of lines — and chrF no worse than 63.1.
+
+## What actually happened
+
+Arena, six cases, `gpt-oss:20b` judge, default prompt: the new arms scored `schema_validity`
+0.667 (`v2-data`) and 0.833 (`v2-tuned`) — the multi-line cases still collapsed, so by the rule
+above this was **not** a win. Two of the three cases that did change showed the capability was
+there: `v2-tuned` kept the three-line dialogue, `v2-data` did not.
+
+The follow-up experiment found the wire: the corpus builder's system prompt is not the prompt the
+arena sends. Re-running the same models with the *training* prompt:
+
+| model | schema | chrF | BLEU |
+| --- | --- | --- | --- |
+| `machinum:4b-v2-data` | **1.000** | 62.9 | **45.6** |
+| `machinum:4b` | **1.000** | 61.9 | 42.5 |
+| `machinum:4b-v2-tuned` | **1.000** | 60.5 | 43.2 |
+
+So the failure was never only in the weights: a model keeps the lines it was taught to keep when
+the instruction matches, and collapses them when the instruction changes. The corpus also earned
+its keep — `v2-data` is +3.1 BLEU over `machinum:4b` on the same prompt, while the tuned arm
+(r=16/alpha=32, lr 1e-4) bought nothing. Conclusion: **corpus 1, hyperparameters 0**, and the next
+run must render the product's own prompt (`packages/tools/prompts/translate.system.md`) into the
+training data instead of this repository's short one.
+
+`docs/model-tags.md` records the four tags this produced, their digests and the abliterated twin.
+

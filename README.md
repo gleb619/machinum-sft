@@ -58,6 +58,7 @@ hand JSONL to `msft data build`.
 | `docs/model-candidates.md` | the models the internet recommends, checked against the registry |
 | `docs/material-pipeline.md` | the daily research loop: what it collects, where the notes go, why the raw material is never committed |
 | `docs/arena.md` | `msft arena`: the same prompts through several models, scored by independent frameworks, with the honesty rules |
+| `docs/model-tags.md` | every `machinum:*` tag: corpus, hyperparameters, digests, and which one to run |
 
 ## Remote worker
 
