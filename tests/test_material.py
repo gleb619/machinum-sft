@@ -470,6 +470,46 @@ def test_run_treats_zero_results_as_done_not_an_error(
     assert rows["hf"]["error"] is None
 
 
+def test_run_retries_an_error_candidate_until_the_budget_runs_out(
+    seeded: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient failure must not delete a frontier node for ever.
+
+    The live case: the first cron fire failed on a site that was mid-deploy. Without a retry
+    budget the `error` row is permanent, so the discovery path that produced it dies with one
+    bad afternoon.
+    """
+    install(
+        monkeypatch,
+        {
+            ("search", "hf", "lora"): (2, "", "HTTP 502 from the site"),
+        },
+    )
+    first = material.run(seeded, day=DAY, sites=["hf"])
+    assert first["queries"] == 1
+    assert first["errors"] == 1
+
+    second = material.run(seeded, day=DAY, sites=["hf"])
+    assert second["queries"] == 1, "an errored candidate is retried on the next run"
+    assert second["errors"] == 1
+
+    third = material.run(seeded, day=DAY, sites=["hf"])
+    assert third["queries"] == 0, "retry_errors=2 is the budget, not an infinite loop"
+    assert third["ok"] is True
+
+    with material.State(seeded.db_path) as state:
+        rows = [dict(r) for r in state.conn.execute(
+            "SELECT status, attempts FROM candidates WHERE site = 'hf'"
+        )]
+        assert all(row["status"] == "error" and row["attempts"] == 2 for row in rows)
+        # The hf node is no longer eligible; the habr/github seeds were never touched
+        # (the run was scoped with sites=["hf"]), so they still count as frontier.
+        assert state.frontier() == 2
+        assert state.conn.execute(
+            "SELECT COUNT(*) AS n FROM candidates WHERE site = 'hf' AND status = 'new'"
+        ).fetchone()["n"] == 0
+
+
 def test_run_skips_a_url_two_candidates_both_return(
     seeded: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
 ) -> None:

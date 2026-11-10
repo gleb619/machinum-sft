@@ -33,6 +33,9 @@ limits:
   children_per_item: 3
   fetch_timeout_s: 120
   ask_timeout_s: 240
+  # A frontier node that failed (timeout, 502, a site mid-deploy) is retried on the next
+  # run until it has been attempted this many times, then it stays `error` for good.
+  retry_errors: 2
 
 scoring:
   keep_min: 0.35        # below: status=scored_out

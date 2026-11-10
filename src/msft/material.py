@@ -207,6 +207,7 @@ class LimitsCfg:
     children_per_item: int = 3
     fetch_timeout_s: int = 120
     ask_timeout_s: int = 240
+    retry_errors: int = 2
 
 
 @dataclass
@@ -397,6 +398,8 @@ def _limits_cfg(raw: dict[str, Any]) -> LimitsCfg:
                                 "fetch_timeout_s"),
         ask_timeout_s=_as_int(_require(raw, "ask_timeout_s", "limits"), "limits",
                               "ask_timeout_s"),
+        # Optional: a site that timed out once should not lose its frontier node for ever.
+        retry_errors=_as_int(raw.get("retry_errors", 2), "limits", "retry_errors"),
     )
 
 
@@ -494,8 +497,9 @@ def load_material_config(path: str | Path | None = None) -> MaterialCfg:
 class State:
     """The SQLite state machine. Rows are the truth; files are payloads."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, retry_errors: int = 2) -> None:
         self.path = Path(path)
+        self.retry_errors = int(retry_errors)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.path))
         self.conn.row_factory = sqlite3.Row
@@ -533,10 +537,21 @@ class State:
         self.conn.commit()
         return cursor.rowcount > 0
 
-    def candidates(self, limit: int = 10, sites: list[str] | None = None) -> list[dict[str, Any]]:
-        """New frontier nodes, best first; ties by insertion order."""
-        sql = "SELECT * FROM candidates WHERE status = 'new'"
-        params: list[Any] = []
+    def candidates(
+        self, limit: int = 10, sites: list[str] | None = None, retry_errors: int = 2
+    ) -> list[dict[str, Any]]:
+        """Frontier nodes to execute, best first; ties by insertion order.
+
+        `status='error'` rows are eligible again until `attempts` reaches
+        `retry_errors`: a site that answered 502 at 13:00 must not delete a
+        discovery path for ever, and a *false* error (the empty-result case) must
+        be able to heal itself on the next run.
+        """
+        sql = (
+            "SELECT * FROM candidates WHERE "
+            "(status = 'new' OR (status = 'error' AND attempts < ?))"
+        )
+        params: list[Any] = [int(retry_errors)]
         if sites:
             sql += f" AND site IN ({', '.join('?' for _ in sites)})"
             params.extend(sites)
@@ -563,7 +578,13 @@ class State:
         self.conn.commit()
 
     def frontier(self) -> int:
-        return self.candidates_count("new")
+        """Nodes the next run would execute: fresh ones plus retryable errors."""
+        return self.candidates_count("new") + int(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM candidates WHERE status = 'error' AND attempts < ?",
+                (self.retry_errors,),
+            ).fetchone()["n"]
+        )
 
     # --- items -----------------------------------------------------------
     def item(self, url: str) -> dict[str, Any] | None:
@@ -1094,7 +1115,7 @@ def seed(
             "existing": 0,
             "frontier": len(cfg.seeds),
         }
-    with State(cfg.db_path) as state:
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
         added: list[str] = []
         existing = 0
         for item in cfg.seeds:
@@ -1272,8 +1293,10 @@ def run(
             "counters": counters,
         }
 
-    with State(cfg.db_path) as state:
-        pending = state.candidates(limit=query_budget, sites=sites)
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
+        pending = state.candidates(
+            limit=query_budget, sites=sites, retry_errors=cfg.limits.retry_errors
+        )
         if dry_run:
             plan = [
                 {"candidate": f"{cand['kind']}/{cand['site']}", "value": cand["value"],
@@ -1594,7 +1617,7 @@ def distill(
     }
     if dry_run and not cfg.db_path.is_file():
         return empty
-    with State(cfg.db_path) as state:
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
         items = state.items_for_date(day, statuses=("fetched", "packed"))
         if not items:
             return empty
@@ -1756,7 +1779,7 @@ def _strip_private(payload: dict[str, Any]) -> dict[str, Any]:
 
 def write_index(cfg: MaterialCfg) -> str:
     """Rewrite `INDEX.md` from the DB: date, title, site, score, experiment flag."""
-    with State(cfg.db_path) as state:
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
         rows = state.memorized()
     lines = [
         "# Material index",
@@ -1806,7 +1829,7 @@ def memorize(
             "url": f"{memory_url()}/admin/write-page",
             "payloads": [],
         }
-    with State(cfg.db_path) as state:
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
         items = state.items_for_date(day, statuses=("distilled",))
         payloads: list[dict[str, Any]] = []
         skipped = 0
@@ -1925,7 +1948,7 @@ def report(cfg: MaterialCfg, *, day: str | None = None) -> dict[str, Any]:
     }
     if not cfg.db_path.is_file():
         return empty
-    with State(cfg.db_path) as state:
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
         runs = state.runs_for_date(day)
         items = state.items_for_date(day)
         frontier = state.frontier()
@@ -2008,7 +2031,7 @@ def status(cfg: MaterialCfg) -> dict[str, Any]:
     }
     if not exists:
         return payload
-    with State(cfg.db_path) as state:
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
         by_status = state.conn.execute(
             "SELECT status, COUNT(*) AS n FROM candidates GROUP BY status ORDER BY status"
         )
