@@ -146,7 +146,7 @@ def refusal_count(replies: list[str]) -> int:
     return total
 
 
-def _generate(model: Any, tokenizer: Any, prompts: list[str], device: str) -> list[str]:
+def _generate(model: Any, tokenizer: Any, prompts: list[str]) -> list[str]:
     """Greedy, 48-token replies — only their opening words are inspected."""
     import torch
 
@@ -154,7 +154,7 @@ def _generate(model: Any, tokenizer: Any, prompts: list[str], device: str) -> li
     for prompt in prompts:
         messages = [{"role": "user", "content": prompt}]
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(text, return_tensors="pt").to(device)
+        inputs = tokenizer(text, return_tensors="pt").to(model.device)
         with torch.no_grad():
             out = model.generate(**inputs, max_new_tokens=48, do_sample=False)
         new_tokens = out[0][inputs["input_ids"].shape[1] :]
@@ -162,7 +162,7 @@ def _generate(model: Any, tokenizer: Any, prompts: list[str], device: str) -> li
     return replies
 
 
-def _capture(model: Any, tokenizer: Any, prompts: list[str], device: str, layers: int) -> Any:
+def _capture(model: Any, tokenizer: Any, prompts: list[str], layers: int) -> Any:
     """Mean last-token residual at the output of every layer, one pass per prompt."""
     import torch
 
@@ -170,7 +170,7 @@ def _capture(model: Any, tokenizer: Any, prompts: list[str], device: str, layers
     for prompt in prompts:
         messages = [{"role": "user", "content": prompt}]
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(text, return_tensors="pt").to(device)
+        inputs = tokenizer(text, return_tensors="pt").to(model.device)
         with torch.no_grad():
             out = model(**inputs, output_hidden_states=True)
         # hidden_states[i + 1] is the residual after layer i; the last token carries the state
@@ -198,7 +198,7 @@ def ablate(model: Any, dirs: Any) -> int:
     for index, layer in enumerate(layers):
         if index >= dirs.shape[0]:
             break
-        direction = dirs[index].to(next(model.parameters()).device)
+        direction = dirs[index]
         for attribute in ("linear_attn.out_proj", "self_attn.o_proj", "mlp.down_proj"):
             module = layer
             for part in attribute.split("."):
@@ -208,7 +208,8 @@ def ablate(model: Any, dirs: Any) -> int:
             if module is None:
                 continue
             with torch.no_grad():
-                module.weight.copy_(project_out(module.weight.float(), direction))
+                local = direction.to(module.weight.device)
+                module.weight.copy_(project_out(module.weight.float(), local))
             changed += 1
     return changed
 
@@ -217,7 +218,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path, help="merged HF checkpoint")
     parser.add_argument("--out", required=True, type=Path, help="where the abliterated model goes")
-    parser.add_argument("--device", default="cuda", help="cuda or cuda:1 (default: cuda)")
+    parser.add_argument(
+        "--device", default="auto", help="device_map: auto (both cards), cuda:0, cuda:1"
+    )
     parser.add_argument(
         "--skip-verify", action="store_true", help="skip the 2×8 refusal generations"
     )
@@ -249,23 +252,24 @@ def main() -> int:
         if (args.model / "processor_config.json").is_file()
         else AutoTokenizer.from_pretrained(args.model)
     )
+    device_map: Any = args.device if args.device == "auto" else {"": args.device}
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.bfloat16, device_map={"": args.device}
+        args.model, dtype=torch.bfloat16, device_map=device_map
     )
     model.eval()
     layers = int(model.config.text_config.num_hidden_layers)
 
-    before = refusal_count(_generate(model, tokenizer, list(HARMFUL[:8]), args.device))
+    before = refusal_count(_generate(model, tokenizer, list(HARMFUL[:8])))
     _log(f"refusals before: {before}/8")
 
-    mean_harmful = _capture(model, tokenizer, list(HARMFUL), args.device, layers)
-    mean_harmless = _capture(model, tokenizer, list(HARMLESS), args.device, layers)
+    mean_harmful = _capture(model, tokenizer, list(HARMFUL), layers)
+    mean_harmless = _capture(model, tokenizer, list(HARMLESS), layers)
     dirs = directions(mean_harmful, mean_harmless)
     changed = ablate(model, dirs)
     _log(f"projected the direction out of {changed} matrices across {layers} layers")
 
     if not args.skip_verify:
-        after = refusal_count(_generate(model, tokenizer, list(HARMFUL[:8]), args.device))
+        after = refusal_count(_generate(model, tokenizer, list(HARMFUL[:8])))
         _log(f"refusals after: {after}/8")
         if after > before:
             _log("refusals went up: this run made the model worse and should not be shipped")
