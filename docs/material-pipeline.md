@@ -1,0 +1,433 @@
+# The material pipeline: a daily loop that reads the LoRA/SFT literature for us
+
+`msft material` is a small state machine that visits the sites the stack already knows how to
+drive — Habr, GitHub, Hugging Face, Google AI Mode, DeepSeek, Qwen, and free-form `ask` notes —
+scores what comes back, packs the survivors into one task file, hands that file to a coding
+agent, and posts the resulting notes into the ai-memory wiki.
+
+It exists because the product moves. `machinum:4b` was trained with plain LoRA, a 49-pair
+dataset and a hand-written eval gate; every one of those choices is a decision the field
+revisits every few months — QLoRA vs LoRA on 16 GB cards, completion-only loss, which
+trainer survives a version bump, how to build a Russian literary corpus without poisoning it
+with machine translation. Human reading of that literature does not scale, and it is exactly
+the kind of reading an agent loop does well: fetch, score, summarise, skip the press releases.
+
+The rule that shapes everything below: **the raw material is bulky, private and disposable;
+the distilled note is small, cited and permanent.** Raw bodies stay on this disk and out of
+git; what survives a machine reinstall is one page per finding in the wiki, written by
+`memorize`.
+
+## The loop
+
+```
+seed ─▶ run ─▶ distill ─▶ memorize ─▶ report
+        │        │            │
+        │        │            └─ POST /admin/write-page → ai-memory wiki
+        │        └─ `at` agent reads pack/<date>.md, writes notes/<date>/*.md
+        └─ webbridge search/extract/ask → raw/<date>/*, items rows, scores
+```
+
+Each arrow is one CLI command, and each is safe to re-run: the same URL never becomes two
+items, the same page path never becomes two notes. There is no daemon and no scheduler
+inside the CLI — `scripts/material-daily.sh` plus one cron line is the scheduler.
+
+### State machine
+
+Candidates are the frontier — what to look for, not what was found. Items are pages.
+
+```
+  candidates: the frontier (what to look for)
+      seed / expansion -> INSERT, UNIQUE(kind, value, site)
+                              |
+                              v
+                        +-----------+
+                        |    new    |
+                        +-----------+
+                          |    |    |
+      the call ran ok ----+    |    +---- never called again
+                              |                    |
+                              v                    v
+                        +-----------+      +-------------+
+                        |   done    |      |   dropped   |
+                        +-----------+      +-------------+
+
+      the call failed --> +-----------+
+                           |   error   |   attempts+1, error = the stderr tail
+                           +-----------+
+```
+
+```
+  items: pages (one row per canonicalised URL)
+      search hit / ask answer
+              |
+              v
+        +---------+
+        |  seen   |   score computed from configs/material.yaml
+        +---------+
+          |     |
+          |     +-- negative keyword, radio LoRa without a domain term, or
+          |         score < keep_min -------------------------> [ scored_out ]
+          |
+          |     +-- content_sha256 already in items
+          |         (cross-post, second URL) -----------------> [ duplicate ]
+          |
+          |  score >= keep_min: fetch, normalise, write raw/<date>/
+          v
+        +---------+
+        | fetched |   raw/<date>/<site>-<slug>.json and .txt
+        +---------+
+              |
+              |  the distill run packs it into pack/<date>.md
+              v
+        +---------+   at exits non-zero or prints no summary
+        | packed  |---> stays packed, the next run retries
+        +---------+   the agent wrote notes/<date>/<slug>.md
+              |
+              v
+        +------------+  distilled_at set, non-"none" experiment -> experiments.md
+        | distilled  |
+        +------------+
+              |
+              |  POST /admin/write-page -> 200 or 201
+              v
+        +------------+  memorized_at set, INDEX.md rewritten
+        | memorized  |
+        +------------+
+
+  anything that cannot proceed: status = error, the error column keeps the reason
+```
+
+Nothing is inferred from files on disk. A note file without a `distilled` row is an orphan;
+a `packed` row without a pack entry is a bug. That is deliberate — `status` is the only
+truth, so a re-run after a crash resumes instead of guessing.
+
+## Subcommands
+
+| Command | What it does | Writes |
+| --- | --- | --- |
+| `seed` | inserts the configured queries into the frontier | `candidates` |
+| `run` | calls webbridge for the highest-priority candidates, scores, fetches, expands | `candidates`, `items`, `raw/` |
+| `distill` | packs `packed` items into one file, runs the `at` agent over it | `pack/`, `notes/`, `experiments.md` |
+| `memorize` | posts each `distilled` note to ai-memory | wiki, `INDEX.md` |
+| `report` | one line (or one JSON object) for a date | nothing |
+| `status` | counters for the whole state dir | nothing |
+
+Exit codes are the contract: `0` ok, `1` the run finished but some items failed, `2` a
+config or environment error (bad YAML, missing token, unwritable directory). Only `2` means
+"fix the operator, then re-run"; `1` means the loop worked and some sites did not.
+
+```bash
+msft material seed                                  # once, and again after editing configs/material.yaml
+msft material seed --dry-run                        # what would be inserted
+msft material run --limit 6                         # six queries, the daily default
+msft material run --limit 3 --site habr --site hf    # one narrow sweep
+msft material run --max-items 5 --no-expand         # cheap: no tag/author children
+msft material run --date 2026-11-09                 # backfill into last Monday's directory
+msft material distill                               # pack + agent
+msft material distill --agent ds-code --timeout-ms 900000
+msft material distill --dry-run                     # show the pack and the at command, never call at
+msft material memorize                              # everything distilled, any date
+msft material memorize --workspace default --project data
+msft material report                                # today
+msft material report --date 2026-11-09 --json       # one JSON object on stdout
+msft material status --json
+```
+
+`report` prints one line, and that line is what the cron delivers:
+
+```
+material 2026-11-10: 6 queries → 12 items, 8 kept (habr 5, github 2, hf 1), 3 duplicates,
+2 distilled, 2 memorized, 1 experiment · frontier 41 · raw 14 files · 92 s
+```
+
+The numbers above are the *format*, not a measurement from this machine. With `--json` the
+same facts arrive as `{date, queries, items, kept, duplicates, fetched, packed, distilled,
+memorized, experiments, frontier, errors, seconds}` — and then everything human-readable goes
+to stderr, so `report --json | jq` is safe in a pipeline.
+
+Environment overrides the CLI reads itself (the script only forwards the path ones):
+
+| Variable | Default |
+| --- | --- |
+| `MSFT_TUNNELSTACK` | `/home/boris/tunnelstack` — where `src/webbridge.py` lives |
+| `MSFT_MATERIAL_DIR` | `<repo>/docs/material` |
+| `MSFT_MATERIAL_CONFIG` | `<repo>/configs/material.yaml` |
+| `MSFT_MEMORY_URL` | `http://127.0.0.1:49374` |
+| `MSFT_MEMORY_TOKEN` | first `AI_MEMORY_AUTH_TOKEN=` line of `deploy/memory/.env` |
+| `MSFT_AT_BIN` | `~/.local/bin/at` |
+
+## The config file
+
+`configs/material.yaml` is committed, because the *policy* of what to read is a decision worth
+reviewing in a diff. Four blocks matter:
+
+| Block | Knob | What changing it buys you |
+| --- | --- | --- |
+| `product` | `keywords`, `negative`, `domain_terms` | the definition of relevance; every score is computed against these lists |
+| `limits` | `queries_per_run`, `items_per_run`, `items_per_site` | how much a single run may spend; the first thing to cut when a run is too slow |
+| `limits` | `max_frontier`, `children_per_item` | how fast the frontier may grow from expansion; the second thing to cut |
+| `scoring` | `keep_min`, `expand_min` | the two thresholds: below `keep_min` an item dies, below `expand_min` it is not used as a parent |
+| `scoring` | `recency_days`, `site_prior` | taste: how much a 2026 post beats a 2024 one, how much GitHub/HF beat Habr |
+| `expansion` | `per_site` | which child kinds a site may produce — `habr: [tag, author]`, `github: [repo]`, `hf: [model]` |
+| `distill` | `agent`, `timeout_ms`, `notes_dir` | which agent writes the notes and how long you are willing to wait |
+| `memory` | `workspace`, `project`, `path_prefix` | where the notes land in the wiki |
+
+`product.domain_terms` is the one list that is not about ranking. It is the
+disambiguation escape hatch described below; deleting an entry there makes every Habr post
+that happens to say "LoRa" (the 868 MHz radio) a candidate again.
+
+## Files, and why they are not in git
+
+```
+docs/material/
+  .state/material.db            SQLite: candidates, items, runs, kv — the only source of truth
+  .state/lock                   flock target; never committed, never read
+  raw/<date>/<site>-<slug>.json exact webbridge output, for re-parsing without the network
+  raw/<date>/<site>-<slug>.txt  normalize_text(body), what the agent actually reads
+  pack/<date>.md                the distill task file: brief, rules, schema, one section per item
+  notes/<date>/<slug>.md        written by the agent: frontmatter + five sections
+  INDEX.md                      table of memorized notes (date, title, site, score, experiment)
+  experiments.md                append-only list of concrete experiment proposals
+```
+
+`slug` is 60 characters of the URL path, `[a-z0-9-]`, plus 8 hex characters of a sha1 of the
+URL: stable across runs, unique across sites. `normalize_text` strips
+`<script|style|nav|aside|footer>` blocks and HTML tags, collapses three or more newlines to
+two, trims trailing spaces and caps the body at 40 000 characters, so a file on disk is at
+most ~40 KB and the same input always produces the same bytes.
+
+`.gitignore` carries one line for the whole tree:
+
+```
+docs/material/
+```
+
+Why the raw material stays out:
+
+- **It is other people's text.** A 40 000-character article body copied into this repo is a
+  licence question with a date on it, and git history is forever. The note that quotes three
+  numbers and links the source is not.
+- **It is bulky and regenerable.** A dozen items a day at tens of kilobytes each, plus the
+  API JSON, is a repository that grows every night for a diff nobody reads. The `.json` copy
+  exists so a parsing bug can be debugged offline, not so it can be versioned.
+- **It is not the deliverable.** The deliverable is knowledge in a store the next session
+  reads at start — the ai-memory wiki, under
+  `projects/machinum-sft/material/<date>-<slug>.md`. That wiki is markdown on disk, backed up
+  with `tar czf memory-$(date +%F).tgz -C deploy/memory data`, and queryable over MCP without
+  this repo being checked out at all. See `memory-stack.md`.
+
+Consequence worth knowing: `INDEX.md` and `experiments.md` live inside the ignored directory,
+so they are local conveniences, not history. The durable index is the wiki page list
+(`memory_recent`), and the durable experiment list is the `## Experiment` section of each
+page. If a future decision wants proposals in git, add
+`!docs/material/experiments.md` below the ignore line — deliberately not done here, because
+the tree is private by contract.
+
+Losing `docs/material/` costs the corpus, not the knowledge: the notes are in the wiki, and
+`seed` plus a run rebuilds a frontier from scratch.
+
+## The smart part
+
+Three mechanisms keep a keyword sweep from turning into a firehose of press releases, radio
+modules and duplicate translations.
+
+**1. Expansion — the frontier feeds itself.** A good item is a *lead*: it names its own tags,
+its author, its topics, its model card. When `score >= expand_min` and expansion is on, the
+run enqueues children with `parent=<url>`, at most `children_per_item` of them:
+
+| Site | Child | Guard |
+| --- | --- | --- |
+| Habr | `kind=tag` for each tag | tags shorter than 3 characters are skipped |
+| Habr | `kind=author` | only when `score >= expand_min + 0.15` — a good article by a named author is worth their back catalogue, a mediocre one is not |
+| GitHub | `kind=repo` from `topics`, searched as `topic:<t>` | needs the `extract` payload, not just the search hit |
+| HF | `kind=model` from the model card's tags | filtered to `lora, qlora, peft, sft, dpo, grpo, unsloth, trl, axolotl, dataset` |
+
+The frontier is capped at `limits.max_frontier` rows; when it is full the run counts and skips
+(`frontier_full` in the counters) rather than dropping what it already has. `--no-expand`
+turns the whole mechanism off for a cheap sweep.
+
+**2. Three layers of dedupe.** Each layer catches a different duplicate:
+
+1. `candidates UNIQUE(kind, value, site)` — the same *question* is asked once. Re-running
+   `seed` on an unchanged config inserts nothing.
+2. `items PRIMARY KEY(url)` after canonicalisation — lowercase host, `utm_*` parameters,
+   `#fragment` and the trailing `/` removed. The same *page* found by two queries is one row,
+   and `first_seen_at` is kept, not overwritten.
+3. `content_sha256(normalize_text(title + "\n" + summary_or_body))` — the same *content* under
+   two URLs. This is what catches a Habr translation of a vendor blog post, the same repo
+   surfaced by two searches, an arXiv abstract and its HF model card. The second URL becomes
+   `status='duplicate'` and is never fetched, which is also where the fetch budget is saved.
+
+**3. Radio LoRa is not a fine-tuning technique.** `(?i)\blora(wan)?\b` matches both the
+adapter family and the 868 MHz modulation, and a keyword sweep of Habr will find the latter:
+antennas, gateways, TTN. The rule is a veto, not a bonus — an item that mentions LoRa and
+nothing from `product.domain_terms` (`llm, language model, fine-tun, adapter, peft, qlora,
+neural, transformer, нейросет, модел, обучен, токениз, весов`) scores 0 and becomes
+`scored_out`. Both lists are data in `configs/material.yaml`, so a new false positive family
+(e.g. "LoRa mesh" flooding the tags) is a one-line config change plus a re-run — no code.
+
+The same veto shape handles the other recurring noise: `negative: [hiring, webinar, podcast,
+discount, black friday]` scores 0 outright, before any recency or star bonus can rescue it.
+
+## The daily run
+
+`scripts/material-daily.sh` is the cron entrypoint. It is a wrapper over four CLI calls, and
+it exists to add the four things cron needs: a lock, budgets, an ordering rule, and one line
+of output.
+
+```bash
+bash scripts/material-daily.sh               # collect → distill → memorize → report
+bash scripts/material-daily.sh --dry-run     # every step in plan mode, nothing written or posted
+bash scripts/material-daily.sh --limit 10    # more queries this run
+MATERIAL_SKIP_DISTILL=1 bash scripts/material-daily.sh   # collect only
+```
+
+What the script guarantees:
+
+- **One run at a time.** `flock -n` on `docs/material/.state/lock`. A second run — cron firing
+  while a hand-started run is still in the agent — prints `material: another run holds the
+  lock` and exits **0**, because a cron job that fails on contention retries and storms.
+  A dry run writes no lock file of its own, so it joins a lock only if one already exists.
+- **Ordering with a purpose.** `run` → `distill` → `memorize` → `report`. A failed `run` skips
+  `distill` (a pack built from a broken collect wastes an agent run) but still runs `memorize`
+  and `report`, because those walk every `distilled` item from earlier days and are
+  independent of today's network luck.
+- **Budgets.** Each step runs under `timeout`: `MATERIAL_TIMEOUT_COLLECT=1800`,
+  `MATERIAL_TIMEOUT_DISTILL=1200`, `MATERIAL_TIMEOUT_MEMORIZE=300`,
+  `MATERIAL_TIMEOUT_REPORT=60`. They sum to 3360 s, inside Hermes cron's 3600 s script
+  timeout, so a hung step is killed by the inner budget and the outer kill stays a backstop.
+  These are **budgets, not measurements** — the only honest number for a real run is the
+  `92 s`-style figure in the report line.
+- **One line on stdout.** The report. Everything else — progress, the failing step, the reason
+  — goes to stderr. That is a deliberate fit with Hermes cron: `--no-agent` jobs deliver
+  stdout verbatim on success and include *both* streams in the alert on a non-zero exit, so a
+  green day costs one short message and no model tokens, and a red day explains itself.
+
+### Wiring it
+
+Hermes cron jails `--script` to `~/.hermes/scripts/`, so the repo script is reached through a
+one-line wrapper that already exists:
+
+```bash
+# ~/.hermes/scripts/material-daily.sh
+exec bash /home/boris/WORKSPACE/machinum-sft/scripts/material-daily.sh "$@"
+```
+
+The job — 13:00 local, no LLM in the loop (`no_agent: true`), already created as
+`machinum-material-daily`:
+
+```bash
+hermes cron create '0 13 * * *' \
+  --name machinum-material-daily \
+  --workdir /home/boris/WORKSPACE/machinum-sft \
+  --script material-daily.sh \
+  --no-agent \
+  --deliver 'telegram:Boris Velichko (dm)'
+```
+
+`hermes cron list` should show it with `next_run_at` at the next 13:00. `--no-agent` matters
+twice: the run costs no model tokens, and stdout is delivered verbatim, so the report line is
+literally the message. On a non-zero exit Hermes sends an alert instead (with both streams),
+which is the red-path notification.
+
+Plain crontab equivalent, if the Hermes scheduler is not running (`hermes cron status`):
+
+```cron
+0 13 * * * cd /home/boris/WORKSPACE/machinum-sft && scripts/material-daily.sh 2>>$HOME/.local/state/material-daily.err.log
+```
+
+stdout still reaches cron mail; stderr appends to the log. Either way the flock makes a
+catch-up run after a laptop that was asleep at 13:00 safe to fire next to a manual run.
+
+First-time setup, once: `msft material seed` (the script does not seed — a daily run that
+silently creates a frontier hides a typo in `configs/material.yaml`), then
+`msft material run --limit 3 --dry-run` to see the plan without the network.
+
+### When a run is red
+
+| What you see | What it means | First command |
+| --- | --- | --- |
+| `another run holds the lock`, exit 0 | a run is in flight, or a killed run left a live process | `pgrep -af 'material'`; if nothing, `fuser docs/material/.state/lock` |
+| exit 2, `error: …` on stderr | config or environment: unreadable YAML, missing token, unwritable dir | `msft material status` then re-read the message; the CLI prints the offending path |
+| exit 1, `collect failed` | webbridge: site down, browser not attached, JSON garbage | `msft material run --limit 1 --site habr` and read the candidate's `error` column |
+| `distill: skipped (collect failed)` | correct behaviour, not a bug | nothing; tomorrow's run picks the `packed` items up |
+| `at` non-zero / no summary | agent crashed, timed out, or printed no JSON | read `docs/material/pack/<date>.md`, then run `at` by hand on that file |
+| items stuck `packed` for days | the agent never accepted the pack | `SELECT url, error FROM items WHERE status='packed'` |
+| `memorize` 4xx | ai-memory down, wrong workspace/project, stale token | `curl -s localhost:49374/healthz`, then `memory-stack.md` |
+| `memorize` 5xx | the wiki store refused the write; the note file is kept | re-run `memorize` after fixing the service — it is idempotent by path |
+| everything green, report says `0 items` | the sites answered and nothing scored | `items` rows with `scored_out` say why; usually `keep_min` or a stale frontier |
+
+Never "fix" a red run by deleting `docs/material/.state/material.db`. The DB is the record of
+what was already read; deleting it re-fetches everything and re-posts nothing (paths dedupe),
+so it is a slow way to look busy.
+
+## Inspecting state
+
+The state is one SQLite file, and the schema is the spec's — four tables, no views. This host
+has no `sqlite3` binary, so the shell is `python3 -m sqlite3` (Python ≥3.12); the SQL is
+identical if you do have the CLI:
+
+```bash
+DB=docs/material/.state/material.db
+python3 -m sqlite3 "$DB" "SELECT status, COUNT(*) FROM candidates GROUP BY status;"
+```
+
+```sql
+-- the frontier: what is queued, what is done, what failed
+SELECT status, COUNT(*) AS n FROM candidates GROUP BY status ORDER BY n DESC;
+
+SELECT priority, kind, site, value FROM candidates
+WHERE status = 'new' ORDER BY priority DESC, id LIMIT 20;
+
+SELECT site, kind, value, attempts, substr(error, 1, 120) AS why
+FROM candidates WHERE status = 'error' ORDER BY updated_at DESC LIMIT 10;
+
+-- the items: the funnel, per date and per site
+SELECT status, COUNT(*) AS n FROM items GROUP BY status ORDER BY n DESC;
+
+SELECT site, COUNT(*) AS n FROM items
+WHERE first_seen_at >= '2026-11-10' GROUP BY site ORDER BY n DESC;
+
+-- why the funnel narrowed
+SELECT url, site, score, title FROM items
+WHERE status = 'scored_out' ORDER BY score DESC LIMIT 20;
+
+SELECT url, site, content_sha FROM items WHERE status = 'duplicate';
+
+-- what the agent owes us
+SELECT url, site, score, fetched_at FROM items WHERE status = 'packed' ORDER BY score DESC;
+
+SELECT url, site, substr(error, 1, 120) AS why FROM items WHERE status = 'error';
+
+-- what reached the wiki, by day
+SELECT substr(memorized_at, 1, 10) AS day, COUNT(*) AS n FROM items
+WHERE memorized_at IS NOT NULL GROUP BY day ORDER BY day DESC LIMIT 7;
+
+-- the last runs, and one counter out of the stored JSON
+SELECT id, started_at, finished_at, counters FROM runs ORDER BY id DESC LIMIT 3;
+
+SELECT json_extract(counters, '$.items') AS items,
+       json_extract(counters, '$.kept')  AS kept
+FROM runs ORDER BY id DESC LIMIT 1;
+
+-- small key/value leftovers (last seed time, schema version)
+SELECT key, value FROM kv ORDER BY key;
+```
+
+`msft material status --json` prints the same counters without SQL, which is what a dashboard
+should use; the queries above are for the "why" that a counter cannot answer.
+
+## What this does not do
+
+- **It does not train anything.** A note's `## Experiment` section is a proposal with a cost
+  estimate, appended to `experiments.md`; running it is a human decision, and `AGENTS.md`
+  still governs the GPU.
+- **It does not read the sites itself.** It shells out to
+  `/home/boris/tunnelstack/src/webbridge.py` and takes the JSON. When a site changes its HTML,
+  the fix belongs in tunnelstack, not here — this repo only sees a candidate in `error`.
+- **It does not judge.** A score is a keyword count, a site prior, a recency bonus and a star
+  bonus. A post that is wrong but well-keyworded gets through; the agent's note is where
+  "this is marketing" gets written down, and a human reading `INDEX.md` is where it gets
+  acted on.
+- **It does not replace `memory.md`.** Gotchas that cost a run belong in that file, in git,
+  reviewed in a diff. The wiki is the journal; the docs are the record.

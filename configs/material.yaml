@@ -1,0 +1,55 @@
+# `msft material` — the daily research loop for the translation fine-tune.
+#
+# Read by `msft material seed|run|distill|memorize|report|status`; nothing else reads it.
+# The brief and the keyword list are the scoring inputs: a page that does not mention any of
+# them is not worth an agent's time, and a page about the *radio* standard LoRa is noise.
+product:
+  name: machinum-sft
+  brief: >
+    A small local model that translates long-form English prose into Russian for the
+    machinum-pipeline book tools. We care about: LoRA/QLoRA/PEFT, dataset construction,
+    completion-only loss, GGUF export, evaluation, VRAM/latency on 2x RTX 4060 Ti 16GB.
+  keywords: [lora, qlora, peft, sft, dpo, grpo, fine-tun, adapter, quantization, gguf,
+             unsloth, trl, axolotl, dataset, synthetic data, eval, benchmark, vram, context]
+  negative: [hiring, webinar, podcast, discount, black friday]
+  # LoRa (the radio standard) is a different product entirely; an item is dropped unless it
+  # also mentions one of these.
+  domain_terms: [llm, language model, fine-tun, adapter, peft, qlora, neural, transformer,
+                 нейросет, модел, обучен, токениз, весов]
+
+seeds:                              # `msft material seed`
+  - {kind: query, site: habr,   value: "LoRA fine-tuning LLM"}
+  - {kind: query, site: habr,   value: "QLoRA обучение больших языковых моделей"}
+  - {kind: query, site: github, value: "lora fine-tuning"}
+  - {kind: query, site: hf,     value: "lora"}
+  - {kind: query, site: hf,     value: "qlora"}
+  - {kind: query, site: github, value: "sft trainer"}
+
+limits:
+  queries_per_run: 6
+  items_per_run: 12
+  items_per_site: 6
+  max_frontier: 200
+  children_per_item: 3
+  fetch_timeout_s: 120
+  ask_timeout_s: 240
+
+scoring:
+  keep_min: 0.35        # below: status=scored_out
+  expand_min: 0.60      # below: no tag/author expansion
+  recency_days: [30, 180]   # bonuses 0.20 / 0.10
+  site_prior: {github: 0.05, hf: 0.05, habr: 0.0}
+
+expansion:
+  allow_kinds: [tag, author, repo, model]
+  per_site: {habr: [tag, author], github: [repo], hf: [model]}
+
+distill:
+  agent: ds-code
+  timeout_ms: 900000
+  notes_dir: notes
+
+memory:
+  workspace: default
+  project: data
+  path_prefix: projects/machinum-sft/material

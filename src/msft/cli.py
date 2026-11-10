@@ -606,6 +606,99 @@ def _cmd_config_show(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# --- material: the daily research state machine ---------------------------
+
+
+def _material_config(args: argparse.Namespace) -> Any:
+    """Load `configs/material.yaml`; after the `material` keyword `--config` means that file."""
+    material = _impl("msft.material")
+    return _func(material, "load_material_config")(getattr(args, "material_config", None))
+
+
+def _cmd_material_seed(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Insert the configured seeds into the frontier (idempotent)."""
+    material = _impl("msft.material")
+    result = _jsonable(
+        _func(material, "seed")(_material_config(args), dry_run=bool(args.dry_run))
+    )
+    _emit(args.as_json, result, _func(material, "format_seed")(result))
+    return EXIT_OK
+
+
+def _cmd_material_run(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Collect → score → dedupe → fetch → expand for one day."""
+    material = _impl("msft.material")
+    result = _jsonable(
+        _func(material, "run")(
+            _material_config(args),
+            limit=getattr(args, "limit", None),
+            day=getattr(args, "date", None),
+            dry_run=bool(args.dry_run),
+            no_expand=bool(getattr(args, "no_expand", False)),
+            max_items=getattr(args, "max_items", None),
+            sites=getattr(args, "site", None),
+        )
+    )
+    _emit(args.as_json, result, _func(material, "format_run")(result))
+    if result.get("dry_run"):
+        return EXIT_OK
+    return EXIT_OK if result.get("ok") else 1
+
+
+def _cmd_material_distill(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Pack the day's fetched items and hand the pack to the `at` agent."""
+    material = _impl("msft.material")
+    result = _jsonable(
+        _func(material, "distill")(
+            _material_config(args),
+            day=getattr(args, "date", None),
+            agent=getattr(args, "agent", None),
+            timeout_ms=getattr(args, "timeout_ms", None),
+            dry_run=bool(args.dry_run),
+        )
+    )
+    _emit(args.as_json, result, _func(material, "format_distill")(result))
+    if result.get("dry_run"):
+        return EXIT_OK
+    return EXIT_OK if result.get("ok") else 1
+
+
+def _cmd_material_memorize(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Write the day's distilled notes into the ai-memory wiki."""
+    material = _impl("msft.material")
+    result = _jsonable(
+        _func(material, "memorize")(
+            _material_config(args),
+            day=getattr(args, "date", None),
+            dry_run=bool(args.dry_run),
+            workspace=getattr(args, "workspace", None),
+            project=getattr(args, "project", None),
+        )
+    )
+    _emit(args.as_json, result, _func(material, "format_memorize")(result))
+    if result.get("dry_run"):
+        return EXIT_OK
+    return EXIT_OK if result.get("ok", True) else 1
+
+
+def _cmd_material_report(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """One line (or one object) about what the loop did on a date."""
+    material = _impl("msft.material")
+    result = _jsonable(
+        _func(material, "report")(_material_config(args), day=getattr(args, "date", None))
+    )
+    _emit(args.as_json, result, _func(material, "format_report")(result))
+    return EXIT_OK
+
+
+def _cmd_material_status(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Offline snapshot of the frontier, the items and the last run."""
+    material = _impl("msft.material")
+    result = _jsonable(_func(material, "status")(_material_config(args)))
+    _emit(args.as_json, result, _func(material, "format_status")(result))
+    return EXIT_OK
+
+
 # --- parser ---------------------------------------------------------------
 
 
@@ -1105,6 +1198,105 @@ def build_parser() -> argparse.ArgumentParser:
     p_w_reset = worker_sub.add_parser("reset", parents=[common], help="clear the queue, keep logs")
     p_w_reset.add_argument("--dir", metavar="PATH", default=None, help="worker directory")
     p_w_reset.set_defaults(handler=_cmd_worker_reset)
+
+    # `material` deliberately does not inherit the training `--config`: after this keyword
+    # `--config` names the material YAML, which is not a RunConfig. Its own `--json` and
+    # `--dry-run` keep both spellings working, and nothing here can reach a GPU.
+    mat = argparse.ArgumentParser(add_help=False)
+    mat.add_argument(
+        "--config",
+        dest="material_config",
+        metavar="PATH",
+        default=None,
+        help="material YAML (default: configs/material.yaml)",
+    )
+    mat.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="print exactly one JSON object on stdout",
+    )
+    mat.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="plan only: no network, no docker, no agent",
+    )
+    p_material = sub.add_parser(
+        "material",
+        parents=[mat],
+        help="daily research loop: collect, score, distill, memorize, report",
+    )
+    mat_sub = p_material.add_subparsers(
+        dest="material_command", metavar="ACTION", required=True
+    )
+    p_m_seed = mat_sub.add_parser(
+        "seed", parents=[mat], help="insert the configured seeds into the frontier"
+    )
+    p_m_seed.set_defaults(handler=_cmd_material_seed)
+    p_m_run = mat_sub.add_parser(
+        "run", parents=[mat], help="collect, score, dedupe, fetch, expand"
+    )
+    p_m_run.add_argument(
+        "--limit", type=int, default=None, metavar="N", help="max candidates to execute"
+    )
+    p_m_run.add_argument(
+        "--date", metavar="YYYY-MM-DD", default=None, help="day the raw files land under"
+    )
+    p_m_run.add_argument(
+        "--no-expand",
+        action="store_true",
+        help="do not enqueue tag/author/topic children",
+    )
+    p_m_run.add_argument(
+        "--max-items", type=int, default=None, metavar="N", help="cap items discovered this run"
+    )
+    p_m_run.add_argument(
+        "--site",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help="restrict to one site (repeatable)",
+    )
+    p_m_run.set_defaults(handler=_cmd_material_run)
+    p_m_distill = mat_sub.add_parser(
+        "distill", parents=[mat], help="pack the day's items and hand the pack to `at`"
+    )
+    p_m_distill.add_argument("--date", metavar="YYYY-MM-DD", default=None)
+    p_m_distill.add_argument(
+        "--agent", metavar="NAME", default=None, help="at agent (default: the config's ds-code)"
+    )
+    p_m_distill.add_argument(
+        "--timeout-ms",
+        dest="timeout_ms",
+        type=int,
+        default=None,
+        metavar="MS",
+        help="hard timeout for the agent (default: the config's timeout_ms)",
+    )
+    p_m_distill.set_defaults(handler=_cmd_material_distill)
+    p_m_memorize = mat_sub.add_parser(
+        "memorize", parents=[mat], help="write the day's notes into the ai-memory wiki"
+    )
+    p_m_memorize.add_argument("--date", metavar="YYYY-MM-DD", default=None)
+    p_m_memorize.add_argument(
+        "--workspace", metavar="W", default=None, help="ai-memory workspace (default: config)"
+    )
+    p_m_memorize.add_argument(
+        "--project", metavar="P", default=None, help="ai-memory project (default: config)"
+    )
+    p_m_memorize.set_defaults(handler=_cmd_material_memorize)
+    p_m_report = mat_sub.add_parser(
+        "report", parents=[mat], help="what the loop did on one day"
+    )
+    p_m_report.add_argument("--date", metavar="YYYY-MM-DD", default=None)
+    p_m_report.set_defaults(handler=_cmd_material_report)
+    p_m_status = mat_sub.add_parser(
+        "status", parents=[mat], help="offline frontier, item counts and last run"
+    )
+    p_m_status.set_defaults(handler=_cmd_material_status)
 
     return parser
 

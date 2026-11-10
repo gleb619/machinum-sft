@@ -56,6 +56,7 @@ hand JSONL to `msft data build`.
 | `docs/index.md` | model card: how `machinum:4b` was built, what it costs, where it fails |
 | `docs/pipeline-check.md` | the model through `mt` on held-out prose, with the defects quoted |
 | `docs/model-candidates.md` | the models the internet recommends, checked against the registry |
+| `docs/material-pipeline.md` | the daily research loop: what it collects, where the notes go, why the raw material is never committed |
 
 ## Remote worker
 

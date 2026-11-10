@@ -60,3 +60,7 @@ worker.local.yaml
 # deploy/memory: the server token and the wiki data never get committed
 deploy/memory/.env
 deploy/memory/data/
+
+# docs/material: raw research material (bulky, third-party text). The distilled notes go to
+# the ai-memory wiki instead — see docs/material-pipeline.md
+docs/material/
