@@ -349,7 +349,7 @@ silently creates a frontier hides a typo in `configs/material.yaml`), then
 | --- | --- | --- |
 | `another run holds the lock`, exit 0 | a run is in flight, or a killed run left a live process | `pgrep -af 'material'`; if nothing, `fuser docs/material/.state/lock` |
 | exit 2, `error: …` on stderr | config or environment: unreadable YAML, missing token, unwritable dir | `msft material status` then re-read the message; the CLI prints the offending path |
-| exit 1, `collect failed` | webbridge: site down, browser not attached, JSON garbage | `msft material run --limit 1 --site habr` and read the candidate's `error` column |
+| exit 1, `collect failed` | webbridge: site down, browser not attached, JSON garbage — **not** an empty search (zero results are a `done` candidate) | `msft material run --limit 1 --site habr` and read the candidate's `error` column |
 | `distill: skipped (collect failed)` | correct behaviour, not a bug | nothing; tomorrow's run picks the `packed` items up |
 | `at` non-zero / no summary | agent crashed, timed out, or printed no JSON | read `docs/material/pack/<date>.md`, then run `at` by hand on that file |
 | items stuck `packed` for days | the agent never accepted the pack | `SELECT url, error FROM items WHERE status='packed'` |

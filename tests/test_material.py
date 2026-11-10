@@ -437,6 +437,39 @@ def test_run_marks_a_failed_cli_as_candidate_error_and_continues(
     assert rows["hf"]["status"] == "done"
 
 
+def test_run_treats_zero_results_as_done_not_an_error(
+    seeded: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A search that matches nothing exits 1 in the tunnelstack client but still prints JSON.
+
+    Observed live: the `author/DaytonCavalet` expansion node ("articles by an author of a
+    high-scoring post") answers with zero RSS items, the client exits 1, and an earlier
+    runner treated that as a failure — which aborted the collect step and, through the
+    daily script, the whole cron run. A frontier node that has been explored and came back
+    empty is *done*, not broken.
+    """
+    install(
+        monkeypatch,
+        {
+            ("search", "hf", "lora"): (
+                1,  # exit 1: "no text extracted" — the client's empty-result contract
+                json.dumps({"site": "hf", "op": "search", "count": 0, "items": []}),
+                "hf: (no text extracted)",
+            ),
+        },
+    )
+    result = material.run(seeded, day=DAY, sites=["hf"])
+    assert result["ok"] is True
+    assert result["errors"] == 0
+    assert result["queries"] == 1
+    assert result["items"] == 0
+
+    with material.State(seeded.db_path) as state:
+        rows = {row["site"]: dict(row) for row in state.conn.execute("SELECT * FROM candidates")}
+    assert rows["hf"]["status"] == "done"
+    assert rows["hf"]["error"] is None
+
+
 def test_run_skips_a_url_two_candidates_both_return(
     seeded: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
 ) -> None:

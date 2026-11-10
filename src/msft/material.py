@@ -1135,7 +1135,7 @@ def _fetch_body(
             ["extract", "habr", url], cfg.limits.fetch_timeout_s
         )
         payload = _loads(stdout)
-        if rc != 0 or not isinstance(payload, dict):
+        if not isinstance(payload, dict):
             return "", None, f"extract failed (rc={rc}): {_tail(stderr or stdout)}"
         body = str(payload.get("text") or "")
         return body, payload, None
@@ -1309,7 +1309,12 @@ def run(
                 )
                 rc, stdout, stderr = run_webbridge(argv_c, timeout)
                 payload = _loads(stdout)
-                if rc != 0 or payload is None:
+                # The tunnelstack client exits 1 when a search matches nothing — its contract
+                # is "print no text, fail" — but the JSON on stdout is still a valid answer.
+                # A query that legitimately found zero results must not fail the whole run:
+                # it is one frontier node that has been explored and is now empty. Only an
+                # unparsable/absent stdout is a real failure (bad argv, dead site, no JSON).
+                if payload is None:
                     counters["errors"] += 1
                     state.set_candidate(
                         int(cand["id"]), "error",
@@ -1317,6 +1322,11 @@ def run(
                     )
                     _log(f"{cand['kind']}/{cand['site']} failed: rc={rc}")
                     continue
+                if rc != 0:
+                    _log(
+                        f"{cand['kind']}/{cand['site']}: rc={rc} with valid JSON "
+                        "(empty result, not a failure)"
+                    )
                 state.set_candidate(int(cand["id"]), "done")
                 for entry in items_from_payload(payload, cand, cfg):
                     url = canonical_url(str(entry["url"]))
