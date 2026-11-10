@@ -386,6 +386,43 @@ def _cmd_probe(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     return EXIT_OK if result.get("ok") else 1
 
 
+def _arena_models(chunks: list[str] | None) -> list[str]:
+    """Flatten repeated, comma-separated `--models` values, keeping order and dropping repeats."""
+    names = [
+        name.strip()
+        for chunk in chunks or []
+        for name in str(chunk).split(",")
+        if name.strip()
+    ]
+    return list(dict.fromkeys(names))
+
+
+def _cmd_arena(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Run the same cases through several models, score each reply, print the leaderboard."""
+    arena = _impl("msft.arena")
+    probe = _impl("msft.probe")
+    system = args.system or str(getattr(probe, "SYSTEM_PROMPT", ""))
+    result = _jsonable(
+        _func(arena, "run")(
+            endpoint=args.endpoint,
+            models=_arena_models(args.models),
+            cases=Path(args.cases) if args.cases else None,
+            prompts=list(args.prompt or []),
+            system=system,
+            judge=args.judge,
+            allow_self_judge=bool(args.allow_self_judge),
+            seed=args.seed,
+            num_predict=args.num_predict,
+            timeout=args.timeout,
+            out=args.out,
+            dry_run=bool(args.dry_run),
+        )
+    )
+    formatter = "format_plan" if result.get("dry_run") else "format_report"
+    _emit(args.as_json, result, _func(arena, formatter)(result))
+    return EXIT_OK if result.get("ok") else 1
+
+
 def _cmd_remote_preflight(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     """Check the remote host over ssh before syncing or training."""
     remote = _impl("msft.remote")
@@ -1040,6 +1077,72 @@ def build_parser() -> argparse.ArgumentParser:
         "--system", metavar="TEXT", default=None, help="system prompt (default: translation)"
     )
     p_probe.set_defaults(handler=_cmd_probe)
+
+    p_arena = sub.add_parser(
+        "arena",
+        help="same prompts through several models, scored by several frameworks",
+    )
+    # `arena` runs by default, so it does not inherit the training flags: `--execute` there
+    # means "actually do it", which is the opposite of what this command needs to explain.
+    p_arena.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="print exactly one JSON object on stdout",
+    )
+    p_arena.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="plan only: count the requests, touch no endpoint",
+    )
+    p_arena.add_argument(
+        "--models",
+        action="append",
+        metavar="LIST",
+        default=[],
+        help="comma-separated ollama model names; repeatable",
+    )
+    p_arena.add_argument(
+        "--cases", metavar="PATH", default=None, help="cases JSONL (instead of --prompt)"
+    )
+    p_arena.add_argument(
+        "--prompt", action="append", metavar="TEXT", default=[], help="ad-hoc prompt; repeatable"
+    )
+    p_arena.add_argument(
+        "--system", metavar="TEXT", default=None, help="system prompt (default: translation)"
+    )
+    p_arena.add_argument(
+        "--judge", metavar="MODEL", default=None, help="model that rates the collected replies"
+    )
+    p_arena.add_argument(
+        "--allow-self-judge",
+        action="store_true",
+        help="allow the judge to be a candidate too (its judge column is starred)",
+    )
+    p_arena.add_argument(
+        "--endpoint",
+        metavar="URL",
+        default=None,
+        help="ollama base URL (default: $MSFT_ARENA_ENDPOINT)",
+    )
+    p_arena.add_argument("--seed", type=int, default=7, help="sampling seed (default: 7)")
+    p_arena.add_argument(
+        "--num-predict", type=int, default=4096, help="max output tokens (default: 4096)"
+    )
+    p_arena.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="per-request timeout (default: 300)",
+    )
+    p_arena.add_argument(
+        "--out", metavar="DIR", default=None, help="artifacts (default: out/arena/<UTC stamp>)"
+    )
+    p_arena.set_defaults(handler=_cmd_arena)
 
     p_remote = sub.add_parser("remote", parents=[common], help="ssh orchestration on a GPU box")
     remote_sub = p_remote.add_subparsers(dest="remote_command", metavar="ACTION", required=True)

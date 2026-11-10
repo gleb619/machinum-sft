@@ -130,6 +130,10 @@ switch has to be per request:
 Three hand-checked sentences prove format, not quality. The 0.8B model of the same family, with
 the same recipe, failed all three — that is what a real gate looks like when it fires.
 
+Comparing this artefact with another model on the same prompts is `msft arena`, which scores
+every reply with several independent frameworks and prints them side by side instead of one
+number; [arena.md](arena.md) explains the columns and what the report refuses to claim.
+
 ## 8. Where it fails
 
 The same chapter through `mt` and through a 27B model, side by side, is the honest benchmark. On
