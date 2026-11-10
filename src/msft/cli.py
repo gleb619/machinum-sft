@@ -625,6 +625,18 @@ def _cmd_material_seed(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_material_add(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Insert explicit URLs into the frontier, ahead of every query."""
+    material = _impl("msft.material")
+    result = _jsonable(
+        _func(material, "add_urls")(
+            _material_config(args), args.urls, dry_run=bool(args.dry_run)
+        )
+    )
+    _emit(args.as_json, result, _func(material, "format_add")(result))
+    return EXIT_OK
+
+
 def _cmd_material_run(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     """Collect → score → dedupe → fetch → expand for one day."""
     material = _impl("msft.material")
@@ -1236,6 +1248,15 @@ def build_parser() -> argparse.ArgumentParser:
         "seed", parents=[mat], help="insert the configured seeds into the frontier"
     )
     p_m_seed.set_defaults(handler=_cmd_material_seed)
+    p_m_add = mat_sub.add_parser(
+        "add",
+        parents=[mat],
+        help="insert explicit URLs into the frontier, ahead of every query",
+    )
+    p_m_add.add_argument(
+        "urls", nargs="+", metavar="URL", help="article/repo/model URL"
+    )
+    p_m_add.set_defaults(handler=_cmd_material_add)
     p_m_run = mat_sub.add_parser(
         "run", parents=[mat], help="collect, score, dedupe, fetch, expand"
     )

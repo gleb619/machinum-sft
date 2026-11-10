@@ -18,6 +18,11 @@ product:
                  нейросет, модел, обучен, токениз, весов]
 
 seeds:                              # `msft material seed`
+  # Explicit reads (`msft material add` / kind: url): ahead of every keyword sweep.
+  - {kind: url, site: habr, value: "https://habr.com/ru/articles/1044422/"}
+  - {kind: url, site: habr, value: "https://habr.com/ru/articles/1054710/"}
+  - {kind: url, site: habr, value: "https://habr.com/ru/companies/rwb/articles/1069148/"}
+  - {kind: url, site: habr, value: "https://habr.com/ru/companies/otus/articles/1026700/"}
   - {kind: query, site: habr,   value: "LoRA fine-tuning LLM"}
   - {kind: query, site: habr,   value: "QLoRA обучение больших языковых моделей"}
   - {kind: query, site: github, value: "lora fine-tuning"}

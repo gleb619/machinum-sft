@@ -176,7 +176,9 @@ def test_shipped_config_loads_and_validates() -> None:
     cfg = material.load_material_config()
     assert cfg.product.name == "machinum-sft"
     assert "qlora" in cfg.product.keywords
-    assert len(cfg.seeds) == 6
+    # six keyword sweeps plus the four committed explicit reads at the top of `seeds:`
+    assert len(cfg.seeds) == 10
+    assert [seed.kind for seed in cfg.seeds[:4]] == ["url"] * 4
     assert cfg.limits.items_per_run == 12
     assert cfg.scoring.expand_min == 0.6
     assert cfg.memory.path_prefix == "projects/machinum-sft/material"
@@ -239,6 +241,149 @@ def test_seed_dry_run_adds_nothing(cfg: material.MaterialCfg) -> None:
     result = material.seed(cfg, dry_run=True)
     assert result["added"] == 3
     assert not cfg.db_path.exists()
+
+
+# --- explicit urls --------------------------------------------------------
+
+ARTICLE = "https://habr.com/ru/articles/1044422/"
+CANONICAL = "https://habr.com/ru/articles/1044422"
+NOISE = {
+    "site": "habr",
+    "url": CANONICAL,
+    "title": "Как я чинил забор",
+    "text": "доски, гвозди",
+}
+
+
+def test_site_for_url_maps_known_hosts_and_refuses_unknown() -> None:
+    assert material.site_for_url(ARTICLE) == "habr"
+    assert material.site_for_url("https://github.com/huggingface/peft") == "github"
+    assert material.site_for_url("https://huggingface.co/org/tiny-lora") == "hf"
+    assert material.site_for_url("https://www.habr.com/ru/articles/1/") == "habr"
+    assert material.site_for_url("https://m.habr.com/ru/articles/1/") == "habr"
+    with pytest.raises(ConfigError, match="no site recipe"):
+        material.site_for_url("https://example.com/x")
+
+
+def test_add_urls_canonicalises_dedupes_and_is_idempotent(cfg: material.MaterialCfg) -> None:
+    first = material.add_urls(cfg, [ARTICLE, ARTICLE, ARTICLE + "?utm_source=x"])
+    assert first["urls"] == 3
+    assert first["added"] == 1, "three spellings of one URL are one candidate"
+    assert first["would_add"] == [f"url/habr: {CANONICAL}"]
+    assert first["frontier"] == 1
+
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute("SELECT * FROM candidates").fetchone()
+    assert row is not None
+    assert row["kind"] == "url"
+    assert row["value"] == CANONICAL
+    assert row["site"] == "habr"
+    assert row["priority"] == 1.0
+    assert row["reason"] == "manual"
+
+    second = material.add_urls(cfg, [ARTICLE])
+    assert second["added"] == 0
+    assert second["existing"] == 1
+    assert second["known"] == [f"url/habr: {CANONICAL}"]
+    assert second["frontier"] == 1
+
+
+def test_add_urls_dry_run_writes_nothing(cfg: material.MaterialCfg) -> None:
+    result = material.add_urls(cfg, [ARTICLE], dry_run=True)
+    assert not cfg.db_path.exists()
+    assert result["dry_run"] is True
+    assert result["added"] == 1
+    assert result["would_add"] == [f"url/habr: {CANONICAL}"]
+    assert result["frontier"] == 1
+
+
+def test_add_urls_unknown_host_is_a_config_error(cfg: material.MaterialCfg) -> None:
+    with pytest.raises(ConfigError, match="no site recipe"):
+        material.add_urls(cfg, ["https://example.com/x"])
+    assert not cfg.db_path.exists(), "a rejected URL must not create state"
+
+
+def test_candidate_argv_maps_url_to_extract() -> None:
+    argv = material.candidate_argv({"kind": "url", "site": "habr", "value": CANONICAL})
+    assert argv == ["extract", "habr", CANONICAL]
+
+
+def test_url_seed_is_ranked_before_queries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MSFT_MATERIAL_DIR", str(tmp_path / "material"))
+    path = write_config(
+        tmp_path,
+        seeds=[
+            {"kind": "query", "site": "habr", "value": "LoRA fine-tuning LLM"},
+            {"kind": "url", "site": "habr", "value": ARTICLE},
+        ],
+    )
+    cfg = material.load_material_config(path)
+    material.seed(cfg)
+    with material.State(cfg.db_path) as state:
+        first = state.candidates(limit=10)[0]
+    assert first["kind"] == "url"
+    assert first["priority"] == 1.0
+
+
+def test_run_fetches_an_explicit_url_below_keep_min(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = install(monkeypatch, {("extract", "habr", CANONICAL): NOISE})
+    material.add_urls(cfg, [CANONICAL])
+    result = material.run(cfg, limit=1, day=DAY, sites=["habr"])
+
+    assert bridge.argv[0] == ["extract", "habr", CANONICAL]
+    assert result["items"] == 1
+    assert result["kept"] == 1
+    assert result["fetched"] == 1
+    assert result["ok"] is True
+    with material.State(cfg.db_path) as state:
+        row = state.item(CANONICAL)
+    assert row is not None
+    assert row["status"] == "fetched"
+    assert row["score"] == 0.0, "the score is recorded, it just does not veto"
+    raws = list((cfg.raw_dir / DAY).glob("*.txt"))
+    assert len(raws) == 1
+
+
+def test_run_still_drops_an_unscored_search_item(
+    seeded: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    noise = habr_item(
+        NOISE["url"] + "/",
+        NOISE["title"],
+        summary="<p>доски, гвозди</p>",
+        published="Sun, 08 Nov 2026 10:00:00 +0000",
+        tags=["diy"],
+        author="carol",
+    )
+    install(monkeypatch, {("search", "habr", "LoRA fine-tuning LLM"): habr_search([noise])})
+    result = material.run(seeded, limit=1, day=DAY, sites=["habr"])
+    assert result["items"] == 1
+    assert result["kept"] == 0
+    assert result["fetched"] == 0
+    with material.State(seeded.db_path) as state:
+        row = state.item(CANONICAL)
+    assert row is not None
+    assert row["status"] == "scored_out", "the keep_min bypass is url-only"
+    assert row["score"] < seeded.scoring.keep_min
+
+
+def test_cli_material_add_json(
+    cfg: material.MaterialCfg, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["material", "add", ARTICLE, "--json", "--config", str(cfg.path)]
+    assert main(argv) == 0
+    payload = one_object(capsys.readouterr().out)
+    assert payload["added"] == 1
+    assert payload["would_add"] == [f"url/habr: {CANONICAL}"]
+
+    assert main(argv) == 0
+    again = one_object(capsys.readouterr().out)
+    assert again["added"] == 0
+    assert again["existing"] == 1
 
 
 # --- canonicalisation, hashing, normalisation -----------------------------

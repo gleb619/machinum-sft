@@ -47,7 +47,7 @@ DEFAULT_MEMORY_URL = "http://127.0.0.1:49374"
 DEFAULT_CONFIG_NAME = "configs/material.yaml"
 
 SITES = ("habr", "github", "hf", "google-ai", "deepseek", "qwen")
-CANDIDATE_KINDS = ("query", "tag", "author", "repo", "model", "note")
+CANDIDATE_KINDS = ("query", "tag", "author", "repo", "url", "model", "note")
 ITEM_STATUSES = (
     "seen",
     "scored_out",
@@ -109,6 +109,24 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 class ConfigError(MsftError):
     """`configs/material.yaml` is missing, unreadable or incomplete (exit code 2)."""
+
+
+# --- urls ----------------------------------------------------------------
+
+
+URL_SITES = {"habr.com": "habr", "github.com": "github", "huggingface.co": "hf"}
+
+
+def site_for_url(url: str) -> str:
+    """The site whose recipe can extract this URL; an unknown host is an error, not a search."""
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    for suffix, site in URL_SITES.items():
+        if host == suffix or host.endswith("." + suffix):
+            return site
+    known = ", ".join(sorted(URL_SITES))
+    raise ConfigError(f"no site recipe for host '{host or url}' (known: {known})")
 
 
 # --- environment ---------------------------------------------------------
@@ -918,6 +936,9 @@ def candidate_argv(cand: dict[str, Any]) -> list[str]:
     value = str(cand["value"])
     if kind == "note":
         return ["ask", site, value]
+    if kind == "url":
+        # A URL candidate is a direct extract: searching for a URL string finds nothing.
+        return ["extract", site, value]
     if kind == "repo":
         if value.startswith("topic:"):
             return ["search", "github", value.split(":", 1)[1]]
@@ -1040,6 +1061,26 @@ def items_from_payload(
                 "source": payload if isinstance(payload, dict) else {"text": text},
             }
         ]
+    if cand["kind"] == "url":
+        # An extract payload carries the page itself, not a result list, so it has no
+        # `items`/`data` key to normalise.
+        if not isinstance(payload, dict):
+            return []
+        text = strip_html(str(payload.get("text") or ""))
+        return [
+            {
+                "url": str(payload.get("url") or cand["value"]),
+                "site": site,
+                "title": str(payload.get("title") or "").strip(),
+                "author": None,
+                "published": None,
+                "tags": [],
+                "summary": text[:1200],
+                "stars": 0,
+                "downloads": 0,
+                "source": payload,
+            }
+        ]
     if not isinstance(payload, dict):
         return []
     raw_items = payload.get("items")
@@ -1128,7 +1169,9 @@ def seed(
                 continue
             if not dry_run:
                 state.add_candidate(
-                    item.kind, item.value, item.site, reason=item.reason or "seed"
+                    item.kind, item.value, item.site,
+                    reason=item.reason or "seed",
+                    priority=1.0 if item.kind == "url" else 0.0,
                 )
             added.append(f"{item.kind}/{item.site}: {item.value}")
         return {
@@ -1139,6 +1182,70 @@ def seed(
             "added": len(added),
             "existing": existing,
             "would_add": added if dry_run else [],
+            "frontier": state.frontier() + (len(added) if dry_run else 0),
+        }
+
+
+def add_urls(
+    cfg: MaterialCfg, urls: list[str], *, dry_run: bool = False
+) -> dict[str, Any]:
+    """Queue explicit URLs for the next run.
+
+    An explicit URL is the operator's decision, not a keyword guess: it is queued at
+    priority 1.0 so it runs ahead of the whole keyword frontier, and `run` lets it through
+    even when its score sits below `scoring.keep_min` — the operator already said this page
+    is wanted, so the score is recorded but does not veto it. Everything downstream (the
+    three dedupe layers, fetch → raw → pack → notes → wiki) is the ordinary path.
+    """
+    resolved: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in urls:
+        canonical = canonical_url(raw)
+        if not canonical:
+            raise ConfigError(f"not a URL: {raw}")
+        pair = (canonical, site_for_url(canonical))
+        if pair in seen:  # the same URL twice in one command is still one candidate
+            continue
+        seen.add(pair)
+        resolved.append(pair)
+
+    if dry_run and not cfg.db_path.exists():
+        would_add = [f"url/{site}: {canonical}" for canonical, site in resolved]
+        return {
+            "dry_run": True,
+            "config": str(cfg.path),
+            "db": str(cfg.db_path),
+            "urls": len(urls),
+            "added": len(would_add),
+            "existing": 0,
+            "would_add": would_add,
+            "known": [],
+            "frontier": len(would_add),
+        }
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
+        added: list[str] = []
+        known: list[str] = []
+        for canonical, site in resolved:
+            entry = f"url/{site}: {canonical}"
+            already = state.conn.execute(
+                "SELECT 1 FROM candidates WHERE kind = 'url' AND value = ? AND site = ?",
+                (canonical, site),
+            ).fetchone()
+            if already:
+                known.append(entry)
+                continue
+            if not dry_run:
+                state.add_candidate("url", canonical, site, reason="manual", priority=1.0)
+            added.append(entry)
+        return {
+            "dry_run": dry_run,
+            "config": str(cfg.path),
+            "db": str(cfg.db_path),
+            "urls": len(urls),
+            "added": len(added),
+            "existing": len(known),
+            "would_add": added,
+            "known": known,
             "frontier": state.frontier() + (len(added) if dry_run else 0),
         }
 
@@ -1365,6 +1472,9 @@ def run(
                     site = str(entry["site"])
                     if per_site.get(site, 0) >= cfg.limits.items_per_site:
                         continue
+                    # The operator already decided an explicit URL is relevant, so the keyword
+                    # score is recorded but does not veto it.
+                    manual = str(cand["kind"]) == "url"
                     score = score_item(entry, cfg)
                     entry["content_sha"] = content_sha(
                         str(entry.get("title") or ""), str(entry.get("summary") or "")
@@ -1378,7 +1488,7 @@ def run(
                         state.add_item(_new_item_row(entry, score, "duplicate"))
                         state.update_item(url, error=f"same content as {owner}")
                         continue
-                    if score < cfg.scoring.keep_min:
+                    if not manual and score < cfg.scoring.keep_min:
                         state.add_item(_new_item_row(entry, score, "scored_out"))
                         continue
                     counters["kept"] += 1
@@ -1426,6 +1536,8 @@ PACK_RULES = """\
 ## Rules
 
 - Write only under `docs/material/notes/{day}/`. Do not touch any other directory.
+- A long body is truncated at 8 000 characters in this pack; its `raw:` file under
+  `docs/material/raw/` holds the full text — read it when the section stops mid-article.
 - No network access. Do not install anything, do not run docker.
 - Keep numbers, model names, versions and links verbatim; do not round, translate or
   transliterate identifiers.
@@ -2101,6 +2213,20 @@ def format_seed(payload: dict[str, Any]) -> str:
     ]
     for entry in payload.get("would_add") or []:
         lines.append(f"  + {entry}")
+    return "\n".join(lines)
+
+
+def format_add(payload: dict[str, Any]) -> str:
+    """What `add` queued, and which URLs the frontier already had."""
+    verb = "would add" if payload.get("dry_run") else "added"
+    lines = [
+        f"add {payload.get('urls', 0)} url(s): {payload.get('added', 0)} {verb}, "
+        f"{payload.get('existing', 0)} already present, frontier {payload.get('frontier', 0)}"
+    ]
+    for entry in payload.get("would_add") or []:
+        lines.append(f"  + {entry}")
+    for entry in payload.get("known") or []:
+        lines.append(f"  = {entry}  (already in the frontier)")
     return "\n".join(lines)
 
 

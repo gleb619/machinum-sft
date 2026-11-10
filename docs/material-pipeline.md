@@ -106,6 +106,7 @@ truth, so a re-run after a crash resumes instead of guessing.
 | Command | What it does | Writes |
 | --- | --- | --- |
 | `seed` | inserts the configured queries into the frontier | `candidates` |
+| `add` | inserts explicit URLs into the frontier, ahead of every query | `candidates` |
 | `run` | calls webbridge for the highest-priority candidates, scores, fetches, expands | `candidates`, `items`, `raw/` |
 | `distill` | packs `packed` items into one file, runs the `at` agent over it | `pack/`, `notes/`, `experiments.md` |
 | `memorize` | posts each `distilled` note to ai-memory | wiki, `INDEX.md` |
@@ -268,6 +269,46 @@ neural, transformer, нейросет, модел, обучен, токениз,
 
 The same veto shape handles the other recurring noise: `negative: [hiring, webinar, podcast,
 discount, black friday]` scores 0 outright, before any recency or star bonus can rescue it.
+
+## Reading one page on purpose
+
+A keyword sweep is a guess about what matters; sometimes you already know. One command puts a
+page in the frontier, and it then flows through the same pipeline as everything else — raw
+file, pack, note, wiki page:
+
+```bash
+msft material add https://habr.com/ru/articles/1044422/
+msft material add URL URL URL          # repeatable: one candidate per URL, deduped
+msft material add URL --dry-run        # what the frontier would gain, state untouched
+msft material add URL --json           # one object on stdout
+```
+
+The committed equivalent, for a page that stays interesting for weeks, is a seed at the top of
+`configs/material.yaml`:
+
+```yaml
+seeds:
+  - {kind: url, site: habr, value: "https://habr.com/ru/articles/1044422/"}
+```
+
+The site is inferred from the host: `habr.com` → `habr`, `github.com` → `github`,
+`huggingface.co` → `hf`, with `www.` and subdomains accepted. **An unknown host is a config
+error** (exit 2, `no site recipe for host '…'`), never a search — there is no recipe to extract
+a page from an unknown site, and searching for a URL string finds nothing.
+
+Three properties make an explicit URL different from a sweep:
+
+- **It runs first.** The candidate carries `priority = 1.0` while every seed and child carries
+  `0.0` or a score, and the frontier is ordered by priority, so explicit URLs are executed
+  before the keyword sweeps — even on a run budgeted to a single query.
+- **`scoring.keep_min` does not apply.** The operator already decided the page is relevant, so
+  `run` computes the score, stores it and shows it in the pack, but does not veto on it: an item
+  scoring `0.0` is still fetched. The rule is deliberately url-only — the same page found by a
+  *search* is scored out exactly as before.
+- **Nothing else is special.** All three dedupe layers still apply (candidate
+  `UNIQUE(kind, value, site)` after canonicalisation, `items` by canonical URL, `content_sha`
+  across URLs), and fetch → `raw/<date>/` → pack → notes → wiki is the ordinary path. A URL
+  already in `items` is reported as seen and is not fetched again.
 
 ## The daily run
 
