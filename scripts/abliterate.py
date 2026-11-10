@@ -99,6 +99,11 @@ def _log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+def _text_config(model: Any) -> Any:
+    """The checkpoint's text config, whether or not the loader already unwrapped it."""
+    return getattr(model.config, "text_config", None) or model.config
+
+
 def plan(model_dir: Path) -> dict[str, Any]:
     """What the surgery would touch, read from the checkpoint's own index (no GPU needed)."""
     index_path = model_dir / "model.safetensors.index.json"
@@ -166,7 +171,7 @@ def _capture(model: Any, tokenizer: Any, prompts: list[str], layers: int) -> Any
     """Mean last-token residual at the output of every layer, one pass per prompt."""
     import torch
 
-    sums = torch.zeros(layers, model.config.text_config.hidden_size, dtype=torch.float32)
+    sums = torch.zeros(layers, _text_config(model).hidden_size, dtype=torch.float32)
     for prompt in prompts:
         messages = [{"role": "user", "content": prompt}]
         text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -257,7 +262,7 @@ def main() -> int:
         args.model, dtype=torch.bfloat16, device_map=device_map
     )
     model.eval()
-    layers = int(model.config.text_config.num_hidden_layers)
+    layers = int(_text_config(model).num_hidden_layers)
 
     before = refusal_count(_generate(model, tokenizer, list(HARMFUL[:8])))
     _log(f"refusals before: {before}/8")
