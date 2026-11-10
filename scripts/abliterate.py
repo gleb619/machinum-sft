@@ -235,12 +235,20 @@ def main() -> int:
         raise SystemExit(f"no residual writers found under {args.model}")
 
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast
 
     if not torch.cuda.is_available():
         raise SystemExit("abliteration is GPU-only: a bf16 4B model does not fit in CPU RAM here")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    # This checkpoint is multimodal (it carries `processor_config.json`), and AutoTokenizer's
+    # processor resolution recurses for ever in transformers 5.17: `_load_tokenizer_from_pretrained`
+    # and `auto_processor_class.from_pretrained` call each other. The tokenizer files are complete
+    # on disk, so load the fast tokenizer directly and skip the auto-class dance.
+    tokenizer = (
+        PreTrainedTokenizerFast.from_pretrained(args.model)
+        if (args.model / "processor_config.json").is_file()
+        else AutoTokenizer.from_pretrained(args.model)
+    )
     model = AutoModelForCausalLM.from_pretrained(
         args.model, dtype=torch.bfloat16, device_map={"": args.device}
     )
