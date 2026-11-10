@@ -151,17 +151,29 @@ def refusal_count(replies: list[str]) -> int:
     return total
 
 
+def _chat_text(tokenizer: Any, prompt: str) -> str:
+    """Render one user turn the way the serving path does: no thinking, no system prompt."""
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+    except TypeError:  # a tokenizer without the Qwen thinking switch
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+
 def _generate(model: Any, tokenizer: Any, prompts: list[str]) -> list[str]:
     """Greedy, 48-token replies — only their opening words are inspected."""
     import torch
 
     replies: list[str] = []
     for prompt in prompts:
-        messages = [{"role": "user", "content": prompt}]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text = _chat_text(tokenizer, prompt)
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
         with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=48, do_sample=False)
+            out = model.generate(**inputs, max_new_tokens=64, do_sample=False)
         new_tokens = out[0][inputs["input_ids"].shape[1] :]
         replies.append(tokenizer.decode(new_tokens, skip_special_tokens=True))
     return replies
@@ -173,8 +185,7 @@ def _capture(model: Any, tokenizer: Any, prompts: list[str], layers: int) -> Any
 
     sums = torch.zeros(layers, _text_config(model).hidden_size, dtype=torch.float32)
     for prompt in prompts:
-        messages = [{"role": "user", "content": prompt}]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text = _chat_text(tokenizer, prompt)
         inputs = tokenizer(text, return_tensors="pt").to(model.device)
         with torch.no_grad():
             out = model(**inputs, output_hidden_states=True)
