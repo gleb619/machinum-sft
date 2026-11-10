@@ -37,7 +37,7 @@ def paragraphs(path: Path) -> list[str]:
     ]
 
 
-def build(en_dir: Path, min_chars: int) -> list[dict[str, str]]:
+def build(en_dir: Path, min_chars: int, groups: tuple[int, ...] = ()) -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
     for en in sorted(en_dir.glob("*.en.md")):
         ru = Path(str(en).replace(".en.md", ".ru.md"))
@@ -57,6 +57,22 @@ def build(en_dir: Path, min_chars: int) -> list[dict[str, str]]:
                     "source": f"{en.parent.name}/{en.name}#p{index}",
                 }
             )
+        # A model cannot keep a line break it has never seen: windows of consecutive
+        # paragraphs teach the shape the system prompt already asks for.
+        for size in groups:
+            for start in range(0, min(len(left), len(right)) - size + 1):
+                window_left = left[start : start + size]
+                window_right = right[start : start + size]
+                if any(len(line) < min_chars // 2 for line in window_left + window_right):
+                    continue
+                records.append(
+                    {
+                        "system": SYSTEM,
+                        "user": "\n".join(window_left),
+                        "reply": "\n".join(window_right),
+                        "source": f"{en.parent.name}/{en.name}#p{start}-{start + size - 1}",
+                    }
+                )
     return records
 
 
@@ -65,9 +81,16 @@ def main() -> int:
     parser.add_argument("--en", required=True, type=Path, help="directory with *.en.md chapters")
     parser.add_argument("--out", required=True, type=Path, help="JSONL to write")
     parser.add_argument("--min-chars", type=int, default=MIN_CHARS)
+    parser.add_argument(
+        "--groups",
+        metavar="SIZES",
+        default="",
+        help="comma-separated window sizes for multi-line samples, e.g. 2,3",
+    )
     args = parser.parse_args()
 
-    records = build(args.en, args.min_chars)
+    groups = tuple(int(part) for part in args.groups.split(",") if part.strip())
+    records = build(args.en, args.min_chars, groups)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as handle:
         for record in records:
