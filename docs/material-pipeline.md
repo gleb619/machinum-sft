@@ -281,8 +281,8 @@ in the article body **and** in the comment tree is classified by host:
 
 | Link host | Row | What happens |
 | --- | --- | --- |
-| `github.com`, `huggingface.co`, `habr.com` | `kind='url'`, `reason='link:<host>'`, `parent=<item url>`, `priority=<item score>` | a real frontier node: the next run extracts it like any other URL |
-| anything else (arxiv, `x.com`, a vendor blog) | `kind='hint'`, `status='hint'` | a leaf the note and `tree` can show; no recipe, so it is *never* a fetch job |
+| `github.com`, `huggingface.co`, `habr.com`, `x.com`/`twitter.com` | `kind='url'`, `reason='link:<host>'`, `parent=<item url>`, `priority=<item score>` | a real frontier node: the next run extracts it like any other URL |
+| anything else (arxiv, a vendor blog) | `kind='hint'`, `status='hint'` | a leaf the note and `tree` can show; no recipe, so it is *never* a fetch job |
 
 Both kinds hang off the item URL, so the chain is readable in both directions. `UNIQUE(kind,
 value, site)` makes a link found twice — in the body and in a comment — one node, and
@@ -418,6 +418,32 @@ lives on an earlier day is a root with the parent's id marked (`← 791966`).
 Both degrade the way every other source does: a payload with no `items`/`data`/`text` yields no
 items and the candidate is `done` — never an exception, never a failed run.
 
+**One tweet on purpose: `add` a status URL.** `x.com` and `twitter.com` are in `URL_SITES`, so
+`msft material add https://x.com/<user>/status/<id>` is an ordinary explicit read
+(`kind='url'`, priority 1.0) that goes through `extract twitter`. Three things are specific to a
+tweet:
+
+- **The item is the tweet, not the page.** The extract payload is a one-row result list
+  (`items: [{author, handle, text, time, link}]`) with a page shell at the top level whose `title`
+  is just `"X"`, so a `url` candidate reuses the same `_normalise_entry` the `search twitter` rows
+  use: permalink → `items.url`, handle → `items.author`, ISO `time` → `items.published`, text →
+  `items.summary`. A payload without `items` falls back to the generic page text.
+- **Its links are recovered from the anchors.** X wraps long URLs across lines and truncates
+  them with `…` in the rendered text ("https://" / "huggingface.co/unsloth/Qwen3." / "…"), so
+  `extract_links` finds nothing usable. The tweet's `[data-testid="tweetText"] a` hrefs are read
+  with one `webbridge send evaluate` against the tab the extract left open, accepted only when
+  `location.href` is the same status (`_same_page` — the browser is shared, so a moved tab must
+  not donate another page's links), then each `t.co` short link is resolved over plain HTTP and
+  appended to the body under `# Links`. `_record_links` then mints candidates from them like any
+  other body's links. All of it is best-effort: a dead evaluate costs a log line, never the item.
+- **`t.co` is read from the redirect page, not from a header.** Asked without a browser session
+  it answers `200` with `<noscript><META …URL=…>` plus `location.replace("https:\/\/…")` and no
+  `Location` header; a `HEAD` returns the short link itself. So `_resolve_short_link` does a
+  capped `GET` and parses the body (JS form first, then the meta/title forms).
+
+`_same_host` folds `twitter.com` onto `x.com` for the same reason: every status canonicalises to
+`x.com`, and an extract of a `twitter.com` URL legitimately comes back on the other host.
+
 **A fetch validates the payload, not the exit code.** webbridge drives one shared, stateful
 browser: an `extract` issued while the tab still sits on another page returns *that* page — its
 own `url`, `found: false`, and `text: '""'` (how the client prints an empty extraction). The first
@@ -448,9 +474,10 @@ seeds:
 ```
 
 The site is inferred from the host: `habr.com` → `habr`, `github.com` → `github`,
-`huggingface.co` → `hf`, with `www.` and subdomains accepted. **An unknown host is a config
-error** (exit 2, `no site recipe for host '…'`), never a search — there is no recipe to extract
-a page from an unknown site, and searching for a URL string finds nothing.
+`huggingface.co` → `hf`, `x.com`/`twitter.com` → `twitter`, with `www.` and subdomains accepted.
+**An unknown host is a config error** (exit 2, `no site recipe for host '…'`), never a search —
+there is no recipe to extract a page from an unknown site, and searching for a URL string finds
+nothing.
 
 Three properties make an explicit URL different from a sweep:
 

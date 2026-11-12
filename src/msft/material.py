@@ -153,7 +153,13 @@ class ConfigError(MsftError):
 # --- urls ----------------------------------------------------------------
 
 
-URL_SITES = {"habr.com": "habr", "github.com": "github", "huggingface.co": "hf"}
+URL_SITES = {
+    "habr.com": "habr",
+    "github.com": "github",
+    "huggingface.co": "hf",
+    "x.com": "twitter",
+    "twitter.com": "twitter",
+}
 
 
 def site_for_url(url: str) -> str:
@@ -1303,17 +1309,22 @@ def score_item(item: dict[str, Any], cfg: MaterialCfg, now: date_cls | None = No
 # --- the two network seams ------------------------------------------------
 
 
-def run_webbridge(argv: list[str], timeout: float) -> tuple[int, str, str]:
+def run_webbridge(
+    argv: list[str], timeout: float, json_flag: bool = True
+) -> tuple[int, str, str]:
     """Run tunnelstack's WebBridge client and return `(rc, stdout, stderr)`.
 
     Tests replace this; nothing else in the module shells out to the network. A missing client
     or a timeout is a `(rc != 0, ...)` result, not an exception: one dead site must not stop
-    the run.
+    the run. `json_flag` exists because `send` is the one subcommand without a `--json`
+    option: it always prints JSON, and passing the flag makes argparse reject the command.
     """
     script = tunnelstack_root() / "src" / "webbridge.py"
     if not script.is_file():
         return 127, "", f"webbridge client not found at {script}"
-    command = [sys.executable, str(script), *argv, "--json"]
+    command = [sys.executable, str(script), *argv]
+    if json_flag:
+        command.append("--json")
     try:
         proc = subprocess.run(
             command,
@@ -1576,6 +1587,16 @@ def items_from_payload(
         # `items`/`data` key to normalise.
         if not isinstance(payload, dict):
             return []
+        if site == "twitter":
+            # X's extract gives the focal tweet under `items` and a rendered `title: "X"` +
+            # `text: "author: … | handle: … | text: …"` at the top level. The tweet is the
+            # material, so normalise the tweet itself; the url extract's `items` is the only
+            # place the permalink and the handle survive intact.
+            raw_items = payload.get("items")
+            if isinstance(raw_items, list) and raw_items:
+                tweet = _normalise_entry("twitter", raw_items[0])
+                if tweet is not None:
+                    return [tweet]
         text = strip_html(str(payload.get("text") or ""))
         return [
             {
@@ -1784,14 +1805,24 @@ class Fetched:
     comments_error: str | None = None
 
 
-def _same_host(a: str, b: str) -> bool:
-    """`habr.com` and `m.habr.com` are the same page; `google.com` never is."""
-    left, right = a.lower(), b.lower()
+# `twitter.com` redirects every status to the same tweet on `x.com`, so an extract of one URL
+# legitimately comes back on the other host. The alias map is the canonical form; comparing
+# names directly would call the same page a stale tab.
+HOST_ALIASES = {"twitter.com": "x.com"}
+
+
+def _canonical_host(host: str) -> str:
+    """Lowercase, drop `www.`/`m.`, and fold an aliased host onto its canonical name."""
+    value = (host or "").lower()
     for prefix in ("www.", "m."):
-        if left.startswith(prefix):
-            left = left[len(prefix):]
-        if right.startswith(prefix):
-            right = right[len(prefix):]
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+    return HOST_ALIASES.get(value, value)
+
+
+def _same_host(a: str, b: str) -> bool:
+    """`habr.com` and `m.habr.com` are the same page; `x.com` and `twitter.com` too."""
+    left, right = _canonical_host(a), _canonical_host(b)
     return left == right or left.endswith("." + right) or right.endswith("." + left)
 
 
@@ -1816,6 +1847,135 @@ def _extract_error(payload: dict[str, Any], url: str) -> str | None:
     if not text.strip('"'):
         return "empty text after extraction"
     return None
+
+
+# X renders a long URL across lines and truncates it with `…`, so the tweet text cannot be
+# mined for links with a regex. The anchors behind `[data-testid="tweetText"]` carry the real
+# `href` (a `t.co` short link); one evaluate against the tab the extract just left open.
+_TWEET_LINKS_JS = (
+    "(()=>({href:location.href,links:[...document.querySelectorAll("
+    "'[data-testid=\"tweetText\"] a')].map(a=>a.href)}))()"
+)
+_SHORT_LINK_HOST = "t.co"
+_SHORT_LINK_TIMEOUT_S = 6
+_SHORT_LINK_READ = 8192
+# t.co answers a browser with a 301 but a script with a 200 and a *page* that redirects itself
+# (no Location header): `<head><noscript><META …URL=…>` plus a `location.replace("…")` script.
+# So the target is in the body, not in `response.geturl()` — measured 2026-11-12, both shapes
+# in one response.
+_SHORT_LINK_RES = (
+    re.compile(r"""location\.replace\(\s*["']([^"']+)["']"""),
+    re.compile(r"""(?i)URL=([^"'>\s]+)"""),
+    re.compile(r"""(?i)<title>\s*(https?://[^<\s]+)\s*</title>"""),
+)
+
+
+def _resolve_short_link(url: str, timeout: float = _SHORT_LINK_TIMEOUT_S) -> str | None:
+    """Resolve one `t.co` link over plain HTTP; `None` when it does not resolve.
+
+    No browser: a short link is a redirect, and spending a WebBridge call per link would
+    serialise the whole fetch behind the extension. The body is read (capped) because t.co may
+    answer 200 with the target only inside the redirect page.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": COMMENT_UA})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            final = str(response.geturl() or "")
+            if final and not _same_host(final, url):
+                return final  # a real 301 that urllib already followed
+            body = response.read(_SHORT_LINK_READ).decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    for pattern in _SHORT_LINK_RES:
+        match = pattern.search(body)
+        if match:
+            # The JS form escapes the slashes (`https:\/\/host\/path`); the HTML forms do not.
+            target = match.group(1).replace("\\/", "/").strip()
+            if target.startswith(("http://", "https://")):
+                return target
+    return None
+
+
+def _same_page(href: str, url: str) -> bool:
+    """The tab is still on *this* status: same aliased host **and** the same path.
+
+    `_same_host` alone is not enough — every tweet and every search page shares `x.com`, so a
+    tab that moved to another status would pass a host-only check and donate its links.
+    """
+    there = urllib.parse.urlsplit(href or "")
+    want = urllib.parse.urlsplit(url or "")
+    if not _same_host(there.hostname or "", want.hostname or ""):
+        return False
+    return there.path.rstrip("/") == want.path.rstrip("/")
+
+
+def _tweet_links(cfg: MaterialCfg, url: str) -> list[str]:
+    """The tweet's own outbound links, resolved and filtered; `[]` on any failure.
+
+    Best-effort by design: the tweet text is already stored, so a dead evaluate, a moved tab or
+    an unresolvable short link costs a log line, never the item.
+    """
+    rc, stdout, stderr = run_webbridge(
+        ["send", "evaluate", json.dumps({"code": _TWEET_LINKS_JS})],
+        cfg.limits.fetch_timeout_s,
+        json_flag=False,
+    )
+    answer = _loads(stdout)
+    if not isinstance(answer, dict) or answer.get("ok") is False:
+        _log(f"{url}: tweet links: evaluate failed (rc={rc}): {_tail(stderr or stdout)}")
+        return []
+    data = answer.get("data")
+    value = data.get("value") if isinstance(data, dict) else None
+    if not isinstance(value, dict):
+        _log(f"{url}: tweet links: evaluate returned no object")
+        return []
+    href = str(value.get("href") or "")
+    if not _same_page(href, url):
+        _log(f"{url}: tweet links: the tab moved to {href or '(unknown)'}")
+        return []
+    anchors = value.get("links")
+    if not isinstance(anchors, list):
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in anchors:
+        target = str(raw)
+        host = (urllib.parse.urlsplit(target).hostname or "").lower()
+        if host == _SHORT_LINK_HOST:
+            target = _resolve_short_link(target) or ""
+        link = canonical_url(target)
+        if not link or link in seen:
+            continue
+        host = (urllib.parse.urlsplit(link).hostname or "").lower()
+        host = host[4:] if host.startswith("www.") else host
+        if _same_host(host, "x.com") or host == _SHORT_LINK_HOST:
+            continue
+        seen.add(link)
+        out.append(link)
+        if len(out) >= cfg.limits.links_per_item:
+            break
+    return out
+
+
+def _fetch_tweet(cfg: MaterialCfg, entry: dict[str, Any], url: str) -> Fetched:
+    """A tweet plus the links its text cannot show.
+
+    The extract is repeated here because the tab it leaves open is the tab the anchor read
+    needs. A failed extract is not an item error: the tweet text the search (or the earlier
+    url extract) already supplied is the material, and the links are then simply absent.
+    """
+    text = str(entry.get("summary") or "")
+    payload: Any = entry.get("source")
+    rc, stdout, stderr = run_webbridge(["extract", "twitter", url], cfg.limits.fetch_timeout_s)
+    extracted = _loads(stdout)
+    if isinstance(extracted, dict) and not _extract_error(extracted, url):
+        text = str(extracted.get("text") or text)
+        payload = extracted
+    links = _tweet_links(cfg, url)
+    if links:
+        text = f"{text}\n\n# Links\n\n" + "\n".join(f"- {link}" for link in links)
+    return Fetched(text, payload, article=text)
 
 
 def _fetch_body(cfg: MaterialCfg, entry: dict[str, Any], url: str, day: str) -> Fetched:
@@ -1855,6 +2015,8 @@ def _fetch_body(cfg: MaterialCfg, entry: dict[str, Any], url: str, day: str) -> 
             result.comments_count = count
             result.body = body + block
         return result
+    if site == "twitter":
+        return _fetch_tweet(cfg, entry, url)
     if site in ("github", "hf"):
         text = _render_entry(site, entry["source"])
         return Fetched(text, entry["source"], article=text)

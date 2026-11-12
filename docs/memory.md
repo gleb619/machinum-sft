@@ -216,3 +216,20 @@ and points at a deleted sandbox).
 was removed; keep it that way, or expect a red `ci-run` that is not your bug.
 
 **`.gitignore` must not hide fixtures.** `*.pt` is ignored, `tests/fixtures/*` is tracked.
+
+## Material loop
+
+**`material add` takes a URL only on a host with a recipe.** `URL_SITES` is the allow-list
+(`habr.com`, `github.com`, `huggingface.co`, `x.com`/`twitter.com`); anything else is
+`no site recipe for host '…'` and exit 2, by design. A vendor blog is a `hint` row, not a fetch.
+
+**`t.co` answers a script with a *page*, not a redirect.** Without a browser session the short
+link returns `200` and no `Location` header: the target is only inside the body
+(`<noscript><META …URL=…>` and `location.replace("https:\/\/…")`). `HEAD` returns the short link
+itself, unchanged. `_resolve_short_link` therefore does a capped `GET` and parses the body —
+`response.geturl()` alone resolves nothing (measured 2026-11-12).
+
+**A tweet's links are not in its text.** X wraps long URLs over several lines and truncates them
+with `…`, so the rendered text yields `https://` as a "link". They are read from the
+`[data-testid="tweetText"] a` hrefs instead, and only when the tab is still on the same status —
+the browser is shared and stateful.

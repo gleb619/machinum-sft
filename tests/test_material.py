@@ -125,7 +125,9 @@ class Bridge:
         self.table = table
         self.calls: list[tuple[list[str], float]] = []
 
-    def __call__(self, argv: list[str], timeout: float) -> tuple[int, str, str]:
+    def __call__(
+        self, argv: list[str], timeout: float, json_flag: bool = True
+    ) -> tuple[int, str, str]:
         self.calls.append((list(argv), timeout))
         value = self.table.get(tuple(argv))
         if value is None:
@@ -293,6 +295,15 @@ def test_site_for_url_maps_known_hosts_and_refuses_unknown() -> None:
         material.site_for_url("https://example.com/x")
 
 
+def test_site_for_url_maps_x_and_twitter_to_twitter() -> None:
+    for url in (
+        "https://x.com/u/status/1",
+        "https://twitter.com/u/status/1",
+        "https://www.x.com/u/status/1",
+    ):
+        assert material.site_for_url(url) == "twitter"
+
+
 def test_rescore_brings_back_what_an_older_brief_threw_away(cfg: material.MaterialCfg) -> None:
     """Re-targeting the brief must reach the posts yesterday's keywords discarded."""
     url = "https://habr.com/ru/articles/424242/"
@@ -383,6 +394,13 @@ def test_extract_error_rejects_a_wrong_or_empty_page() -> None:
     # the client prints `""` for an empty extraction, and that used to pass as a body
     assert "empty text" in (material._extract_error({**ok, "text": '""'}, habr) or "")
     assert "empty text" in (material._extract_error({**ok, "text": "   \n "}, habr) or "")
+
+
+def test_same_host_aliases_x_and_twitter() -> None:
+    assert material._same_host("x.com", "twitter.com")
+    assert material._same_host("www.x.com", "twitter.com")
+    assert material._same_host("m.habr.com", "habr.com")
+    assert not material._same_host("x.com", "example.com")
 
 
 def test_fetch_body_marks_a_stale_tab_as_an_error(
@@ -1734,6 +1752,44 @@ TWEET = {
     "link": "/natfriedman/status/1234567890",
 }
 
+TWEET_URL = "https://x.com/UnslothAI/status/2120536946774769860"
+TWEET_TEXT = "Qwen3.5 8B-27B GGUF is out: https://t.co/qwen"
+TWEET_RENDERED = f"@UnslothAI: {TWEET_TEXT}"
+# One `extract twitter <status>` in the shape sites/twitter.yml returns: the focal tweet under
+# `items`, and a page shell at the top level whose `title` is just "X".
+TWEET_EXTRACT = {
+    "site": "twitter",
+    "op": "extract",
+    "url": TWEET_URL,
+    "title": "X",
+    "text": TWEET_RENDERED,
+    "count": 1,
+    "items": [
+        {
+            "author": "Unsloth AI",
+            "handle": "@UnslothAI",
+            "text": TWEET_TEXT,
+            "time": "2026-11-11T18:30:00.000Z",
+            "link": "/UnslothAI/status/2120536946774769860",
+        }
+    ],
+}
+
+
+def tweet_bridge(extract: Any, evaluate: Any):
+    """A webbridge stand-in for the two calls `_fetch_body` makes for a tweet."""
+
+    def call(
+        argv: list[str], timeout: float, json_flag: bool = True
+    ) -> tuple[int, str, str]:
+        if argv[:2] == ["extract", "twitter"]:
+            return 0, json.dumps(extract), ""
+        if argv[:2] == ["send", "evaluate"]:
+            return 0, json.dumps(evaluate), ""
+        raise AssertionError(f"unexpected webbridge call: {argv}")
+
+    return call
+
 
 def test_comments_are_appended_to_the_raw_text_and_counted(
     cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
@@ -1990,6 +2046,181 @@ def test_twitter_search_rows_parse_into_items(
     assert row["author"] == "@natfriedman", "the handle is the author, the display name is not"
     assert row["published"] == "2026-11-09T10:00:00.000Z"
     assert "QLoRA adapter" in (row["summary"] or "")
+
+
+def test_twitter_url_candidate_uses_the_focal_tweet(cfg: material.MaterialCfg) -> None:
+    cand = {"kind": "url", "site": "twitter", "value": TWEET_URL}
+    items = material.items_from_payload(TWEET_EXTRACT, cand, cfg)
+
+    assert len(items) == 1
+    item = items[0]
+    assert item["url"] == TWEET_URL, "the permalink comes from the tweet, not the page shell"
+    assert item["author"] == "@UnslothAI"
+    assert item["published"] == "2026-11-11T18:30:00.000Z"
+    assert item["summary"] == TWEET_TEXT
+    assert item["title"] != "X", "the page shell's title is not the tweet"
+
+
+def test_twitter_url_candidate_without_items_falls_back_to_the_page(
+    cfg: material.MaterialCfg,
+) -> None:
+    cand = {"kind": "url", "site": "twitter", "value": TWEET_URL}
+    items = material.items_from_payload({**TWEET_EXTRACT, "items": []}, cand, cfg)
+
+    assert len(items) == 1
+    assert items[0]["url"] == TWEET_URL
+    assert items[0]["summary"] == TWEET_RENDERED
+
+
+def test_fetch_body_twitter_appends_resolved_links_once(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evaluate = {
+        "ok": True,
+        "data": {
+            "type": "object",
+            "value": {
+                "href": TWEET_URL,
+                "links": [
+                    "https://t.co/qwen",
+                    "https://t.co/qwen",
+                    "https://x.com/UnslothAI",
+                ],
+            },
+        },
+    }
+    monkeypatch.setattr(material, "run_webbridge", tweet_bridge(TWEET_EXTRACT, evaluate))
+    resolved: list[str] = []
+
+    def fake_resolve(url: str) -> str:
+        resolved.append(url)
+        return "https://huggingface.co/unsloth/Qwen3.5-8B-GGUF"
+
+    monkeypatch.setattr(material, "_resolve_short_link", fake_resolve)
+
+    entry = {"site": "twitter", "url": TWEET_URL, "summary": TWEET_TEXT, "source": {}}
+    result = material._fetch_body(cfg, entry, TWEET_URL, DAY)
+
+    link = "https://huggingface.co/unsloth/Qwen3.5-8B-GGUF"
+    assert result.error is None
+    assert resolved == ["https://t.co/qwen", "https://t.co/qwen"], "resolve before dedupe"
+    assert result.body == TWEET_RENDERED + f"\n\n# Links\n\n- {link}", "the link appears once"
+    assert result.article == result.body, "link extraction reads `article`, not `body`"
+
+
+def test_fetch_body_twitter_survives_a_failed_evaluate(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        material, "run_webbridge", tweet_bridge(TWEET_EXTRACT, {"ok": False, "error": "no tab"})
+    )
+    monkeypatch.setattr(
+        material, "_resolve_short_link", lambda url: pytest.fail("nothing to resolve")
+    )
+
+    entry = {"site": "twitter", "url": TWEET_URL, "summary": TWEET_TEXT, "source": {}}
+    result = material._fetch_body(cfg, entry, TWEET_URL, DAY)
+
+    assert result.error is None, "the tweet text is already stored; links are best-effort"
+    assert result.body == TWEET_RENDERED
+    assert "# Links" not in result.body
+
+
+def test_tweet_links_from_a_moved_tab_are_ignored(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evaluate = {
+        "ok": True,
+        "data": {
+            "value": {
+                "href": "https://x.com/someone/status/999",
+                "links": ["https://t.co/other"],
+            }
+        },
+    }
+    monkeypatch.setattr(material, "run_webbridge", tweet_bridge(TWEET_EXTRACT, evaluate))
+    monkeypatch.setattr(
+        material,
+        "_resolve_short_link",
+        lambda url: pytest.fail("a moved tab's links must not be resolved"),
+    )
+
+    entry = {"site": "twitter", "url": TWEET_URL, "summary": TWEET_TEXT, "source": {}}
+    result = material._fetch_body(cfg, entry, TWEET_URL, DAY)
+
+    assert result.error is None
+    assert "# Links" not in result.body, "same host is not the same status"
+
+
+def test_short_link_target_is_read_from_the_redirect_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """t.co answers a script with 200 + a redirect page, not a 301 with a Location header."""
+
+    class Response:
+        def __init__(self, body: str) -> None:
+            self.body = body
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *exc: Any) -> None:
+            return None
+
+        def geturl(self) -> str:
+            return "https://t.co/qwen"
+
+        def read(self, size: int) -> bytes:
+            assert size > 0
+            return self.body.encode("utf-8")
+
+    body = (
+        '<head><noscript><META http-equiv="refresh" '
+        'content="0;URL=https://huggingface.co/unsloth/Qwen3.8-27B-GGUF"></noscript>'
+        '<title>https://huggingface.co/unsloth/Qwen3.8-27B-GGUF</title></head>'
+        '<script>window.opener = null; location.replace("https:\\/\\/huggingface.co'
+        '\\/unsloth\\/Qwen3.8-27B-GGUF")</script>'
+    )
+    seen: list[Any] = []
+    monkeypatch.setattr(
+        material.urllib.request,
+        "urlopen",
+        lambda request, timeout: seen.append(request) or Response(body),
+    )
+
+    assert (
+        material._resolve_short_link("https://t.co/qwen")
+        == "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF"
+    )
+    assert seen and seen[0].get_method() == "GET", "a HEAD gets no redirect page to read"
+
+
+def test_run_webbridge_appends_json_only_when_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "tunnelstack"
+    script = root / "src" / "webbridge.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("# stand-in\n", encoding="utf-8")
+    monkeypatch.setenv("MSFT_TUNNELSTACK", str(root))
+
+    class Done:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+
+    seen: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: Any) -> Done:
+        seen.append(list(command))
+        return Done()
+
+    monkeypatch.setattr(material.subprocess, "run", fake_run)
+    material.run_webbridge(["extract", "twitter", TWEET_URL], 5)
+    material.run_webbridge(["send", "evaluate", "{}"], 5, json_flag=False)
+
+    assert seen[0][-1] == "--json"
+    assert "--json" not in seen[1], "send has no --json option and rejects it"
 
 
 def test_grok_answer_is_one_item_with_a_stable_url(cfg: material.MaterialCfg) -> None:
