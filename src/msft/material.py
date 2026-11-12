@@ -1902,6 +1902,39 @@ def _append_experiments(cfg: MaterialCfg, day: str, entries: list[tuple[str, str
     return written
 
 
+def _reconcile_notes(
+    cfg: MaterialCfg, state: State, items: list[dict[str, Any]], day: str
+) -> tuple[int, int, list[tuple[str, str]]]:
+    """Book the notes that are actually on disk: (distilled, missing, experiments).
+
+    The agent is the slow, unreliable half of this step, and it writes its files as it goes:
+    a run killed at its timeout after nine of nine notes is a *successful* distill booked as
+    a failure, and re-running it tomorrow re-reads the same pack for nothing. The note file,
+    not the agent's exit code, is the evidence that an item was digested.
+    """
+    distilled = 0
+    missing = 0
+    experiments: list[tuple[str, str]] = []
+    for item in items:
+        slug = slugify(str(item["url"]))
+        note = cfg.notes_dir / day / f"{slug}.md"
+        if not note.is_file():
+            missing += 1
+            continue
+        front, _body = _parse_note(note)
+        state.update_item(
+            item["url"],
+            status="distilled",
+            distilled_at=_now(),
+            digest_path=cfg.display(note),
+        )
+        distilled += 1
+        proposal = _experiment(front)
+        if proposal:
+            experiments.append((slug, proposal))
+    return distilled, missing, experiments
+
+
 def distill(
     cfg: MaterialCfg,
     *,
@@ -2001,15 +2034,20 @@ def distill(
         status = str((summary or {}).get("status", "")).lower()
         ok = proc.returncode == 0 and summary is not None and status not in ("failed", "error")
         if not ok:
+            # A killed or crashed agent still writes its notes: book what landed instead of
+            # throwing a finished digest away (see `_reconcile_notes`).
+            distilled, missing, experiments = _reconcile_notes(cfg, state, items, day)
+            written = _append_experiments(cfg, day, experiments)
             return {
                 "dry_run": False,
                 "date": day,
-                "ok": False,
+                "ok": distilled > 0 and missing == 0,
+                "agent_failed": True,
                 "items": len(items),
                 "packed": len(items),
-                "distilled": 0,
-                "missing_notes": len(items),
-                "experiments": 0,
+                "distilled": distilled,
+                "missing_notes": missing,
+                "experiments": written,
                 "pack": cfg.display(pack_path),
                 "command": command,
                 "returncode": proc.returncode,
@@ -2018,26 +2056,7 @@ def distill(
                 "seconds": seconds,
             }
 
-        distilled = 0
-        missing = 0
-        experiments: list[tuple[str, str]] = []
-        for item in items:
-            slug = slugify(str(item["url"]))
-            note = cfg.notes_dir / day / f"{slug}.md"
-            if not note.is_file():
-                missing += 1
-                continue
-            front, _body = _parse_note(note)
-            state.update_item(
-                item["url"],
-                status="distilled",
-                distilled_at=_now(),
-                digest_path=cfg.display(note),
-            )
-            distilled += 1
-            proposal = _experiment(front)
-            if proposal:
-                experiments.append((slug, proposal))
+        distilled, missing, experiments = _reconcile_notes(cfg, state, items, day)
         written = _append_experiments(cfg, day, experiments)
         return {
             "dry_run": False,

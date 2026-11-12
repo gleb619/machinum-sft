@@ -418,7 +418,7 @@ silently creates a frontier hides a typo in `configs/material.yaml`), then
 | exit 2, `error: …` on stderr | config or environment: unreadable YAML, missing token, unwritable dir | `msft material status` then re-read the message; the CLI prints the offending path |
 | exit 1, `collect failed` | webbridge: site down, browser not attached, JSON garbage — **not** an empty search (zero results are a `done` candidate) | `msft material run --limit 1 --site habr` and read the candidate's `error` column |
 | `distill: skipped (collect failed)` | correct behaviour, not a bug | nothing; tomorrow's run picks the `packed` items up |
-| `at` non-zero / no summary | agent crashed, timed out, or printed no JSON | read `docs/material/pack/<date>.md`, then run `at` by hand on that file |
+| `at` non-zero / no summary | agent crashed, timed out, or printed no JSON. The note files are the evidence, not the exit code: `distill` books every note that landed, so a kill *after* the notes were written is a success with `agent_failed: true` and the items go to `distilled`. Only notes that are missing leave their item `packed` | read `docs/material/pack/<date>.md` and `docs/material/notes/<date>/`, then run `at` by hand on that file with a bigger `--timeout` |
 | items stuck `packed` for days | the agent never accepted the pack | `SELECT url, error FROM items WHERE status='packed'` |
 | `memorize` 4xx | ai-memory down, wrong workspace/project, stale token | `curl -s localhost:49374/healthz`, then `memory-stack.md` |
 | `memorize` 5xx | the wiki store refused the write; the note file is kept | re-run `memorize` after fixing the service — it is idempotent by path |

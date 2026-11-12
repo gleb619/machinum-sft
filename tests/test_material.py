@@ -882,19 +882,17 @@ def prepare_fetched(
     return cfg
 
 
-def fake_at(tmp_path: Path, *, status: str = "ok", exit_code: int = 0) -> Path:
+def fake_at(
+    tmp_path: Path, *, status: str = "ok", exit_code: int = 0, write_notes: bool = True
+) -> Path:
     """A stand-in for `at`: reads the pack, writes one note per slug, prints a JSON summary."""
     script = tmp_path / "fake-at"
-    script.write_text(
-        f"""#!/usr/bin/env python3
-import json, pathlib, sys
-pack = pathlib.Path(sys.argv[sys.argv.index("-f") + 1])
-notes = pathlib.Path({str(tmp_path / "material" / "notes")!r}) / pack.stem
-notes.mkdir(parents=True, exist_ok=True)
+    note_body = (
+        """
 slugs = [line.split(": ", 1)[1] for line in pack.read_text().splitlines()
          if line.startswith("- slug: ")]
 for slug in slugs:
-    (notes / f"{{slug}}.md").write_text(
+    (notes / f"{slug}.md").write_text(
         "---\\n"
         "title: A packed item\\n"
         "site: habr\\n"
@@ -905,6 +903,17 @@ for slug in slugs:
         "experiment: Try r=32 with completion-only loss on 200 pairs\\n"
         "---\\n\\n# A packed item\\n\\n## What it is\\n\\nA note.\\n"
     )
+"""
+        if write_notes
+        else "\nslugs = []\n"
+    )
+    script.write_text(
+        f"""#!/usr/bin/env python3
+import json, pathlib, sys
+pack = pathlib.Path(sys.argv[sys.argv.index("-f") + 1])
+notes = pathlib.Path({str(tmp_path / "material" / "notes")!r}) / pack.stem
+notes.mkdir(parents=True, exist_ok=True)
+{note_body}
 print("Now using node v22.20.0 (npm v10.9.3)")
 print(json.dumps({{"status": {status!r}, "files": len(slugs)}}))
 sys.exit({exit_code})
@@ -981,7 +990,9 @@ def test_distill_failure_keeps_items_packed(
     cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     prepare_fetched(cfg, monkeypatch)
-    monkeypatch.setenv("MSFT_AT_BIN", str(fake_at(tmp_path, status="failed", exit_code=1)))
+    monkeypatch.setenv(
+        "MSFT_AT_BIN", str(fake_at(tmp_path, status="failed", exit_code=1, write_notes=False))
+    )
 
     result = material.distill(cfg, day=DAY)
     assert result["ok"] is False
@@ -995,6 +1006,29 @@ def test_distill_failure_keeps_items_packed(
     retry = material.distill(cfg, day=DAY)
     assert retry["items"] == 1
     assert retry["distilled"] == 1
+
+
+def test_distill_books_the_notes_a_timed_out_agent_did_write(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`at` killed at its timeout after writing every note is a done digest, not a failure."""
+    prepare_fetched(cfg, monkeypatch)
+    monkeypatch.setenv(
+        "MSFT_AT_BIN", str(fake_at(tmp_path, status="failed", exit_code=1, write_notes=True))
+    )
+
+    result = material.distill(cfg, day=DAY)
+    assert result["agent_failed"] is True
+    assert result["ok"] is True, "every expected note is on disk"
+    assert result["distilled"] == 1
+    assert result["missing_notes"] == 0
+    assert result["experiments"] == 1
+    with material.State(cfg.db_path) as state:
+        items = state.items_for_date(DAY)
+    assert items[0]["status"] == "distilled"
+
+    # Nothing is left to do, so tomorrow's run does not re-pack and re-read the same page.
+    assert material.distill(cfg, day=DAY)["items"] == 0
 
 
 # --- memorize -------------------------------------------------------------

@@ -60,7 +60,10 @@ expansion:
 
 distill:
   agent: ds-code
-  timeout_ms: 900000
+  # 25 min, not 15: ds-code reads an ~88 KB pack (9 items) and writes one note per item; the
+  # nine-note run of 2026-11-12 was killed at exactly 900 s with all nine notes already on
+  # disk. Shortening this is how a good digest gets thrown away (see `_reconcile_notes`).
+  timeout_ms: 1500000
   notes_dir: notes
 
 memory:

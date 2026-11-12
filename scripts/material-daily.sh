@@ -28,10 +28,12 @@ LIMIT="${LIMIT:-6}"
 
 # Per-step budgets, seconds. These are ceilings for an unattended run, not measurements: a
 # stuck `webbridge.py` or a hung agent must not hold the lock (or the cron slot) until
-# tomorrow. They sum to 3360 s so they land inside Hermes cron's 3600 s script timeout
+# tomorrow. They sum to 3060 s so they land inside Hermes cron's 3600 s script timeout
 # (`cron.script_timeout_seconds`); the outer kill is then a backstop, not the usual end.
-T_COLLECT="${MATERIAL_TIMEOUT_COLLECT:-1800}"
-T_DISTILL="${MATERIAL_TIMEOUT_DISTILL:-1200}"
+# Distill owns the largest share on purpose: `at` is the slow step (an 88 KB pack of nine
+# items took ~15 min on 2026-11-12), and collect is a handful of searches, not half an hour.
+T_COLLECT="${MATERIAL_TIMEOUT_COLLECT:-1200}"
+T_DISTILL="${MATERIAL_TIMEOUT_DISTILL:-1500}"
 T_MEMORIZE="${MATERIAL_TIMEOUT_MEMORIZE:-300}"
 T_REPORT="${MATERIAL_TIMEOUT_REPORT:-60}"
 
