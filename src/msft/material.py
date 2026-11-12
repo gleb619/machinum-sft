@@ -57,7 +57,9 @@ DEFAULT_CONFIG_NAME = "configs/material.yaml"
 # Every site the WebBridge client has a recipe for and that this loop may drive. `twitter` is a
 # search source (one row per tweet); `grok` is a chat site, so its nodes hold *questions*, not
 # keywords, and `candidate_argv` sends them to `ask`.
-SITES = ("habr", "github", "hf", "google-ai", "deepseek", "qwen", "twitter", "grok")
+SITES = (
+    "habr", "github", "hf", "google-ai", "deepseek", "qwen", "twitter", "grok", "unsloth"
+)
 CANDIDATE_KINDS = ("query", "tag", "author", "repo", "url", "model", "note")
 ITEM_STATUSES = (
     "seen",
@@ -159,6 +161,7 @@ URL_SITES = {
     "huggingface.co": "hf",
     "x.com": "twitter",
     "twitter.com": "twitter",
+    "unsloth.ai": "unsloth",
 }
 
 
@@ -2020,6 +2023,13 @@ def _fetch_body(cfg: MaterialCfg, entry: dict[str, Any], url: str, day: str) -> 
     if site in ("github", "hf"):
         text = _render_entry(site, entry["source"])
         return Fetched(text, entry["source"], article=text)
+    source = entry.get("source")
+    if isinstance(source, dict) and str(source.get("text") or "").strip():
+        # A text-mode extract (`mode: text`, e.g. a docs site's markdown twin) puts the whole
+        # page in `text`; `entry["summary"]` is only its first 1200 chars, so using it here
+        # would silently truncate a 39 KB article to a paragraph.
+        text = str(source["text"])
+        return Fetched(text, source, article=text)
     text = str(entry.get("summary") or "")
     return Fetched(text, entry.get("source"), article=text)
 

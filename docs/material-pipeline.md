@@ -474,10 +474,15 @@ seeds:
 ```
 
 The site is inferred from the host: `habr.com` → `habr`, `github.com` → `github`,
-`huggingface.co` → `hf`, `x.com`/`twitter.com` → `twitter`, with `www.` and subdomains accepted.
-**An unknown host is a config error** (exit 2, `no site recipe for host '…'`), never a search —
-there is no recipe to extract a page from an unknown site, and searching for a URL string finds
-nothing.
+`huggingface.co` → `hf`, `x.com`/`twitter.com` → `twitter`, `unsloth.ai` → `unsloth`, with
+`www.` and subdomains accepted. **An unknown host is a config error** (exit 2, `no site recipe
+for host '…'`), never a search — there is no recipe to extract a page from an unknown site, and
+searching for a URL string finds nothing.
+
+A vendor docs site with a markdown endpoint is a `url` source like any other: the `unsloth`
+recipe reads the page's `.md` twin (`https://unsloth.ai/docs/models/qwen3.8` →
+`…/qwen3.8.md`), so the body is markdown — headings, code fences, tables — not text scraped
+out of a rendered DOM.
 
 Three properties make an explicit URL different from a sweep:
 

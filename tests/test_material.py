@@ -466,6 +466,88 @@ def test_candidate_argv_maps_url_to_extract() -> None:
     assert argv == ["extract", "habr", CANONICAL]
 
 
+# --- a vendor docs site (unsloth) ----------------------------------------
+
+UNSLOTH_PAGE = "https://unsloth.ai/docs/models/qwen3.8"
+UNSLOTH_MD = UNSLOTH_PAGE + ".md"
+UNSLOTH_BODY = """\
+# Qwen3.8 - How to Run Locally
+
+Fine-tune Qwen3.8 with LoRA on a single 24 GB GPU. The adapter fits when the base model is
+loaded in 4-bit and the sequence length stays under 4096.
+
+## Install
+
+```bash
+pip install unsloth
+```
+
+| Quant | VRAM |
+| --- | --- |
+| Q4_K_M | 17 GB |
+| Q8_0 | 30 GB |
+"""
+# The shape tunnelstack's `extract` returns for `mode: text`: the markdown twin, the H1 as
+# `title`, and the whole page in `text` (no `found` key, so it must not trip that check).
+UNSLOTH_PAYLOAD = {
+    "site": "unsloth",
+    "op": "extract",
+    "mode": "text",
+    "url": UNSLOTH_MD,
+    "title": "Qwen3.8 - How to Run Locally",
+    "text": UNSLOTH_BODY,
+    "chars": len(UNSLOTH_BODY),
+}
+
+
+def test_site_for_url_maps_unsloth_and_its_markdown_twin() -> None:
+    assert material.site_for_url(UNSLOTH_PAGE) == "unsloth"
+    assert material.site_for_url(UNSLOTH_MD) == "unsloth", "the `.md` twin is the same site"
+    assert material.site_for_url("https://www.unsloth.ai/docs") == "unsloth"
+
+
+def test_unsloth_is_a_known_seed_site(tmp_path: Path) -> None:
+    path = write_config(
+        tmp_path, seeds=[{"kind": "url", "site": "unsloth", "value": UNSLOTH_PAGE}]
+    )
+    cfg = material.load_material_config(path)
+    assert cfg.seeds[0].site == "unsloth"
+
+
+def test_items_from_payload_unsloth_text_mode_is_the_markdown_body(
+    cfg: material.MaterialCfg,
+) -> None:
+    cand = {"kind": "url", "site": "unsloth", "value": UNSLOTH_PAGE}
+    items = material.items_from_payload(UNSLOTH_PAYLOAD, cand, cfg)
+
+    assert len(items) == 1
+    item = items[0]
+    assert item["title"] == "Qwen3.8 - How to Run Locally", "the H1 is the title"
+    assert item["url"] == UNSLOTH_MD, "the item is the page the recipe actually read"
+    assert item["summary"] == material.strip_html(UNSLOTH_BODY)
+    assert "mode: text" not in item["summary"], "not the rendered key: value flattening"
+
+
+def test_extract_error_accepts_the_markdown_twin() -> None:
+    assert material._extract_error(UNSLOTH_PAYLOAD, UNSLOTH_PAGE) is None
+    empty = {**UNSLOTH_PAYLOAD, "text": ""}
+    assert "empty text" in (material._extract_error(empty, UNSLOTH_PAGE) or "")
+
+
+def test_fetch_body_keeps_the_whole_markdown_twin(cfg: material.MaterialCfg) -> None:
+    """`summary` is a 1200-char prefix; the raw file must be the whole `.md` twin."""
+    body = UNSLOTH_BODY + "\n\n" + ("LoRA adapter notes for Qwen3.8. " * 200)
+    assert len(body) > 3 * 1200
+    payload = {**UNSLOTH_PAYLOAD, "text": body, "chars": len(body)}
+    cand = {"kind": "url", "site": "unsloth", "value": UNSLOTH_PAGE}
+    item = material.items_from_payload(payload, cand, cfg)[0]
+
+    fetched = material._fetch_body(cfg, item, UNSLOTH_PAGE, DAY)
+    assert fetched.error is None
+    assert fetched.body == body
+    assert fetched.article == body
+
+
 def test_url_seed_is_ranked_before_queries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
