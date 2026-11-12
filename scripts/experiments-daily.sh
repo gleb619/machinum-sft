@@ -23,9 +23,10 @@
 # Exit codes: 0 nothing due, work done, or the box is unreachable (the line says how many are
 # queued); 1 a job actually failed; 2 config/environment (bad catalog, no CLI, lock held).
 #
-# The cron slot must be long enough for the watch: `cron.script_timeout_seconds` above
-# 21600 + 600 for a weekend drain, or the outer kill lands mid-job and the queue sees a
-# `running` row with no verdict. `tick --time-budget` is the inner ceiling.
+# The cron slot must be longer than the per-fire watch (`FIRE_CEILING_S`, 6600 s by default):
+# `cron.script_timeout_seconds` is raised to 7200 for that reason, or the outer kill lands
+# mid-watch and the queue sees a `running` row with no verdict. A weekend drain is therefore
+# several fires (every two hours), not one six-hour script.
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -126,14 +127,27 @@ fi
 # reachable, and "box unreachable: 3 queued" is exactly the fact a silent 13:00 cron would
 # otherwise hide. `report` prints the same counters offline for a human.
 BUDGET="${MSFT_EXPERIMENTS_BUDGET:-auto}"
+# The watch is capped per FIRE (one hour fifty), not by the weekday/weekend policy: a cron slot
+# is a single script run, and a laptop that sleeps mid-watch kills it. A weekend drain is many
+# bounded fires (every two hours) and the QUEUE is what makes them one continuous drain —
+# cheapest first, one job at a time. The policy still decides the budget: one job on a weekday,
+# the whole backlog at the weekend.
 TIME_ARGS=()
 if [ -n "${MSFT_EXPERIMENTS_TIME_BUDGET:-}" ]; then
   TIME_ARGS=(--time-budget "$MSFT_EXPERIMENTS_TIME_BUDGET")
+else
+  TIME_ARGS=(--time-budget "${FIRE_CEILING_S:-6600}")
 fi
 
 LINE=""
 tick_rc=0
-LINE=$("${MSFT[@]}" experiments tick --budget "$BUDGET" "${TIME_ARGS[@]}" "${PASS[@]}") || tick_rc=$?
+# `--execute` is what makes this a run instead of a plan; the dry-run flag alone must never
+# leave a cron job that quietly reports what it would have done.
+TICK_ARGS=(--budget "$BUDGET" "${TIME_ARGS[@]}" "${PASS[@]}")
+if [ "$DRY_RUN" -eq 0 ]; then
+  TICK_ARGS+=(--execute)
+fi
+LINE=$("${MSFT[@]}" experiments tick "${TICK_ARGS[@]}") || tick_rc=$?
 
 if [ -z "$LINE" ]; then
   report_rc=0

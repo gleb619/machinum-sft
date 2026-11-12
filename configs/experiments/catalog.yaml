@@ -25,6 +25,10 @@
 # served model, not a box job.
 
 recipes:
+  # The fallback: queued once per day when no note proposed a runnable recipe, so the daily job
+  # is never a silent no-op. It must stay the cheapest row in the file — its whole job is to
+  # prove the path still works, not to learn anything.
+  #
   # data build reads data/raw and writes the split; the 2026-11-08 run logged it under 5 s.
   # 5 s / 60 = 0.08 -> 0.1. Cheapest row in the menu, so it drains a weekend first.
   data-build:
@@ -81,3 +85,7 @@ recipes:
     config: configs/qwen3.5-4b-lora.yaml
     est_minutes: 3.0
     what: the cheapest 4B train that still produces a judgeable adapter
+
+# Queued once per day when the day's notes produced no runnable proposal, so the daily job is
+# never a silent no-op. Must name a recipe above.
+fallback: data-build

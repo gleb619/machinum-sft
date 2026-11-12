@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status, est_minutes, created_at);
 """
 
-_TOP_KEYS = ("recipes",)
+_TOP_KEYS = ("recipes", "fallback")
 _RECIPE_KEYS = ("kind", "config", "args", "est_minutes", "what")
 _RELATIVE_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 _SECTION_RE = re.compile(r"(?m)^##\s+\S+\s+·\s+`([^`]+)`\s*$")
@@ -192,6 +192,8 @@ class ExperimentsCfg:
     recipes: dict[str, Recipe]
     material_dir: Path
     repo: Path
+    #: The cheapest known-good recipe used on a day whose notes proposed nothing runnable.
+    fallback: str | None = None
 
     @property
     def db_path(self) -> Path:
@@ -279,11 +281,18 @@ def load_catalog(
             what=_as_str(raw, "what", where),
             args=_as_args(raw, where),
         )
+    fallback = data.get("fallback")
+    if fallback is not None:
+        if not isinstance(fallback, str) or fallback not in recipes:
+            raise CatalogError(
+                f"{p}: 'fallback' must name one of the recipes above, got {fallback!r}"
+            )
     return ExperimentsCfg(
         path=p,
         recipes=recipes,
         material_dir=material_dir(),
         repo=Path(repo) if repo is not None else REPO_ROOT,
+        fallback=str(fallback) if fallback is not None else None,
     )
 
 
@@ -502,7 +511,6 @@ def sync(cfg: ExperimentsCfg, day: str | None = None, dry_run: bool = False) -> 
     notes = sorted(folder.glob("*.md")) if folder.is_dir() else []
     if not notes:
         _log(f"sync: no notes under {cfg.notes_dir / chosen}")
-        return counters
     prose = _prose_hypotheses(cfg.material_dir / "experiments.md")
     pending: list[dict[str, Any]] = []
     for note in notes:
@@ -531,6 +539,26 @@ def sync(cfg: ExperimentsCfg, day: str | None = None, dry_run: bool = False) -> 
                 "hypothesis": _hypothesis(block, prose, slug, front),
             }
         )
+
+    if not pending and cfg.fallback:
+        # A day whose notes proposed nothing runnable must not become a silent no-op — that is
+        # the failure this queue exists to end. The fallback is the cheapest known-good recipe,
+        # queued once per day (`fallback:<day>`), and its origin says plainly that no note asked
+        # for it, so the report cannot be mistaken for a research finding.
+        recipe = cfg.recipes[cfg.fallback]
+        pending.append(
+            {
+                "origin": f"fallback:{chosen}",
+                "recipe": recipe.name,
+                "kind": recipe.kind,
+                "config": recipe.config,
+                "args": list(recipe.args),
+                "est_minutes": recipe.est_minutes,
+                "hypothesis": "no note proposed a runnable recipe; the cheapest known-good run",
+            }
+        )
+        counters["fallback"] = 1
+        _log(f"sync: nothing runnable in {chosen}; falling back to {recipe.name}")
 
     if dry_run:
         seen = _pairs_readonly(cfg.db_path)

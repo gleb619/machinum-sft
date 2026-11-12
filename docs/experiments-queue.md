@@ -51,6 +51,12 @@ experiment_job:
 the note stays readable, and the queue only ever holds things the repository already knows
 how to run.
 
+A day whose notes proposed nothing runnable is not allowed to become a silent no-op — that is
+the failure this queue exists to end. The catalog's top-level `fallback:` names the cheapest
+known-good recipe, queued **once per day** with `origin: fallback:<day>`; its row says in
+`origin` and `hypothesis` that no note asked for it, so a report can never read it as a research
+finding. Remove the key and an empty day stays empty.
+
 ## Why the catalog is an allow-list
 
 A queue that accepts free-form jobs is a queue a model can point at a 12B training run. The
@@ -197,7 +203,10 @@ What it guarantees:
   failed, exit 2 for config/environment. That keeps the DM quiet on a green day and honest on
   a red one.
 
-Wiring, next to the material job (18:00 local, after the research loop has had the day):
+Wiring: TWO jobs, because the budget differs by day and a cron expression cannot say one thing
+on Tuesday and another on Saturday. Both run the same script; the script's `--budget auto`
+resolves the policy (one job Monday–Friday, the whole backlog at the weekend), so the two jobs
+differ only in when they fire.
 
 ```bash
 # ~/.hermes/scripts/experiments-daily.sh
@@ -205,24 +214,29 @@ exec bash /home/boris/WORKSPACE/machinum-sft/scripts/experiments-daily.sh "$@"
 ```
 
 ```bash
-hermes cron create '0 18 * * *' \
-  --name machinum-experiments-daily \
-  --workdir /home/boris/WORKSPACE/machinum-sft \
-  --script experiments-daily.sh \
-  --no-agent \
-  --deliver 'telegram:Boris Velichko (dm)'
+# weekdays, after the 13:00 research loop has produced the day's notes
+hermes cron create '0 15 * * 1-5' --name machinum-experiments-daily \
+  --workdir /home/boris/WORKSPACE/machinum-sft --script experiments-daily.sh \
+  --no-agent --deliver 'telegram:Boris Velichko (dm)'
+
+# Saturday + Sunday, every two hours: each fire drains the backlog for up to ~110 min
+hermes cron create '0 8-22/2 * * 6,0' --name machinum-experiments-weekend \
+  --workdir /home/boris/WORKSPACE/machinum-sft --script experiments-daily.sh \
+  --no-agent --deliver 'telegram:Boris Velichko (dm)'
 ```
 
 Plain crontab equivalent:
 
 ```cron
-0 18 * * * cd /home/boris/WORKSPACE/machinum-sft && scripts/experiments-daily.sh 2>>$HOME/.local/state/experiments-daily.err.log
+0 15 * * 1-5    cd /home/boris/WORKSPACE/machinum-sft && scripts/experiments-daily.sh 2>>$HOME/.local/state/experiments-daily.err.log
+0 8-22/2 * * 6,0 cd /home/boris/WORKSPACE/machinum-sft && scripts/experiments-daily.sh 2>>$HOME/.local/state/experiments-daily.err.log
 ```
 
-**Raise the script timeout before trusting a weekend.** Hermes cron's
-`cron.script_timeout_seconds` defaults to 3600 s, and a weekend drain may watch a job for
-21 600 s; the outer kill would land mid-job and leave a `running` row the next tick has to
-reap. Set the timeout above `21600 + 600`, or run the weekend drain by hand.
+**The weekend drain is many bounded fires, not one long script.** The per-fire watch is
+`FIRE_CEILING_S` (6600 s), and `cron.script_timeout_seconds` must sit above it — 7200 — or the
+outer kill lands mid-watch and leaves a `running` row the next tick has to reap. A single
+six-hour script would also die with the laptop; a queue plus an every-two-hour fire resumes by
+itself. `flock -n` makes a fire that overlaps the previous one exit 0 immediately.
 
 Environment overrides (the CLI reads them itself; the script only forwards the two paths):
 
@@ -230,8 +244,8 @@ Environment overrides (the CLI reads them itself; the script only forwards the t
 | --- | --- |
 | `MSFT_MATERIAL_DIR` | `<repo>/docs/material` |
 | `MSFT_EXPERIMENTS_CATALOG` | `<repo>/configs/experiments/catalog.yaml` |
-| `MSFT_EXPERIMENTS_BUDGET` | `auto` (weekday/weekend rule) |
-| `MSFT_EXPERIMENTS_TIME_BUDGET` | 5400 weekday / 21600 weekend |
+| `MSFT_EXPERIMENTS_BUDGET` | `auto` (weekday: one job · weekend: drain) |
+| `MSFT_EXPERIMENTS_TIME_BUDGET` | `FIRE_CEILING_S`, 6600 s per fire |
 | `MSFT_REMOTE_HOST`, `MSFT_REMOTE_DIR` | from `configs/worker.local.yaml` |
 
 ## When a run is red

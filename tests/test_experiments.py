@@ -333,6 +333,45 @@ def test_sync_with_no_notes_is_empty_not_an_error(cfg: experiments.ExperimentsCf
     assert counters["queued"] == 0
 
 
+def test_sync_falls_back_to_the_cheapest_recipe_once_per_day(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A day whose notes proposed nothing runnable must not be a silent no-op."""
+    data = copy.deepcopy(CATALOG)
+    data["fallback"] = "cheap"
+    monkeypatch.setenv("MSFT_MATERIAL_DIR", str(tmp_path / "material"))
+    cfg = experiments.load_catalog(write_catalog(tmp_path, data), repo=repo)
+    assert cfg.fallback == "cheap"
+
+    first = experiments.sync(cfg, day=DAY)
+    assert first["queued"] == 1
+    assert first["fallback"] == 1
+    rows = experiments.list_jobs(cfg=cfg)
+    assert [(row["recipe"], row["origin"]) for row in rows] == [("cheap", f"fallback:{DAY}")]
+
+    # Once per day, not once per sync: the cron fires the script, and a retry must be free.
+    second = experiments.sync(cfg, day=DAY)
+    assert second["queued"] == 0
+    assert second["duplicates"] == 1
+    assert len(experiments.list_jobs(cfg=cfg)) == 1
+
+
+def test_a_catalog_without_a_fallback_queues_nothing(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MSFT_MATERIAL_DIR", str(tmp_path / "material"))
+    cfg = experiments.load_catalog(write_catalog(tmp_path), repo=repo)
+    assert cfg.fallback is None
+    assert experiments.sync(cfg, day=DAY)["queued"] == 0
+
+
+def test_a_fallback_naming_an_unknown_recipe_is_a_catalog_error(tmp_path: Path) -> None:
+    data = copy.deepcopy(CATALOG)
+    data["fallback"] = "nope"
+    with pytest.raises(CatalogError, match="fallback"):
+        experiments.load_catalog(write_catalog(tmp_path, data))
+
+
 # --- the budget rule ------------------------------------------------------
 
 
