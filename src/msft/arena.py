@@ -38,6 +38,17 @@ DEFAULT_TIMEOUT_S = 300.0
 MAX_JUDGE_CHARS = 6000
 NOISE_CASES = 30
 
+#: The columns the leaders table ranks one model per axis on. Never summed, never weighted.
+LEADER_AXES = (
+    "schema_validity",
+    "contract",
+    "chrf",
+    "glossary",
+    "judge_fidelity",
+    "judge_fluency",
+    "speed_index",
+)
+
 JUDGE_SYSTEM = (
     "You rate a translation from English into Russian. "
     "Score fidelity from 1 (meaning lost) to 5 (meaning preserved) and fluency from "
@@ -48,7 +59,13 @@ JUDGE_SYSTEM = (
 
 @dataclass(frozen=True)
 class Case:
-    """One arena case, resolved from a JSONL record or an ad-hoc prompt."""
+    """One arena case, resolved from a JSONL record or an ad-hoc prompt.
+
+    ``task`` and ``expect`` are the instruction half of the case: ``task`` labels what was
+    asked for (``summarize``, ``ner``, ``proofread``, ``translate``) so the leaderboard can be
+    split by it, and ``expect`` describes the output shape the instruction demanded. A case
+    with no ``expect`` has no contract to break and is left out of the contract mean.
+    """
 
     case: str
     prompt: str
@@ -58,6 +75,8 @@ class Case:
     terms: list[dict[str, str]] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     error: str | None = None
+    task: str | None = None
+    expect: dict[str, Any] | None = None
 
 
 def _log(message: str) -> None:
@@ -134,6 +153,49 @@ def _expected_lines(value: object) -> int | None:
     return value
 
 
+def _task(value: object) -> str | None:
+    """The task label as written; the canonical four are summarize, ner, proofread, translate.
+
+    Any other non-empty string is kept as its own label instead of being rejected: a case file
+    may need a fifth task, and silently dropping the label would hide it from the per-task
+    breakdown rather than let it show up there.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def _expect(value: object) -> dict[str, Any] | None:
+    """A normalised ``expect`` object, or None when the record carries no usable one.
+
+    Only the fields the contract scorer reads are kept, and their types are checked here
+    rather than at scoring time: ``str(a_list)`` inside a violation message is less useful than
+    a rule that never sees the bad value. An unknown ``format`` is kept on purpose, so the
+    scorer reports it as a violation instead of the loader silently making the case untested.
+    """
+    if not isinstance(value, dict):
+        return None
+    fmt = value.get("format")
+    if not isinstance(fmt, str) or not fmt.strip():
+        return None
+    expect: dict[str, Any] = {"format": fmt.strip()}
+    keys = value.get("keys")
+    if isinstance(keys, list):
+        kept = [key for key in keys if isinstance(key, str) and key]
+        if kept:
+            expect["keys"] = kept
+    for name in ("bullets_min", "pairs_min"):
+        number = value.get(name)
+        if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
+            expect[name] = number
+    if value.get("unchanged") is True:
+        expect["unchanged"] = True
+    unchanged_line = value.get("unchanged_line")
+    if isinstance(unchanged_line, str) and unchanged_line:
+        expect["unchanged_line"] = unchanged_line
+    return expect
+
+
 def _case_from_record(record: dict[str, Any], index: int) -> Case:
     """One JSONL record as a `Case`; a missing prompt becomes an error case."""
     name = str(record.get("case") or f"case {index}")
@@ -159,6 +221,8 @@ def _case_from_record(record: dict[str, Any], index: int) -> Case:
         expected_lines=_expected_lines(record.get("expected_lines")),
         terms=_terms(record.get("terms")),
         tags=_tags(record.get("tags")),
+        task=_task(record.get("task")),
+        expect=_expect(record.get("expect")),
     )
 
 
@@ -301,6 +365,18 @@ def _row_metrics(reply: str, case: Case) -> dict[str, Any]:
     return row
 
 
+def _row_contract(reply: str, case: Case) -> dict[str, Any]:
+    """The per-reply contract score and its violations, or nothing when the case has no `expect`.
+
+    Nothing rather than a zero: a case that never asked for a shape cannot be failed on one,
+    and ``score`` only averages the cases that carry an ``expect``.
+    """
+    value, violations = metrics.contract(reply, case.expect)
+    if value is None:
+        return {}
+    return {"contract": value, "contract_violations": violations}
+
+
 def run_model(
     url: str,
     model: str,
@@ -316,6 +392,8 @@ def run_model(
     rows: list[dict[str, Any]] = []
     for case in cases:
         row: dict[str, Any] = {"case": case.case, "prompt_logged": case.prompt}
+        if case.task is not None:
+            row["task"] = case.task
         if case.expected_lines is not None:
             row["expected_lines"] = case.expected_lines
         if case.reference is not None:
@@ -334,6 +412,7 @@ def run_model(
             continue
         row["reply"] = reply
         row["metrics"] = _row_metrics(reply, case)
+        row.update(_row_contract(reply, case))
         row["timing"] = _timing(data)
         thinking = _thinking(data)
         if thinking is not None:
@@ -448,6 +527,55 @@ def _passes_gates(row: dict[str, Any], index: int) -> bool:
     return bool(applicable) and all(applicable)
 
 
+def _contract_score(row: dict[str, Any]) -> float:
+    """One row's contract score; an unanswered case with an `expect` counts as 0.0.
+
+    Not skipped: a case that asked for a shape and got no reply at all is the worst possible
+    compliance, and leaving it out would let a model that dropped half the cases look exact.
+    """
+    value = row.get("contract")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return round(float(value), 4)
+
+
+def _task_stats(rows: list[dict[str, Any]], cases: list[Case]) -> dict[str, dict[str, Any]]:
+    """Per-task contract and chrF means, so bullets-best and translation-worst share a table.
+
+    The keys are the case records' ``task`` labels; cases without one are absent here rather
+    than lumped into an ``unknown`` bucket that would hide which label was forgotten.
+    """
+    by_case = {str(row.get("case")): row for row in rows}
+    totals: dict[str, dict[str, Any]] = {}
+    for case in cases:
+        if case.task is None:
+            continue
+        bucket = totals.setdefault(
+            case.task, {"n": 0, "answered": 0, "contract": [], "chrf": []}
+        )
+        row = by_case.get(case.case, {})
+        bucket["n"] += 1
+        if isinstance(row.get("reply"), str):
+            bucket["answered"] += 1
+        if case.expect is not None:
+            bucket["contract"].append(_contract_score(row))
+        if case.reference:
+            reply = row.get("reply")
+            text = reply if isinstance(reply, str) else ""
+            bucket["chrf"].append(metrics.chrf(text, case.reference))
+    return {
+        task: {
+            "n": bucket["n"],
+            "answered": bucket["answered"],
+            "n_contract": len(bucket["contract"]),
+            "contract": _mean(bucket["contract"]),
+            "n_ref": len(bucket["chrf"]),
+            "chrf": _mean(bucket["chrf"]),
+        }
+        for task, bucket in totals.items()
+    }
+
+
 def score(
     replies: dict[str, list[dict[str, Any]]], cases: list[Case]
 ) -> dict[str, dict[str, Any]]:
@@ -480,6 +608,12 @@ def score(
             hits = metrics.glossary_hits(text, case.terms)
             glossary_values.append(hits if hits is not None else 0.0)
 
+        contract_values = [
+            _contract_score(by_case.get(case.case, {}))
+            for case in cases
+            if case.expect is not None
+        ]
+
         scripts = [
             row["metrics"]["script"]
             for row in rows
@@ -497,10 +631,18 @@ def score(
             if isinstance(row.get("timing"), dict)
             and row["timing"].get("load_ms") is not None
         ]
+        latencies = [
+            row["timing"]["total_ms"] / 1000.0
+            for row in rows
+            if isinstance(row.get("timing"), dict)
+            and row["timing"].get("total_ms") is not None
+        ]
         result[model] = {
             "answered": answered,
             "total": len(rows),
             "schema_validity": round(passed / len(rows), 4) if rows else 0.0,
+            "contract": _mean(contract_values),
+            "n_contract": len(contract_values),
             "chrf": _mean(chrf_values),
             "bleu": metrics.bleu(hypotheses, references) if referenced else None,
             "glossary": _mean(glossary_values),
@@ -510,8 +652,24 @@ def score(
             "source_leak": sum(int(item["source_leak_lines"]) for item in scripts),
             "cyr_ratio": _mean([float(item["cyrillic_ratio"]) for item in scripts]),
             "tokens_per_s": _mean([float(value) for value in rates]),
+            "p50_reply_s": round(statistics.median(latencies), 2) if latencies else None,
+            "worst_reply_s": round(max(latencies), 2) if latencies else None,
             "load_s": _mean(loads),
+            "tasks": _task_stats(rows, cases),
         }
+
+    # speed_index is relative to this run, so it can only be computed once every model has a
+    # rate: 1.0 is the fastest model here, and the rest is a linear share of that.
+    fastest = max(
+        (stat["tokens_per_s"] for stat in result.values() if stat["tokens_per_s"]), default=None
+    )
+    for stat in result.values():
+        rate = stat["tokens_per_s"]
+        stat["speed_index"] = (
+            round(float(rate) / float(fastest), 4)
+            if fastest and rate is not None
+            else None
+        )
     return result
 
 
@@ -525,6 +683,33 @@ def _judge_stats(judge_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         bucket["fidelity"].append(float(row["fidelity"]))
         bucket["fluency"].append(float(row["fluency"]))
     return stats
+
+
+def _leaders(rows: list[dict[str, Any]]) -> dict[str, str]:
+    """The model that leads each axis, one axis at a time.
+
+    A self-judged model is skipped on the judge axes for the same reason its judge mean is
+    excluded from the ranking: a model grading itself is not evidence. Ties break on the model
+    name so two identical runs print the same table, and an axis no model has a value on is
+    simply absent rather than filled with a default.
+    """
+    leaders: dict[str, str] = {}
+    for axis in LEADER_AXES:
+        best: tuple[float, str] | None = None
+        for row in rows:
+            if axis.startswith("judge_") and row.get("judge_star"):
+                continue
+            value = row.get(axis)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            candidate = (float(value), str(row["model"]))
+            if best is None or candidate[0] > best[0] or (
+                candidate[0] == best[0] and candidate[1] < best[1]
+            ):
+                best = candidate
+        if best is not None:
+            leaders[axis] = best[1]
+    return leaders
 
 
 def _near_leader(
@@ -560,8 +745,16 @@ def leaderboard(
     judge_rows: list[dict[str, Any]],
     *,
     self_judge: str | None,
+    rank_by: str | None = None,
 ) -> dict[str, Any]:
-    """The sortable table plus the honesty notes; never a single composite score."""
+    """The sortable table plus the honesty notes; never a single composite score.
+
+    `rank_by` names ONE axis (any column the leaders table ranks plus `tok_per_s`/`answered`)
+    and re-sorts the table by it alone. It exists because "which model is best" is four
+    different questions now — the default order prefers a protocol-clean reply, but a user who
+    cares about throughput must be able to ask for the fastest model without a weighted sum
+    inventing a winner.
+    """
     stats = score(replies, cases)
     judged = _judge_stats(judge_rows)
     n_ref = sum(1 for case in cases if case.reference)
@@ -592,22 +785,41 @@ def leaderboard(
         )
 
     if n_ref:
-        sort_key = "schema_validity, then chrF"
-
-        def order(row: dict[str, Any]) -> tuple[float, float, str]:
-            return (-row["schema_validity"], -(row["chrf"] or 0.0), row["model"])
-
+        # With cases that carry an `expect`, format compliance outranks translation similarity:
+        # an unusable shape is a retry in the pipeline, a two-point chrF gap may be noise.
+        if any(case.expect is not None for case in cases):
+            sort_key = "schema_validity, then contract, then chrF"
+            fields = ("schema_validity", "contract", "chrf")
+        else:
+            sort_key = "schema_validity, then chrF"
+            fields = ("schema_validity", "chrf")
     elif judge_rows:
         sort_key = "schema_validity, then judge mean"
-
-        def order(row: dict[str, Any]) -> tuple[float, float, str]:
-            return (-row["schema_validity"], -(row["judge_mean"] or 0.0), row["model"])
-
+        fields = ("schema_validity", "judge_mean")
     else:
         sort_key = "answered"
+        fields = ("answered",)
 
-        def order(row: dict[str, Any]) -> tuple[float, str]:
-            return (-row["answered"], row["model"])
+    if rank_by is not None:
+        axis = str(rank_by).strip()
+        allowed = {*LEADER_AXES, "tok_per_s", "answered", "p50_reply_s"}
+        if axis not in allowed:
+            raise MsftError(
+                f"unknown --rank-by {rank_by!r}: pick one of {', '.join(sorted(allowed))}"
+            )
+        # `p50_reply_s` is a latency, so a smaller number wins; every other axis is a score.
+        ascending = axis == "p50_reply_s"
+        fields = (axis,)
+        sort_key = f"requested: {axis}{' (lowest first)' if ascending else ''}"
+    else:
+        ascending = False
+
+    def order(row: dict[str, Any]) -> tuple[Any, ...]:
+        """Descending on the sort fields, then the model name so ties are reproducible."""
+        ranked = tuple(
+            (row.get(name) or 0.0) if ascending else -(row.get(name) or 0.0) for name in fields
+        )
+        return ranked + (row["model"],)
 
     rows.sort(key=order)
     leader = rows[0]["model"] if rows else None
@@ -652,12 +864,37 @@ def leaderboard(
     notes.append(
         "tok/s is eval tokens per eval second; model load time is excluded and sits in `load s`"
     )
+    if any(case.expect is not None for case in cases):
+        notes.append(
+            "`contract` is the mean over the cases that carry an `expect`; a case without one "
+            "is left out of the mean, never scored 0, and an unanswered contract case is 0"
+        )
+    if any(case.task is not None for case in cases):
+        notes.append(
+            "`tasks` in this payload and the per-task table in the markdown split the same "
+            "means by the case's `task` label"
+        )
+    if any(row["speed_index"] is not None for row in rows):
+        notes.append(
+            "`speed_index` = tok/s ÷ the fastest model's tok/s in THIS run: 1.0 is this run's "
+            "fastest, so it is a share, not a rate, and it is never averaged with quality"
+        )
+    leaders = _leaders(rows)
+    if leaders:
+        notes.append(
+            "`leaders` names one model per axis; the axes are not comparable to each other "
+            "and no axis sums them"
+        )
+    else:
+        notes.append("`leaders` is empty: no axis had a value to rank")
     return {
         "models": models,
         "cases": len(cases),
         "n_ref": n_ref,
+        "n_contract": sum(1 for case in cases if case.expect is not None),
         "sort_key": sort_key,
         "leader": leader,
+        "leaders": leaders,
         "self_judge": self_judge,
         "judge_ran": bool(judge_rows),
         "rows": rows,
@@ -671,6 +908,78 @@ def leaderboard(
 def _format_optional(value: float | None, digits: int) -> str:
     """A formatted number or `-` when the column does not apply."""
     return "-" if value is None else f"{value:.{digits}f}"
+
+
+#: Decimals per axis in the leaders table: the columns have different natural precision.
+_AXIS_DIGITS = {
+    "schema_validity": 3,
+    "contract": 3,
+    "chrf": 1,
+    "glossary": 2,
+    "judge_fidelity": 2,
+    "judge_fluency": 2,
+    "speed_index": 3,
+}
+
+
+def _leaders_table(board: dict[str, Any]) -> list[str]:
+    """The `axis | model | value` table, or nothing when no axis had a value.
+
+    It sits above the model table because it answers the question the model table cannot: not
+    "which model is best" but "which model leads this one axis". The heading says out loud that
+    the axes are not comparable, since a 1.000 on `speed_index` and a 1.000 on `schema_validity`
+    are shares of two unrelated denominators.
+    """
+    leaders = board.get("leaders") or {}
+    if not leaders:
+        return []
+    by_model = {row["model"]: row for row in board["rows"]}
+    lines = [
+        "who leads on each axis — the axes are not comparable to each other:",
+        "",
+        "| axis | model | value |",
+        "| --- | --- | --- |",
+    ]
+    for axis, model in leaders.items():
+        value = by_model.get(model, {}).get(axis)
+        digits = _AXIS_DIGITS.get(axis, 3)
+        lines.append(f"| {axis} | {model} | {_format_optional(value, digits)} |")
+    lines.append("")
+    return lines
+
+
+def _task_table(board: dict[str, Any]) -> list[str]:
+    """The per-task breakdown: the same model can top bullets and trail translation."""
+    labels = sorted({task for row in board["rows"] for task in (row.get("tasks") or {})})
+    if not labels:
+        return []
+    lines = [
+        "per task — the same means split by each case's `task` label:",
+        "",
+        "| model | task | answered n/m | contract | chrF |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for row in board["rows"]:
+        stats = row.get("tasks") or {}
+        for task in labels:
+            stat = stats.get(task)
+            if stat is None:
+                continue
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        row["model"],
+                        f"{task} ({stat['n']})",
+                        f"{stat['answered']}/{stat['n']}",
+                        _format_optional(stat["contract"], 3),
+                        _format_optional(stat["chrf"], 1),
+                    ]
+                )
+                + " |"
+            )
+    lines.append("")
+    return lines
 
 
 def _note_cell(row: dict[str, Any], leader: str | None) -> str:
@@ -688,6 +997,7 @@ def _note_cell(row: dict[str, Any], leader: str | None) -> str:
 def format_report(board: dict[str, Any]) -> str:
     """The markdown table plus the notes that keep it honest."""
     n_ref = board["n_ref"]
+    n_contract = board.get("n_contract", 0)
     judged_total = sum(int(row["judged"]) for row in board["rows"])
     if board["judge_ran"]:
         judge_header = f"judge f/f (judged {judged_total})"
@@ -697,6 +1007,7 @@ def format_report(board: dict[str, Any]) -> str:
         "model",
         "answered n/m",
         "schema_validity",
+        f"contract ({n_contract})",
         f"chrF ({n_ref})",
         f"BLEU ({n_ref})",
         "glossary",
@@ -705,15 +1016,20 @@ def format_report(board: dict[str, Any]) -> str:
         "source_leak",
         "cyr_ratio",
         "tok/s",
+        "speed_index",
+        "p50 s",
+        "worst s",
         "load s",
         "note",
     ]
-    lines = [
-        f"arena leaderboard — sorted by {board['sort_key']}",
-        "",
-        "| " + " | ".join(header) + " |",
-        "| " + " | ".join("---" for _ in header) + " |",
-    ]
+    lines = [f"arena leaderboard — sorted by {board['sort_key']}", ""]
+    lines.extend(_leaders_table(board))
+    lines.extend(
+        [
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join("---" for _ in header) + " |",
+        ]
+    )
     for row in board["rows"]:
         if board["judge_ran"] and row["judged"]:
             star = "*" if row["judge_star"] else ""
@@ -731,6 +1047,7 @@ def format_report(board: dict[str, Any]) -> str:
                     row["model"],
                     f"{row['answered']}/{row['total']}",
                     f"{row['schema_validity']:.3f}",
+                    _format_optional(row["contract"], 3),
                     _format_optional(row["chrf"], 1),
                     _format_optional(row["bleu"], 1),
                     _format_optional(row["glossary"], 2),
@@ -739,15 +1056,41 @@ def format_report(board: dict[str, Any]) -> str:
                     str(row["source_leak"]),
                     _format_optional(row["cyr_ratio"], 2),
                     _format_optional(row["tokens_per_s"], 1),
+                    _format_optional(row["speed_index"], 3),
+                    _format_optional(row["p50_reply_s"], 2),
+                    _format_optional(row["worst_reply_s"], 2),
                     _format_optional(row["load_s"], 2),
                     _note_cell(row, board["leader"]),
                 ]
             )
             + " |"
         )
-    lines.extend(["", "notes:"])
+    lines.append("")
+    lines.extend(_task_table(board))
+    lines.extend(["notes:"])
     lines.extend(f"- {note}" for note in board["notes"])
     return redact("\n".join(lines))
+
+
+def _plan(
+    url: str, models: list[str], cases: list[Case], judge: str | None, out: Path
+) -> dict[str, Any]:
+    """What a real run would spend, without touching the endpoint."""
+    usable = sum(1 for case in cases if case.error is None)
+    return {
+        "dry_run": True,
+        "endpoint": redact(url),
+        "models": models,
+        "judge": judge,
+        "cases": len(cases),
+        "error_cases": len(cases) - usable,
+        "contract_cases": sum(1 for case in cases if case.expect is not None),
+        "tasks": sorted({case.task for case in cases if case.task is not None}),
+        "candidate_requests": usable * len(models),
+        "judge_calls": usable * len(models) if judge else 0,
+        "out": str(out),
+        "ok": True,
+    }
 
 
 def format_plan(plan: dict[str, Any]) -> str:
@@ -757,6 +1100,8 @@ def format_plan(plan: dict[str, Any]) -> str:
         f"  endpoint: {plan['endpoint']}",
         f"  models: {', '.join(plan['models']) or '-'} ({len(plan['models'])})",
         f"  cases: {plan['cases']} (unusable: {plan['error_cases']})",
+        f"  contract cases: {plan.get('contract_cases', 0)}",
+        f"  tasks: {', '.join(plan.get('tasks') or []) or '-'}",
         f"  candidate requests: {plan['candidate_requests']}",
         f"  judge calls: {plan['judge_calls']}",
         f"  out: {plan['out']}",
@@ -779,6 +1124,10 @@ def _case_record(case: Case) -> dict[str, Any]:
         "prompt": case.prompt,
         "source": case.source,
     }
+    if case.task is not None:
+        record["task"] = case.task
+    if case.expect is not None:
+        record["expect"] = case.expect
     if case.reference is not None:
         record["reference"] = case.reference
     if case.expected_lines is not None:
@@ -835,25 +1184,6 @@ def _default_out() -> Path:
     return Path("out") / "arena" / stamp
 
 
-def _plan(
-    url: str, models: list[str], cases: list[Case], judge: str | None, out: Path
-) -> dict[str, Any]:
-    """What a real run would spend, without touching the endpoint."""
-    usable = sum(1 for case in cases if case.error is None)
-    return {
-        "dry_run": True,
-        "endpoint": redact(url),
-        "models": models,
-        "judge": judge,
-        "cases": len(cases),
-        "error_cases": len(cases) - usable,
-        "candidate_requests": usable * len(models),
-        "judge_calls": usable * len(models) if judge else 0,
-        "out": str(out),
-        "ok": True,
-    }
-
-
 def run(
     *,
     endpoint: str | None = None,
@@ -868,6 +1198,7 @@ def run(
     timeout: float = DEFAULT_TIMEOUT_S,
     out: Path | str | None = None,
     dry_run: bool = False,
+    rank_by: str | None = None,
 ) -> dict[str, Any]:
     """Preflight, run every candidate, judge once, write the artifacts; never raises on a row."""
     url = resolve_endpoint(endpoint)
@@ -907,7 +1238,7 @@ def run(
         _log(f"arena {name}: {answered}/{len(resolved)} answered in {walls[name]:.1f}s")
 
     judged = judge_rows(url, judge, replies, resolved, timeout=timeout) if judge else []
-    board = leaderboard(names, replies, resolved, judged, self_judge=self_judge)
+    board = leaderboard(names, replies, resolved, judged, self_judge=self_judge, rank_by=rank_by)
 
     replies_dir = out_dir / "replies"
     cases_path = out_dir / "cases.jsonl"
@@ -941,6 +1272,7 @@ def run(
         "wall_s": walls,
         "cases": len(resolved),
         "n_ref": board["n_ref"],
+        "n_contract": board["n_contract"],
         "self_judge": self_judge,
     }
     _write_json(meta_path, meta)

@@ -416,6 +416,7 @@ def _cmd_arena(cfg: RunConfig | None, args: argparse.Namespace) -> int:
             timeout=args.timeout,
             out=args.out,
             dry_run=bool(args.dry_run),
+            rank_by=args.rank_by,
         )
     )
     formatter = "format_plan" if result.get("dry_run") else "format_report"
@@ -745,6 +746,98 @@ def _cmd_material_status(cfg: RunConfig | None, args: argparse.Namespace) -> int
     material = _impl("msft.material")
     result = _jsonable(_func(material, "status")(_material_config(args)))
     _emit(args.as_json, result, _func(material, "format_status")(result))
+    return EXIT_OK
+
+
+# --- experiments: the queue between the notes and the box ------------------
+
+
+def _experiments_config(args: argparse.Namespace) -> Any:
+    """Load the recipe catalog; after the `experiments` keyword `--catalog` names that file."""
+    experiments = _impl("msft.experiments")
+    return _func(experiments, "load_catalog")(getattr(args, "catalog", None))
+
+
+def _cmd_experiments_catalog(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Print the menu of recipes a note is allowed to propose, cheapest first."""
+    experiments = _impl("msft.experiments")
+    result = _jsonable(_func(experiments, "catalog")(_experiments_config(args)))
+    _emit(args.as_json, result, _func(experiments, "format_catalog")(result))
+    return EXIT_OK
+
+
+def _cmd_experiments_sync(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Turn a day's note frontmatter into queued jobs, validated against the catalog."""
+    experiments = _impl("msft.experiments")
+    result = _jsonable(
+        _func(experiments, "sync")(
+            _experiments_config(args),
+            day=getattr(args, "date", None),
+            dry_run=bool(args.dry_run),
+        )
+    )
+    _emit(args.as_json, result, _func(experiments, "format_sync")(result))
+    return EXIT_OK
+
+
+def _cmd_experiments_list(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Print the queue, newest first, optionally filtered by status."""
+    experiments = _impl("msft.experiments")
+    result = _jsonable(
+        _func(experiments, "list_jobs")(getattr(args, "status", None))
+    )
+    _emit(args.as_json, result, _func(experiments, "format_list")(result))
+    return EXIT_OK
+
+
+def _cmd_experiments_add(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Queue one recipe by hand — the operator's own experiment."""
+    experiments = _impl("msft.experiments")
+    result = _jsonable(
+        _func(experiments, "add_job")(
+            args.recipe,
+            hypothesis=getattr(args, "hypothesis", None),
+            origin="manual",
+            cfg=_experiments_config(args),
+        )
+    )
+    _emit(args.as_json, result, _func(experiments, "format_add")(result))
+    return EXIT_OK
+
+
+def _cmd_experiments_tick(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Plan (default) or start the cheapest queued jobs on the box, one at a time."""
+    experiments = _impl("msft.experiments")
+    queue = _experiments_config(args)
+    day = getattr(args, "date", None)
+    budget, seconds = _func(experiments, "resolve_budget")(
+        getattr(args, "budget", "auto"),
+        day=day,
+        time_budget_s=getattr(args, "time_budget_s", None),
+    )
+    result = _jsonable(
+        _func(experiments, "tick")(
+            queue,
+            budget=budget,
+            execute=bool(args.execute),
+            time_budget_s=seconds,
+            day=day,
+        )
+    )
+    _emit(args.as_json, result, _func(experiments, "format_tick")(result))
+    if result.get("box_unreachable"):
+        # Distinct from 2 (bad catalog) so the cron wrapper can report it and exit 0.
+        return int(getattr(experiments, "EXIT_UNREACHABLE", 4))
+    return 1 if result.get("failed") else EXIT_OK
+
+
+def _cmd_experiments_report(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """One line (or one object) about the queue's backlog and today's verdicts."""
+    experiments = _impl("msft.experiments")
+    result = _jsonable(
+        _func(experiments, "report")(_experiments_config(args), day=getattr(args, "date", None))
+    )
+    _emit(args.as_json, result, _func(experiments, "format_report")(result))
     return EXIT_OK
 
 
@@ -1142,6 +1235,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_arena.add_argument(
         "--out", metavar="DIR", default=None, help="artifacts (default: out/arena/<UTC stamp>)"
     )
+    p_arena.add_argument(
+        "--rank-by",
+        metavar="AXIS",
+        default=None,
+        help=(
+            "sort the table by ONE axis instead of the default order: schema_validity, "
+            "contract, chrf, glossary, judge_fidelity, judge_fluency, speed_index, tok_per_s, "
+            "p50_reply_s (lowest first) or answered"
+        ),
+    )
     p_arena.set_defaults(handler=_cmd_arena)
 
     p_remote = sub.add_parser("remote", parents=[common], help="ssh orchestration on a GPU box")
@@ -1421,6 +1524,105 @@ def build_parser() -> argparse.ArgumentParser:
         "status", parents=[mat], help="offline frontier, item counts and last run"
     )
     p_m_status.set_defaults(handler=_cmd_material_status)
+
+    # `experiments` is a sibling of `material`, not a child: it reads the material tree and
+    # its own catalog, never a RunConfig. `--catalog` replaces `--config` here for the same
+    # reason `--config` meant the material YAML above — the word already has a meaning.
+    exp = argparse.ArgumentParser(add_help=False)
+    exp.add_argument(
+        "--catalog",
+        dest="catalog",
+        metavar="PATH",
+        default=None,
+        help="recipe catalog (default: configs/experiments/catalog.yaml)",
+    )
+    exp.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="print exactly one JSON object on stdout",
+    )
+    exp.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="plan only: no queue write, no ssh, no docker",
+    )
+    exp.add_argument(
+        "--execute",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="actually signal the box; the default only prints the plan",
+    )
+    p_experiments = sub.add_parser(
+        "experiments",
+        parents=[exp],
+        help="the costed experiment queue: catalog, sync, tick, report",
+        description=(
+            "A recipe is a known-cost run from the catalog, and a note may only propose one "
+            "of them. `tick` starts at most --budget jobs, cheapest first, and starts "
+            "nothing while the box already has a job running."
+        ),
+    )
+    exp_sub = p_experiments.add_subparsers(
+        dest="experiments_command", metavar="ACTION", required=True
+    )
+    p_e_catalog = exp_sub.add_parser(
+        "catalog", parents=[exp], help="list the recipes a note is allowed to propose"
+    )
+    p_e_catalog.set_defaults(handler=_cmd_experiments_catalog)
+    p_e_sync = exp_sub.add_parser(
+        "sync", parents=[exp], help="queue today's note proposals, validated and costed"
+    )
+    p_e_sync.add_argument("--date", metavar="YYYY-MM-DD", default=None, help="day of notes")
+    p_e_sync.set_defaults(handler=_cmd_experiments_sync)
+    p_e_list = exp_sub.add_parser("list", parents=[exp], help="the queue, newest first")
+    p_e_list.add_argument(
+        "--status",
+        metavar="STATUS",
+        default=None,
+        help="queued | running | done | failed | skipped",
+    )
+    p_e_list.set_defaults(handler=_cmd_experiments_list)
+    p_e_add = exp_sub.add_parser(
+        "add", parents=[exp], help="queue a catalog recipe by hand"
+    )
+    p_e_add.add_argument("recipe", help="recipe name (see `msft experiments catalog`)")
+    p_e_add.add_argument("--hypothesis", metavar="TEXT", default=None, help="what it tests")
+    p_e_add.set_defaults(handler=_cmd_experiments_add)
+    p_e_tick = exp_sub.add_parser(
+        "tick",
+        parents=[exp],
+        help="plan (default) or start the cheapest queued jobs on the box",
+        description=(
+            "One GPU job at a time, cheapest `est_minutes` first. `--budget auto` is the "
+            "weekday/weekend rule: Mon-Fri one job in 90 minutes, Sat-Sun the whole backlog "
+            "in six hours. `--budget 0` also means drain."
+        ),
+    )
+    p_e_tick.add_argument(
+        "--budget",
+        metavar="N",
+        default="auto",
+        help="jobs to start: N, 0 (drain) or auto — the weekday/weekend rule (default)",
+    )
+    p_e_tick.add_argument(
+        "--time-budget",
+        dest="time_budget_s",
+        type=int,
+        metavar="SECONDS",
+        default=None,
+        help="stop watching after this long (default: 5400 weekday / 21600 weekend)",
+    )
+    p_e_tick.add_argument("--date", metavar="YYYY-MM-DD", default=None, help="the budget's day")
+    p_e_tick.set_defaults(handler=_cmd_experiments_tick)
+    p_e_report = exp_sub.add_parser(
+        "report", parents=[exp], help="backlog, today's verdicts, est vs actual minutes"
+    )
+    p_e_report.add_argument("--date", metavar="YYYY-MM-DD", default=None)
+    p_e_report.set_defaults(handler=_cmd_experiments_report)
 
     return parser
 

@@ -1,0 +1,83 @@
+# The experiment menu: every recipe the daily research loop is allowed to propose.
+#
+# WHY a catalog instead of free-form prose. The notes used to end with one line of
+# `experiment:` text, and nothing ever ran it. A queue makes the proposals runnable, which
+# makes them dangerous: a model that can name a job can name a 12B run. So a recipe is the
+# unit of permission, not a sentence — `msft experiments sync` drops any note whose
+# `experiment_job.recipe` is not a key below, and `est_minutes` here (never the note's guess)
+# is what the scheduler sorts by.
+#
+# `est_minutes` IS the scheduler. `tick` takes the cheapest queued row first, so a wrong
+# number silently starves every expensive recipe behind a cheap one (or the reverse). Every
+# value below is derived from a measured run, and the derivation is in the comment because
+# the next person to add a recipe has to do the same arithmetic:
+#   measured seconds / 60, rounded UP to the next 0.1 min.
+# Source for all of them: docs/run-2026-11-08.md (train 167 s on 0.8B, merge 31.6 s,
+# quantize 9.4 s, `msft data build` < 5 s) and docs/handoff.md §4.
+#
+# `config` is repo-relative and must be committed: the box runs a `git clone`, so an
+# uncommitted config is a job that fails ten minutes later inside the container.
+# `args` is appended verbatim after `--config` (one `--arg` per token), so only flags the
+# real CLI accepts may appear here — checked with `msft train|data|eval|verify --help`.
+#
+# Deliberately absent: an `arena` recipe. `worker.JOB_KINDS` has no `arena` kind, so
+# `remote signal arena` cannot be queued; an arena pair is a laptop-side comparison over a
+# served model, not a box job.
+
+recipes:
+  # data build reads data/raw and writes the split; the 2026-11-08 run logged it under 5 s.
+  # 5 s / 60 = 0.08 -> 0.1. Cheapest row in the menu, so it drains a weekend first.
+  data-build:
+    kind: data
+    config: configs/qwen3.5-0.8b-lora.yaml
+    est_minutes: 0.1
+    what: rebuild the train/val split from data/raw and print the pair count
+
+  # 9.4 s measured for the 0.8B quantize (f16 1.56 GB -> 516 MB Q4_K_S) -> 0.16 -> 0.2.
+  smoke-quantize:
+    kind: quantize
+    config: configs/smoke-qwen3.5-0.8b.yaml
+    est_minutes: 0.2
+    what: quantize the smoke adapter's merged weights to Q4_K_S and check the GGUF size
+
+  # `msft eval` is pure Python over a predictions JSONL: the 2026-11-08 gates printed in the
+  # same second as the command, so 12 s of container start is the whole cost -> 0.2.
+  # Needs the predictions the last `probe`/`arena` wrote under the config's output dir.
+  eval-4b-gates:
+    kind: eval
+    config: configs/qwen3.5-4b-lora.yaml
+    est_minutes: 0.2
+    what: replay the six protocol gates on the 4B predictions already on the box
+
+  # 31.6 s measured for the 0.8B merge (adapter -> 1.7 GB bf16) -> 0.53 -> 0.6.
+  smoke-merge:
+    kind: merge
+    config: configs/smoke-qwen3.5-0.8b.yaml
+    est_minutes: 0.6
+    what: merge the smoke adapter into 16-bit weights and confirm the tokenizer loads
+
+  # `verify --deep` re-hashes the GGUF. The measured quantize wrote 516 MB in 9.4 s
+  # (~55 MB/s); the 4B file is 2.63 GB, so ~48 s of I/O, and the tokenizer load is the rest.
+  # 48 s / 60 = 0.8.
+  verify-4b:
+    kind: verify
+    config: configs/qwen3.5-4b-lora.yaml
+    args: ["--deep"]
+    est_minutes: 0.8
+    what: re-hash the 4B GGUF against its provenance sidecar and re-load its tokenizer
+
+  # 167 s measured end to end (18 steps, 3 epochs, adapter 44 MB) -> 2.78 -> 3.0.
+  smoke-train:
+    kind: train
+    config: configs/smoke-qwen3.5-0.8b.yaml
+    est_minutes: 3.0
+    what: one full smoke epoch — the regression check for the whole training path
+
+  # 165.8 s measured for 4 steps on the 4B (80 s of steps, the rest loading 9.4 GB) ->
+  # 2.76 -> 3.0. The number assumes /hf already holds Qwen3.5-4B; a cold cache adds a
+  # multi-minute download this estimate does not cover, which is why it is last in line.
+  short-4b-train:
+    kind: train
+    config: configs/qwen3.5-4b-lora.yaml
+    est_minutes: 3.0
+    what: the cheapest 4B train that still produces a judgeable adapter

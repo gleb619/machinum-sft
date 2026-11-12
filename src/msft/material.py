@@ -1771,8 +1771,16 @@ tags: [<tags, comma separated>]
 published: <date or null>
 score: <the score from this pack>
 experiment: <one line, or none>
+experiment_job:          # OPTIONAL — omit the whole block when nothing is worth GPU time
+  recipe: <one recipe name from configs/experiments/catalog.yaml>
+  hypothesis: <one line: which result would change our mind>
 ---
 ```
+
+`experiment_job` is what the queue reads. `recipe` is an allow-list: only a name the
+catalog already costs will ever run — anything else is dropped, so an invented recipe is
+not a way to ask for a 12B job. `experiment:` stays the human sentence and is what
+`experiments.md` keeps.
 
 Body sections, in this order and with these headings:
 
@@ -1878,6 +1886,27 @@ def _experiment(front: dict[str, Any]) -> str:
         return ""
     text = str(raw).strip()
     return "" if text.lower() in ("", "none", "null", "-") else text
+
+
+def parse_experiment_job(front: dict[str, Any]) -> dict[str, str] | None:
+    """The optional `experiment_job:` block, as `{recipe, hypothesis}`; None when absent.
+
+    The catalog (`configs/experiments/catalog.yaml`) is the allow-list: a note may only name
+    a recipe the repository already prices, so a model writing a note cannot invent a GPU
+    job. Parsing is deliberately tolerant — a missing block is None, a block that is not a
+    mapping or has no usable `recipe` comes back with an empty recipe — because the caller
+    counters those cases and must never fail a whole distill over one note's frontmatter.
+    The prose `experiment:` line is untouched: it stays the human record.
+    """
+    raw = front.get("experiment_job")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return {"recipe": "", "hypothesis": ""}
+    return {
+        "recipe": str(raw.get("recipe") or "").strip(),
+        "hypothesis": " ".join(str(raw.get("hypothesis") or "").split())[:300],
+    }
 
 
 def _append_experiments(cfg: MaterialCfg, day: str, entries: list[tuple[str, str]]) -> int:
