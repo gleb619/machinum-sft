@@ -107,7 +107,7 @@ truth, so a re-run after a crash resumes instead of guessing.
 | --- | --- | --- |
 | `seed` | inserts the configured queries into the frontier | `candidates` |
 | `add` | inserts explicit URLs into the frontier, ahead of every query | `candidates` |
-| `run` | calls webbridge for the highest-priority candidates, scores, fetches, expands | `candidates`, `items`, `raw/` |
+| `run` | calls webbridge for the due candidates (fresh, retryable, and `done` ones past `limits.refresh_days`), tops a short day up with synthesized pairs, scores, fetches, expands | `candidates`, `items`, `raw/` |
 | `distill` | packs `packed` items into one file, runs the `at` agent over it | `pack/`, `notes/`, `experiments.md` |
 | `memorize` | posts each `distilled` note to ai-memory | wiki, `INDEX.md` |
 | `report` | one line (or one JSON object) for a date | nothing |
@@ -167,6 +167,8 @@ reviewing in a diff. Four blocks matter:
 | `product` | `keywords`, `negative`, `domain_terms` | the definition of relevance; every score is computed against these lists |
 | `limits` | `queries_per_run`, `items_per_run`, `items_per_site` | how much a single run may spend; the first thing to cut when a run is too slow |
 | `limits` | `max_frontier`, `children_per_item` | how fast the frontier may grow from expansion; the second thing to cut |
+| `limits` | `refresh_days` | how long an answered query stays answered. `3` means a keyword is re-asked every fourth day for whatever appeared under it; `0` restores the old one-shot crawl |
+| `limits` | `synthesize_queries` | `true` tops a short day up with keyword pairs from `product.keywords`, so the budget is spent even when nothing is due |
 | `scoring` | `keep_min`, `expand_min` | the two thresholds: below `keep_min` an item dies, below `expand_min` it is not used as a parent |
 | `scoring` | `recency_days`, `site_prior` | taste: how much a 2026 post beats a 2024 one, how much GitHub/HF beat Habr |
 | `expansion` | `per_site` | which child kinds a site may produce — `habr: [tag, author]`, `github: [repo]`, `hf: [model]` |
@@ -246,6 +248,30 @@ run enqueues children with `parent=<url>`, at most `children_per_item` of them:
 The frontier is capped at `limits.max_frontier` rows; when it is full the run counts and skips
 (`frontier_full` in the counters) rather than dropping what it already has. `--no-expand`
 turns the whole mechanism off for a cheap sweep.
+
+**Refresh — a question is not one-shot.** A `done` candidate whose `updated_at` is at least
+`limits.refresh_days` old is eligible again (3 days in the shipped config). This is the
+difference between a daily loop and a crawl that finishes: a post published today was not in
+the answer to `QLoRA обучение больших языковых моделей` yesterday, so the same question is
+worth asking again on a schedule. Two rules keep it bounded. `kind='url'` never refreshes —
+the operator pointed at one page, and one read of that page answers it for ever. And due
+`done` nodes are taken **oldest `updated_at` first**, behind the fresh and retryable ones, so
+six queries a day walk the whole pool instead of re-asking the same six. Re-executing a node
+writes `updated_at` again, which re-arms it for another `refresh_days` — no extra column.
+
+**Synthesis — widening the pool.** Refresh only hands back the questions the seeds happen to
+contain: with six seeds and three days, a day with nothing fresh has two due nodes. When
+`limits.synthesize_queries` is on and the run still has budget left, it pairs the keywords
+from `product.keywords` in order (`lora qlora`, `lora peft`, `qlora peft`, …) — skipping the
+hyphenated scoring stems such as `fine-tun`, which exist so that `fine-tuned` matches during
+scoring and are not words anyone types into a search box — skips any
+string the frontier already holds for *any* site and status, and spreads the new questions
+round-robin over the sites named in `seeds`. It is deterministic — the same state produces
+the same plan, so `--dry-run` is a real preview — and it respects `limits.max_frontier`. A
+`--site` sweep is an explicit narrow question and is not topped up. Two limits worth knowing:
+the pairs are finite (19 keywords give 171 questions, so a few weeks of idle days exhaust
+them and the answer is a longer `product.keywords`, not code), and a pair that was asked and
+answered is never asked again.
 
 **2. Three layers of dedupe.** Each layer catches a different duplicate:
 
@@ -396,7 +422,8 @@ silently creates a frontier hides a typo in `configs/material.yaml`), then
 | items stuck `packed` for days | the agent never accepted the pack | `SELECT url, error FROM items WHERE status='packed'` |
 | `memorize` 4xx | ai-memory down, wrong workspace/project, stale token | `curl -s localhost:49374/healthz`, then `memory-stack.md` |
 | `memorize` 5xx | the wiki store refused the write; the note file is kept | re-run `memorize` after fixing the service — it is idempotent by path |
-| everything green, report says `0 items` | the sites answered and nothing scored | `items` rows with `scored_out` say why; usually `keep_min` or a stale frontier |
+| everything green, report says `0 items` | the sites answered and nothing scored | `items` rows with `scored_out` say why; usually `keep_min` |
+| everything green, report says `0 queries` | the frontier had nothing due: every candidate is `done` and inside `limits.refresh_days`, and synthesis is off or full | `msft material status` (frontier count), then `limits.refresh_days` / `limits.synthesize_queries` in `configs/material.yaml`; a real run also prints `frontier empty: nothing is due` on stderr |
 
 Never "fix" a red run by deleting `docs/material/.state/material.db`. The DB is the record of
 what was already read; deleting it re-fetches everything and re-posts nothing (paths dedupe),

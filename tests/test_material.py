@@ -46,6 +46,11 @@ BASE_CONFIG: dict[str, Any] = {
         "children_per_item": 3,
         "fetch_timeout_s": 120,
         "ask_timeout_s": 240,
+        # Pinned to the old one-shot behaviour so a count in an older test still means what
+        # it meant. The shipped defaults (3 / true) are covered by their own tests below,
+        # which override these two keys explicitly.
+        "refresh_days": 0,
+        "synthesize_queries": False,
     },
     "scoring": {
         "keep_min": 0.35,
@@ -180,6 +185,8 @@ def test_shipped_config_loads_and_validates() -> None:
     assert len(cfg.seeds) == 10
     assert [seed.kind for seed in cfg.seeds[:4]] == ["url"] * 4
     assert cfg.limits.items_per_run == 12
+    assert cfg.limits.refresh_days == 3, "the daily loop must re-ask its questions"
+    assert cfg.limits.synthesize_queries is True
     assert cfg.scoring.expand_min == 0.6
     assert cfg.memory.path_prefix == "projects/machinum-sft/material"
     assert cfg.distill.agent == "ds-code"
@@ -1213,3 +1220,303 @@ def test_cli_memorize_dry_run_prints_payloads(
     assert "memorize plan" in out
     assert '"workspace": "default"' in out
     assert '"project": "data"' in out
+
+
+# --- frontier refresh + query synthesis -----------------------------------
+
+OLD = "2026-01-01T00:00:00+00:00"
+
+
+def daily_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **overrides: Any):
+    """A config with the shipped daily-loop defaults: refresh_days=3, synthesis on."""
+    monkeypatch.setenv("MSFT_MATERIAL_DIR", str(tmp_path / "material"))
+    monkeypatch.setenv("MSFT_MEMORY_TOKEN", "test-token")
+    keys = {"limits__refresh_days": 3, "limits__synthesize_queries": True, **overrides}
+    return material.load_material_config(write_config(tmp_path, **keys))
+
+
+def finish_all(cfg: material.MaterialCfg, *, when: str | None = OLD) -> None:
+    """Mark every candidate `done` and, optionally, backdate `updated_at` to `when`."""
+    with material.State(cfg.db_path) as state:
+        for row in state.conn.execute("SELECT id FROM candidates").fetchall():
+            state.set_candidate(int(row["id"]), "done")
+        if when is not None:
+            state.conn.execute("UPDATE candidates SET updated_at = ?", (when,))
+        state.conn.commit()
+
+
+def test_refresh_makes_an_old_done_query_askable_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = daily_cfg(tmp_path, monkeypatch)
+    material.seed(cfg)
+    with material.State(cfg.db_path) as state:
+        for row in state.conn.execute("SELECT id FROM candidates").fetchall():
+            state.set_candidate(int(row["id"]), "done")
+        state.conn.execute(
+            "UPDATE candidates SET updated_at = ? WHERE value = ?",
+            (OLD, "LoRA fine-tuning LLM"),
+        )
+        state.conn.commit()
+        due = state.candidates(limit=10, refresh_days=3)
+
+    assert [cand["value"] for cand in due] == ["LoRA fine-tuning LLM"], (
+        "the old node is due again, the two just-answered ones are not"
+    )
+    assert due[0]["status"] == "done"
+
+
+def test_refresh_days_zero_is_the_old_one_shot_behaviour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = daily_cfg(tmp_path, monkeypatch)
+    material.seed(cfg)
+    finish_all(cfg)
+    with material.State(cfg.db_path) as state:
+        assert state.candidates(limit=10) == []
+        assert state.candidates(limit=10, refresh_days=0) == []
+        assert state.frontier(refresh_days=0) == 0
+        # and the window is what brings them back, not the status alone
+        assert len(state.candidates(limit=10, refresh_days=3)) == 3
+
+
+def test_done_url_candidates_never_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One explicit read of one page answers that node for ever, however old it gets."""
+    cfg = daily_cfg(
+        tmp_path,
+        monkeypatch,
+        seeds=[
+            {"kind": "url", "site": "habr", "value": "https://habr.com/ru/articles/1044422/"},
+            {"kind": "query", "site": "habr", "value": "LoRA fine-tuning LLM"},
+        ],
+    )
+    material.seed(cfg)
+    finish_all(cfg)
+    with material.State(cfg.db_path) as state:
+        due = state.candidates(limit=10, refresh_days=3)
+    assert [cand["kind"] for cand in due] == ["query"]
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute("SELECT status FROM candidates WHERE kind = 'url'").fetchone()
+    assert row["status"] == "done", "the url node stays answered; it is just never re-asked"
+
+
+def test_refresh_rotation_is_oldest_updated_at_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = daily_cfg(tmp_path, monkeypatch)
+    material.seed(cfg)
+    ages = {
+        "hf": "2026-01-01T00:00:00+00:00",
+        "github": "2026-02-01T00:00:00+00:00",
+        "habr": "2026-03-01T00:00:00+00:00",
+    }
+    with material.State(cfg.db_path) as state:
+        for row in state.conn.execute("SELECT id FROM candidates").fetchall():
+            state.set_candidate(int(row["id"]), "done")
+        for site, when in ages.items():
+            state.conn.execute("UPDATE candidates SET updated_at = ? WHERE site = ?", (when, site))
+        state.conn.commit()
+        assert [cand["site"] for cand in state.candidates(limit=10, refresh_days=3)] == [
+            "hf", "github", "habr"
+        ]
+        # A short run takes the stalest nodes, which is what makes the pool rotate.
+        assert [cand["site"] for cand in state.candidates(limit=2, refresh_days=3)] == [
+            "hf", "github"
+        ]
+
+
+def test_run_reasks_everything_after_the_refresh_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live bug: every candidate `done`, so the daily cron executed 0 queries for ever."""
+    cfg = daily_cfg(tmp_path, monkeypatch, limits__synthesize_queries=False)
+    material.seed(cfg)
+    finish_all(cfg)
+    bridge = install(
+        monkeypatch,
+        {
+            ("search", "habr", "LoRA fine-tuning LLM"): habr_search([]),
+            ("search", "github", "lora fine-tuning"): github_search([]),
+            ("search", "hf", "lora"): hf_search([]),
+        },
+    )
+    result = material.run(cfg, day=DAY, limit=3, no_expand=True)
+
+    assert bridge.argv == [
+        ["search", "habr", "LoRA fine-tuning LLM"],
+        ["search", "github", "lora fine-tuning"],
+        ["search", "hf", "lora"],
+    ], "all three answered nodes are asked again, in the frontier's order"
+    assert result["queries"] == 3
+    assert result["refreshed"] == 3
+    assert result["ok"] is True
+
+    # Re-executing a node re-arms it: `updated_at` moved to now, so it is not due again
+    # until another `refresh_days` have passed.
+    with material.State(cfg.db_path) as state:
+        assert state.candidates(limit=10, refresh_days=3) == []
+
+
+def test_frontier_and_report_agree_with_candidates_after_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = daily_cfg(tmp_path, monkeypatch)
+    material.seed(cfg)
+    finish_all(cfg)
+    with material.State(cfg.db_path) as state:
+        assert len(state.candidates(limit=500, refresh_days=3)) == 3
+        assert state.frontier(refresh_days=3) == 3
+    assert material.status(cfg)["frontier"] == 3, "status must not print 'frontier 0' with work due"
+    assert material.report(cfg, day=DAY)["frontier"] == 3
+
+
+def test_synthesize_queries_is_deterministic_and_skips_known_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = daily_cfg(tmp_path, monkeypatch, product__keywords=["lora", "qlora", "peft"])
+    material.seed(cfg)
+    with material.State(cfg.db_path) as state:
+        first = material.synthesize_queries(cfg, state, 3, day=DAY)
+        assert first == [
+            ("lora qlora", "synth:lora+qlora"),
+            ("lora peft", "synth:lora+peft"),
+            ("qlora peft", "synth:qlora+peft"),
+        ]
+        assert material.synthesize_queries(cfg, state, 3) == first, "no randomness, same order"
+        assert len(material.synthesize_queries(cfg, state, 2)) == 2
+        assert material.synthesize_queries(cfg, state, 0) == []
+
+        # A pair already asked under *any* site and status is not asked again.
+        state.add_candidate("query", "lora qlora", "hf")
+        assert [value for value, _ in material.synthesize_queries(cfg, state, 3)] == [
+            "lora peft", "qlora peft"
+        ]
+
+
+def test_synthesis_skips_hyphenated_scoring_stems(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`fine-tun` is a scoring stem: `lora fine-tun` is not a question any engine answers."""
+    cfg = daily_cfg(
+        tmp_path, monkeypatch, product__keywords=["lora", "fine-tun", "gguf"]
+    )
+    material.seed(cfg)
+    with material.State(cfg.db_path) as state:
+        assert material.synthesize_queries(cfg, state, 5) == [("lora gguf", "synth:lora+gguf")]
+
+
+def test_synthesis_fills_a_short_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = daily_cfg(tmp_path, monkeypatch, product__keywords=["lora", "qlora", "peft"])
+    material.seed(cfg)
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", "LoRA fine-tuning LLM"): habr_search([]),
+            ("search", "github", "lora fine-tuning"): github_search([]),
+            ("search", "hf", "lora"): hf_search([]),
+            ("search", "habr", "lora qlora"): habr_search([]),
+            ("search", "github", "lora peft"): github_search([]),
+            ("search", "hf", "qlora peft"): hf_search([]),
+        },
+    )
+    result = material.run(cfg, day=DAY, limit=6, no_expand=True)
+
+    assert result["queries"] == 6, "three seeds plus three synthesized questions"
+    assert result["synthesized"] == 3
+    with material.State(cfg.db_path) as state:
+        rows = {
+            str(row["value"]): dict(row) for row in state.conn.execute("SELECT * FROM candidates")
+        }
+    assert rows["lora qlora"]["reason"] == "synth:lora+qlora"
+    assert rows["lora qlora"]["site"] == "habr", "round-robin over the seed sites, in order"
+    assert rows["lora peft"]["site"] == "github"
+    assert rows["qlora peft"]["site"] == "hf"
+    assert all(rows[value]["status"] == "done" for value in ("lora qlora", "qlora peft"))
+
+
+def test_synthesis_adds_nothing_when_the_budget_is_already_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = daily_cfg(tmp_path, monkeypatch, product__keywords=["lora", "qlora", "peft"])
+    material.seed(cfg)
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", "LoRA fine-tuning LLM"): habr_search([]),
+            ("search", "github", "lora fine-tuning"): github_search([]),
+            ("search", "hf", "lora"): hf_search([]),
+        },
+    )
+    result = material.run(cfg, day=DAY, limit=3, no_expand=True)
+    assert result["queries"] == 3
+    assert result["synthesized"] == 0
+    with material.State(cfg.db_path) as state:
+        assert state.candidates_count() == 3, "a full budget must not grow the frontier"
+
+
+def test_synthesis_respects_max_frontier(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = daily_cfg(
+        tmp_path,
+        monkeypatch,
+        product__keywords=["lora", "qlora", "peft"],
+        limits__max_frontier=4,
+    )
+    material.seed(cfg)  # three fresh nodes, room for exactly one more
+    result = material.run(cfg, day=DAY, limit=6, dry_run=True, no_expand=True)
+    assert result["would_synthesize"] == 1
+    assert result["queries_planned"] == 4
+
+
+def test_synthesis_respects_a_full_frontier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = daily_cfg(
+        tmp_path,
+        monkeypatch,
+        product__keywords=["lora", "qlora", "peft"],
+        limits__max_frontier=3,
+    )
+    material.seed(cfg)
+    result = material.run(cfg, day=DAY, limit=6, dry_run=True, no_expand=True)
+    assert result["would_synthesize"] == 0
+    assert result["queries_planned"] == 3
+
+
+def test_dry_run_plan_shows_the_synthesized_queries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = daily_cfg(tmp_path, monkeypatch, product__keywords=["lora", "qlora", "peft"])
+    material.seed(cfg)
+    bridge = install(monkeypatch, {})
+    result = material.run(cfg, day=DAY, dry_run=True, limit=6)
+
+    assert bridge.calls == []
+    assert result["queries_planned"] == 6
+    synthesized = [step for step in result["plan"] if step.get("synthesized")]
+    assert [step["value"] for step in synthesized] == ["lora qlora", "lora peft", "qlora peft"]
+    assert [step["candidate"] for step in synthesized] == [
+        "query/habr", "query/github", "query/hf"
+    ]
+    assert synthesized[0]["reason"] == "synth:lora+qlora"
+    assert synthesized[0]["argv"] == ["search", "habr", "lora qlora"]
+    with material.State(cfg.db_path) as state:
+        assert state.candidates_count() == 3, "a dry run writes no synthesized row"
+
+
+def test_config_defaults_when_the_daily_loop_keys_are_absent(tmp_path: Path) -> None:
+    data = copy.deepcopy(BASE_CONFIG)
+    del data["limits"]["refresh_days"]
+    del data["limits"]["synthesize_queries"]
+    path = tmp_path / "legacy.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    cfg = material.load_material_config(path)
+    assert cfg.limits.refresh_days == 3
+    assert cfg.limits.synthesize_queries is True
+
+
+def test_config_negative_refresh_days_is_a_config_error(tmp_path: Path) -> None:
+    path = write_config(tmp_path, limits__refresh_days=-1)
+    with pytest.raises(ConfigError, match="refresh_days"):
+        material.load_material_config(path)

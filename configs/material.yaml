@@ -41,6 +41,12 @@ limits:
   # A frontier node that failed (timeout, 502, a site mid-deploy) is retried on the next
   # run until it has been attempted this many times, then it stays `error` for good.
   retry_errors: 2
+  # A keyword is not a one-shot question: a post published today was not in yesterday's
+  # answer, so an answered query becomes askable again after this many days (0 = never).
+  refresh_days: 3
+  # Refresh only re-asks what the seeds already contain, so a short day is topped up with
+  # keyword pairs (lora+dataset, peft+vram, …) instead of running zero queries.
+  synthesize_queries: true
 
 scoring:
   keep_min: 0.35        # below: status=scored_out

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import html
+import itertools
 import json
 import os
 import re
@@ -32,7 +33,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import date as date_cls
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -226,6 +227,12 @@ class LimitsCfg:
     fetch_timeout_s: int = 120
     ask_timeout_s: int = 240
     retry_errors: int = 2
+    # A keyword is not a one-shot question: a post written today was not in yesterday's
+    # answer, so an answered node becomes askable again after this many days (0 = never).
+    refresh_days: int = 3
+    # Refresh only re-asks questions the seeds happen to contain, so the frontier is also
+    # widened with deterministic keyword pairs (see `synthesize_queries`).
+    synthesize_queries: bool = True
 
 
 @dataclass
@@ -343,6 +350,13 @@ def _as_float(value: Any, where: str, key: str) -> float:
     return float(value)
 
 
+def _as_bool(value: Any, where: str, key: str) -> bool:
+    """A real YAML boolean; `yes`/`no` are strings to YAML 1.2, and a string toggle is a typo."""
+    if isinstance(value, bool):
+        return value
+    raise ConfigError(f"material config: '{where}.{key}' must be true or false")
+
+
 def _as_list(value: Any, where: str, key: str) -> list[Any]:
     if not isinstance(value, list) or not value:
         raise ConfigError(f"material config: '{where}.{key}' must be a non-empty list")
@@ -402,7 +416,7 @@ def _seed_cfg(raw: Any, index: int) -> SeedCfg:
 
 
 def _limits_cfg(raw: dict[str, Any]) -> LimitsCfg:
-    return LimitsCfg(
+    cfg = LimitsCfg(
         queries_per_run=_as_int(_require(raw, "queries_per_run", "limits"), "limits",
                                 "queries_per_run"),
         items_per_run=_as_int(_require(raw, "items_per_run", "limits"), "limits",
@@ -418,7 +432,19 @@ def _limits_cfg(raw: dict[str, Any]) -> LimitsCfg:
                               "ask_timeout_s"),
         # Optional: a site that timed out once should not lose its frontier node for ever.
         retry_errors=_as_int(raw.get("retry_errors", 2), "limits", "retry_errors"),
+        # Optional, so a config written before the daily-loop fix keeps loading: those two
+        # keys did not exist, and their absence means the new defaults, not an error.
+        refresh_days=_as_int(raw.get("refresh_days", 3), "limits", "refresh_days"),
+        synthesize_queries=_as_bool(
+            raw.get("synthesize_queries", True), "limits", "synthesize_queries"
+        ),
     )
+    if cfg.refresh_days < 0:
+        raise ConfigError(
+            "material config: 'limits.refresh_days' must be >= 0 "
+            "(0 disables refresh and restores one-shot behaviour)"
+        )
+    return cfg
 
 
 def _scoring_cfg(raw: dict[str, Any]) -> ScoringCfg:
@@ -512,6 +538,17 @@ def load_material_config(path: str | Path | None = None) -> MaterialCfg:
 # --- state ---------------------------------------------------------------
 
 
+def _refresh_cutoff(refresh_days: int) -> str:
+    """The `updated_at` a `done` node must be at or below to be asked again.
+
+    Same shape `_now()` writes (UTC, seconds precision, `+00:00`), so SQLite compares the
+    two as plain strings — no parsing, no timezone surprises, and the comparison stays
+    indexable on `(status, updated_at)`.
+    """
+    moment = datetime.now(timezone.utc) - timedelta(days=int(refresh_days))
+    return moment.isoformat(timespec="seconds")
+
+
 class State:
     """The SQLite state machine. Rows are the truth; files are payloads."""
 
@@ -556,14 +593,32 @@ class State:
         return cursor.rowcount > 0
 
     def candidates(
-        self, limit: int = 10, sites: list[str] | None = None, retry_errors: int = 2
+        self,
+        limit: int = 10,
+        sites: list[str] | None = None,
+        retry_errors: int = 2,
+        refresh_days: int = 0,
     ) -> list[dict[str, Any]]:
-        """Frontier nodes to execute, best first; ties by insertion order.
+        """Frontier nodes to execute, in the order a run should spend its budget.
 
-        `status='error'` rows are eligible again until `attempts` reaches
-        `retry_errors`: a site that answered 502 at 13:00 must not delete a
-        discovery path for ever, and a *false* error (the empty-result case) must
-        be able to heal itself on the next run.
+        Three kinds of work, and the order is the point:
+
+        1. `status='new'` rows — questions never asked.
+        2. `status='error'` rows with `attempts < retry_errors` — a site that answered 502
+           at 13:00 must not delete a discovery path for ever, and a *false* error (the
+           empty-result case) must be able to heal itself on the next run.
+        3. with `refresh_days > 0`, `status='done'` rows whose `updated_at` is at least
+           that old, oldest first. A search query is not a one-shot question: posts appear
+           under it every day, so the same question deserves asking again after a window.
+           Oldest-first rotation is what makes one run cycle the whole pool instead of
+           re-asking the same six questions week after week.
+
+        `kind='url'` is never refreshed: the operator pointed at one page, one read of it
+        answers that node for ever.
+
+        Implemented as two SELECTs rather than one `ORDER BY CASE`: the first is capped at
+        `limit`, the second gets the remainder, which expresses "fresh work wins, then
+        rotation" without a CASE expression in the SQL or a tie-break nobody can read.
         """
         sql = (
             "SELECT * FROM candidates WHERE "
@@ -575,7 +630,23 @@ class State:
             params.extend(sites)
         sql += " ORDER BY priority DESC, id ASC LIMIT ?"
         params.append(int(limit))
-        return [dict(row) for row in self.conn.execute(sql, params)]
+        rows = [dict(row) for row in self.conn.execute(sql, params)]
+
+        remaining = int(limit) - len(rows)
+        if refresh_days <= 0 or remaining <= 0:
+            return rows
+        sql = (
+            "SELECT * FROM candidates WHERE status = 'done' AND kind <> 'url' "
+            "AND updated_at <= ?"
+        )
+        params = [_refresh_cutoff(refresh_days)]
+        if sites:
+            sql += f" AND site IN ({', '.join('?' for _ in sites)})"
+            params.extend(sites)
+        sql += " ORDER BY updated_at ASC, id ASC LIMIT ?"
+        params.append(remaining)
+        rows.extend(dict(row) for row in self.conn.execute(sql, params))
+        return rows
 
     def candidates_count(self, status: str | None = None) -> int:
         if status is None:
@@ -595,14 +666,30 @@ class State:
         )
         self.conn.commit()
 
-    def frontier(self) -> int:
-        """Nodes the next run would execute: fresh ones plus retryable errors."""
-        return self.candidates_count("new") + int(
+    def frontier(self, refresh_days: int = 0) -> int:
+        """How many nodes the next run would execute — `candidates()` counted, not guessed.
+
+        `status` and `report` print this number, so it has to use the same predicate the
+        run does; a frontier of 0 next to a run that still collected six queries is worse
+        than no number at all.
+        """
+        fresh = int(
             self.conn.execute(
-                "SELECT COUNT(*) AS n FROM candidates WHERE status = 'error' AND attempts < ?",
+                "SELECT COUNT(*) AS n FROM candidates WHERE "
+                "status = 'new' OR (status = 'error' AND attempts < ?)",
                 (self.retry_errors,),
             ).fetchone()["n"]
         )
+        if refresh_days <= 0:
+            return fresh
+        due = int(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM candidates WHERE status = 'done' "
+                "AND kind <> 'url' AND updated_at <= ?",
+                (_refresh_cutoff(refresh_days),),
+            ).fetchone()["n"]
+        )
+        return fresh + due
 
     # --- items -----------------------------------------------------------
     def item(self, url: str) -> dict[str, Any] | None:
@@ -697,8 +784,17 @@ class State:
         self.conn.commit()
 
     def runs_for_date(self, day: str) -> list[dict[str, Any]]:
+        """Runs whose work belongs to `day`, not runs that merely *started* on it.
+
+        A `run --date 2026-11-09` executed on the 12th collects into the 9th's raw folder, so
+        keying on `started_at` made `report --date 2026-11-09` silently sum to zero. The
+        counter's own `date` is the authority; `started_at` stays the fallback for rows
+        written before it was recorded.
+        """
         rows = self.conn.execute(
-            "SELECT * FROM runs WHERE started_at LIKE ? ORDER BY id ASC", (f"{day}%",)
+            "SELECT * FROM runs WHERE COALESCE(json_extract(counters, '$.date'), "
+            "substr(started_at, 1, 10)) = ? ORDER BY id ASC",
+            (day,),
         )
         return [dict(row) for row in rows]
 
@@ -1174,6 +1270,7 @@ def seed(
                     priority=1.0 if item.kind == "url" else 0.0,
                 )
             added.append(f"{item.kind}/{item.site}: {item.value}")
+        frontier = state.frontier(cfg.limits.refresh_days)
         return {
             "dry_run": dry_run,
             "config": str(cfg.path),
@@ -1182,7 +1279,7 @@ def seed(
             "added": len(added),
             "existing": existing,
             "would_add": added if dry_run else [],
-            "frontier": state.frontier() + (len(added) if dry_run else 0),
+            "frontier": frontier + (len(added) if dry_run else 0),
         }
 
 
@@ -1237,6 +1334,7 @@ def add_urls(
             if not dry_run:
                 state.add_candidate("url", canonical, site, reason="manual", priority=1.0)
             added.append(entry)
+        frontier = state.frontier(cfg.limits.refresh_days)
         return {
             "dry_run": dry_run,
             "config": str(cfg.path),
@@ -1246,7 +1344,7 @@ def add_urls(
             "existing": len(known),
             "would_add": added,
             "known": known,
-            "frontier": state.frontier() + (len(added) if dry_run else 0),
+            "frontier": frontier + (len(added) if dry_run else 0),
         }
 
 
@@ -1351,12 +1449,74 @@ def _children(entry: dict[str, Any], score: float, cfg: MaterialCfg) -> list[See
     return out
 
 
+# --- frontier synthesis --------------------------------------------------
+
+
+def _synthesis_sites(cfg: MaterialCfg) -> list[str]:
+    """Distinct seed sites in config order — the round-robin order for new queries.
+
+    Taken from the seeds rather than from `SITES`, because the seeds say which sites this
+    deployment can actually drive; a synthesized query for a site nobody configured is a
+    frontier node that fails every morning.
+    """
+    order: list[str] = []
+    for seed in cfg.seeds:
+        if seed.site not in order:
+            order.append(seed.site)
+    return order
+
+
+def synthesize_queries(
+    cfg: MaterialCfg, state: State, want: int, day: str | None = None
+) -> list[tuple[str, str]]:
+    """Compose up to `want` new 2-keyword queries as `(value, reason)` pairs.
+
+    Refresh alone only hands back the questions the seeds happen to contain, and once the
+    pool is small a day has one or two due nodes — a "daily" loop that reads two pages.
+    This widens the frontier along the axis the config already declares: every keyword is
+    paired with the ones after it in `product.keywords`, in a fixed order (no randomness),
+    so the same state always produces the same plan and a dry run is a real preview.
+
+    A pair is skipped when the frontier already holds that exact string for *any* site and
+    *any* status: `UNIQUE(kind, value, site)` only dedupes within a site, and re-asking an
+    answered question under a second site would spend the same budget on the same pages.
+    The whole `candidates` value column is read once into a set — this runs once per run.
+
+    The caller assigns sites round-robin over `_synthesis_sites(cfg)` (the Nth question to
+    the Nth distinct seed site), so habr, github and hf all receive fresh questions and no
+    site is flooded.
+
+    `day` is accepted for call-site symmetry with the rest of the module and is unused:
+    a plan that changes with the calendar is not reproducible.
+    """
+    if want <= 0:
+        return []
+    # A hyphenated entry is a *scoring stem* (`fine-tun`, so that `fine-tuned` and
+    # `fine-tuning` both match), not a word anyone types into a search box: pairing it
+    # produces "lora fine-tun", a query no engine answers as written.
+    keywords = [str(keyword) for keyword in cfg.product.keywords if "-" not in str(keyword)]
+    asked = {str(row["value"]) for row in state.conn.execute("SELECT value FROM candidates")}
+    pairs: list[tuple[str, str]] = []
+    for first, second in itertools.combinations(keywords, 2):
+        value = f"{first} {second}"
+        if value in asked:
+            continue
+        pairs.append((value, f"synth:{first}+{second}"))
+        if len(pairs) >= want:
+            break
+    return pairs
+
+
 # --- run -----------------------------------------------------------------
 
 
 def _empty_counters() -> dict[str, Any]:
     return {
         "queries": 0,
+        # A subset of `queries`: `done` nodes the refresh window made askable again.
+        "refreshed": 0,
+        # Frontier nodes this run minted from `product.keywords` to fill the budget.
+        "synthesized": 0,
         "items": 0,
         "kept": 0,
         "kept_by_site": {},
@@ -1401,32 +1561,85 @@ def run(
         }
 
     with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
+        refresh_days = cfg.limits.refresh_days
         pending = state.candidates(
-            limit=query_budget, sites=sites, retry_errors=cfg.limits.retry_errors
+            limit=query_budget, sites=sites, retry_errors=cfg.limits.retry_errors,
+            refresh_days=refresh_days,
         )
+        # Refresh only hands back questions the seeds already contain, so a small pool can
+        # still leave a day with one due node. Keyword pairs are what keep the daily budget
+        # spent on new territory. A `--site` sweep is an explicit narrow question and is not
+        # topped up; the daily cron always runs unfiltered.
+        new_queries: list[dict[str, Any]] = []
+        if cfg.limits.synthesize_queries and sites is None and len(pending) < query_budget:
+            cycle = _synthesis_sites(cfg)
+            room = cfg.limits.max_frontier - state.frontier(refresh_days=refresh_days)
+            want = min(query_budget - len(pending), max(0, room))
+            if cycle and want > 0:
+                pairs = synthesize_queries(cfg, state, want, day=day)
+                for index, (value, reason) in enumerate(pairs):
+                    site = cycle[index % len(cycle)]
+                    if dry_run:
+                        new_queries.append({
+                            "candidate": f"query/{site}",
+                            "value": value,
+                            "argv": candidate_argv(
+                                {"kind": "query", "site": site, "value": value}
+                            ),
+                            "status": "new",
+                            "reason": reason,
+                            "synthesized": True,
+                        })
+                        continue
+                    if state.add_candidate("query", value, site, reason=reason, priority=0.0):
+                        counters["synthesized"] += 1
+                if not dry_run:
+                    # Re-select: the new rows are `new`, so they rank with the fresh work.
+                    pending = state.candidates(
+                        limit=query_budget, sites=sites,
+                        retry_errors=cfg.limits.retry_errors, refresh_days=refresh_days,
+                    )
+
         if dry_run:
             plan = [
                 {"candidate": f"{cand['kind']}/{cand['site']}", "value": cand["value"],
-                 "argv": candidate_argv(cand)}
+                 "argv": candidate_argv(cand), "status": cand["status"],
+                 "reason": cand.get("reason")}
                 for cand in pending
-            ]
+            ] + new_queries
+            if not plan:
+                _log("frontier empty: nothing is due — see limits.refresh_days")
             return {
                 "dry_run": True,
                 "date": day,
                 "config": str(cfg.path),
                 "queries_planned": len(plan),
                 "items_budget": budget,
-                "frontier": state.frontier(),
+                "frontier": state.frontier(refresh_days=refresh_days),
+                "would_synthesize": len(new_queries),
                 "plan": plan,
                 "counters": counters,
             }
 
+        if not pending:
+            # An idle day must say so on stderr: `report` will print "0 queries" and the next
+            # question is always whether the loop is broken or simply has nothing left due.
+            _log("frontier empty: nothing is due — see limits.refresh_days")
+
         run_id = state.start_run(argv if argv is not None else sys.argv[1:])
         started = time.monotonic()
         per_site: dict[str, int] = {}
+        # Stored *before* `finish_run` persists the counters: `report --date` looks a run up
+        # by the day it collected for, not by the wall clock, so `run --date 2026-11-09` on
+        # the 12th is still readable as the 9th (see `State.runs_for_date`).
+        counters["date"] = day
         try:
             for cand in pending:
                 counters["queries"] += 1
+                if str(cand["status"]) == "done":
+                    # The refresh window brought this answered node back: same question,
+                    # whatever has appeared under it since.
+                    counters["refreshed"] += 1
                 if not str(cand["value"]).strip():
                     # A seed with an empty value can never be executed; drop it, do not fail it.
                     state.set_candidate(int(cand["id"]), "dropped", "empty value")
@@ -1513,7 +1726,7 @@ def run(
                     if no_expand or score < cfg.scoring.expand_min:
                         continue
                     for child in _children(entry, score, cfg)[: cfg.limits.children_per_item]:
-                        if state.frontier() >= cfg.limits.max_frontier:
+                        if state.frontier(refresh_days) >= cfg.limits.max_frontier:
                             counters["frontier_full"] += 1
                             break
                         if state.add_candidate(
@@ -1524,7 +1737,7 @@ def run(
         finally:
             counters["seconds"] = round(time.monotonic() - started, 1)
             state.finish_run(run_id, counters)
-        counters["frontier"] = state.frontier()
+        counters["frontier"] = state.frontier(refresh_days)
         counters["date"] = day
         counters["ok"] = counters["errors"] == 0
         return counters
@@ -2063,7 +2276,7 @@ def report(cfg: MaterialCfg, *, day: str | None = None) -> dict[str, Any]:
     with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
         runs = state.runs_for_date(day)
         items = state.items_for_date(day)
-        frontier = state.frontier()
+        frontier = state.frontier(cfg.limits.refresh_days)
     queries = items_count = kept = duplicates = fetched = errors = 0
     kept_by_site: dict[str, int] = {}
     seconds = 0.0
@@ -2149,7 +2362,7 @@ def status(cfg: MaterialCfg) -> dict[str, Any]:
         )
         payload["candidates"] = {str(row["status"]): int(row["n"]) for row in by_status}
         payload["candidates_total"] = state.candidates_count()
-        payload["frontier"] = state.frontier()
+        payload["frontier"] = state.frontier(cfg.limits.refresh_days)
         payload["items"] = state.items_by_status()
         payload["items_total"] = state.items_total()
         payload["dates"] = state.dates()
@@ -2233,14 +2446,19 @@ def format_add(payload: dict[str, Any]) -> str:
 def format_run(payload: dict[str, Any]) -> str:
     """Either the plan (dry run) or the counters one real run left behind."""
     if payload.get("dry_run"):
+        extra = payload.get("would_synthesize") or 0
         lines = [
             f"run plan {payload['date']}: {payload.get('queries_planned', 0)} query(s), "
             f"item budget {payload.get('items_budget', 0)}, frontier {payload.get('frontier', 0)}"
+            + (f" (+{extra} to synthesize)" if extra else "")
         ]
         for step in payload.get("plan") or []:
             lines.append(f"  {step['candidate']:<14} {' '.join(step['argv'])}")
         if not payload.get("plan"):
-            lines.append("  (nothing new in the frontier — run `msft material seed` first)")
+            lines.append(
+                "  (nothing due — every candidate is done and inside limits.refresh_days; "
+                "`msft material seed` adds questions)"
+            )
         return "\n".join(lines)
     by_site = payload.get("kept_by_site") or {}
     breakdown = ""
