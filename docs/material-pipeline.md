@@ -1,9 +1,9 @@
 # The material pipeline: a daily loop that reads the LoRA/SFT literature for us
 
 `msft material` is a small state machine that visits the sites the stack already knows how to
-drive — Habr, GitHub, Hugging Face, Google AI Mode, DeepSeek, Qwen, and free-form `ask` notes —
-scores what comes back, packs the survivors into one task file, hands that file to a coding
-agent, and posts the resulting notes into the ai-memory wiki.
+drive — Habr, GitHub, Hugging Face, Google AI Mode, DeepSeek, Qwen, X/Twitter, Grok — and free-form
+`ask` notes, scores what comes back, packs the survivors into one task file, hands that file to a
+coding agent, and posts the resulting notes into the ai-memory wiki.
 
 It exists because the product moves. `machinum:4b` was trained with plain LoRA, a 49-pair
 dataset and a hand-written eval gate; every one of those choices is a decision the field
@@ -107,11 +107,13 @@ truth, so a re-run after a crash resumes instead of guessing.
 | --- | --- | --- |
 | `seed` | inserts the configured queries into the frontier | `candidates` |
 | `add` | inserts explicit URLs into the frontier, ahead of every query | `candidates` |
-| `run` | calls webbridge for the due candidates (fresh, retryable, and `done` ones past `limits.refresh_days`), tops a short day up with synthesized pairs, scores, fetches, expands | `candidates`, `items`, `raw/` |
+| `run` | calls webbridge for the due candidates (fresh, retryable, and `done` ones past `limits.refresh_days`), tops a short day up with synthesized pairs, scores, fetches (with Habr's comment tree), expands, records outbound links | `candidates`, `items`, `raw/` |
 | `distill` | packs `packed` items into one file, runs the `at` agent over it | `pack/`, `notes/`, `experiments.md` |
 | `memorize` | posts each `distilled` note to ai-memory | wiki, `INDEX.md` |
 | `report` | one line (or one JSON object) for a date | nothing |
 | `status` | counters for the whole state dir | nothing |
+| `tree` | the net one day drew: candidate → item(s) → their outbound links, as an ASCII tree or `--json` | nothing |
+| `rescore` | re-applies the *current* brief to items an older brief threw away (`scored_out` → `new`); status never moves the other way | `items` |
 
 Exit codes are the contract: `0` ok, `1` the run finished but some items failed, `2` a
 config or environment error (bad YAML, missing token, unwritable directory). Only `2` means
@@ -132,7 +134,26 @@ msft material memorize --workspace default --project data
 msft material report                                # today
 msft material report --date 2026-11-09 --json       # one JSON object on stdout
 msft material status --json
+msft material tree                                  # today's net, one screen
+msft material tree --date 2026-11-10 --depth 3      # two days back, one level deeper
+msft material tree --json                           # same structure, for a dashboard
+msft material rescore --dry-run                     # what today's brief would bring back
+msft material rescore                               # flip them to `new`; the next run fetches them
 ```
+
+**A brief is not frozen.** `run` scores an item once, and `scored_out` is final — correct for a
+stable brief, wrong every time the priorities move. Re-targeting the research to
+summarization/NER/proofreading changed the keyword list, and the 22 posts the old list had
+discarded had to be re-read (`rescore`: 22 rows, 5 back, one at 1.0). `run` therefore also
+drains rows left at `status='new'` — a `rescore` flip, or a run that died between insert and
+fetch — because the query loop only reads what it just found and `state.item(url)` stops the
+same post from being discovered twice.
+
+**The keywords carry both alphabets.** The corpus is mostly Russian while the brief is English,
+and an English-only list scores a perfectly on-topic habr post at `0.00` (found on 2026-11-12:
+six posts on structured output dropped, titles like «Почему ваш LLM-сервис ведёт себя как
+хочет»). Each priority therefore has a Russian stem beside it (`структурированн`, `сущност`,
+`опечатк`, `перевод`, …).
 
 `report` prints one line, and that line is what the cron delivers:
 
@@ -144,7 +165,9 @@ material 2026-11-10: 6 queries → 12 items, 8 kept (habr 5, github 2, hf 1), 3 
 The numbers above are the *format*, not a measurement from this machine. With `--json` the
 same facts arrive as `{date, queries, items, kept, duplicates, fetched, packed, distilled,
 memorized, experiments, frontier, errors, seconds}` — and then everything human-readable goes
-to stderr, so `report --json | jq` is safe in a pipeline.
+to stderr, so `report --json | jq` is safe in a pipeline. `run --json` additionally carries
+`comments_fetched`, `comments_failed`, `links_queued` and `links_known`; `report` does not sum
+those four, because they describe the fetch, not the funnel.
 
 Environment overrides the CLI reads itself (the script only forwards the path ones):
 
@@ -167,6 +190,7 @@ reviewing in a diff. Four blocks matter:
 | `product` | `keywords`, `negative`, `domain_terms` | the definition of relevance; every score is computed against these lists |
 | `limits` | `queries_per_run`, `items_per_run`, `items_per_site` | how much a single run may spend; the first thing to cut when a run is too slow |
 | `limits` | `max_frontier`, `children_per_item` | how fast the frontier may grow from expansion; the second thing to cut |
+| `limits` | `links_per_item` | outbound links per item, per kind: how many hosts-with-a-recipe become fetch jobs (default 4) and how many hints are recorded (same cap). `0` turns link extraction into hints-only |
 | `limits` | `refresh_days` | how long an answered query stays answered. `3` means a keyword is re-asked every fourth day for whatever appeared under it; `0` restores the old one-shot crawl |
 | `limits` | `synthesize_queries` | `true` tops a short day up with keyword pairs from `product.keywords`, so the budget is spent even when nothing is due |
 | `scoring` | `keep_min`, `expand_min` | the two thresholds: below `keep_min` an item dies, below `expand_min` it is not used as a parent |
@@ -186,7 +210,8 @@ docs/material/
   .state/material.db            SQLite: candidates, items, runs, kv — the only source of truth
   .state/lock                   flock target; never committed, never read
   raw/<date>/<site>-<slug>.json exact webbridge output, for re-parsing without the network
-  raw/<date>/<site>-<slug>.txt  normalize_text(body), what the agent actually reads
+  raw/<date>/<site>-<slug>.txt  normalize_text(body) + the comment tree, what the agent reads
+  raw/<date>/<site>-<slug>.comments.json  the exact Habr comment payload, provenance
   pack/<date>.md                the distill task file: brief, rules, schema, one section per item
   notes/<date>/<slug>.md        written by the agent: frontmatter + five sections
   INDEX.md                      table of memorized notes (date, title, site, score, experiment)
@@ -247,7 +272,27 @@ run enqueues children with `parent=<url>`, at most `children_per_item` of them:
 
 The frontier is capped at `limits.max_frontier` rows; when it is full the run counts and skips
 (`frontier_full` in the counters) rather than dropping what it already has. `--no-expand`
-turns the whole mechanism off for a cheap sweep.
+turns the whole mechanism off for a cheap sweep — tags, authors *and* links.
+
+**Links — a page is also a list of leads.** Expansion asks what a page *is*; links ask what it
+*points at*, and for this product that is usually the more useful question (an article about
+QLoRA ends with the repo, the paper and the dataset). After a successful fetch every http(s) URL
+in the article body **and** in the comment tree is classified by host:
+
+| Link host | Row | What happens |
+| --- | --- | --- |
+| `github.com`, `huggingface.co`, `habr.com` | `kind='url'`, `reason='link:<host>'`, `parent=<item url>`, `priority=<item score>` | a real frontier node: the next run extracts it like any other URL |
+| anything else (arxiv, `x.com`, a vendor blog) | `kind='hint'`, `status='hint'` | a leaf the note and `tree` can show; no recipe, so it is *never* a fetch job |
+
+Both kinds hang off the item URL, so the chain is readable in both directions. `UNIQUE(kind,
+value, site)` makes a link found twice — in the body and in a comment — one node, and
+`limits.links_per_item` caps each kind per item, because a note with forty links is not a reading
+list. A hint is stored in `candidates` with `status='hint'`, which no frontier query selects:
+`candidates()`, `frontier()` and `status` never see it as work, and the tree can still draw it.
+Counters: `links_queued` (new fetch jobs), `links_known` (the frontier already had it).
+
+Habr's own JSON endpoints (`habr.com/kek/…`) are excluded on purpose: they sit on a host with a
+recipe, but fetching a comment payload as if it were an article wastes a browser call.
 
 **Refresh — a question is not one-shot.** A `done` candidate whose `updated_at` is at least
 `limits.refresh_days` old is eligible again (3 days in the shipped config). This is the
@@ -295,6 +340,91 @@ neural, transformer, нейросет, модел, обучен, токениз,
 
 The same veto shape handles the other recurring noise: `negative: [hiring, webinar, podcast,
 discount, black friday]` scores 0 outright, before any recency or star bonus can rescue it.
+
+## The net: comments, links, and `tree`
+
+The loop is not a keyword sweep that ends in a list of hits. A page that survives the score
+arrives with its discussion and leaves a trail of links, and the point of both is that the reader
+can follow them further.
+
+**Habr's comment tree.** The browser recipe returns `#post-content-body`, which is the author's
+half of the page: the numbers people actually ask about (VRAM, batch size, how long the run took,
+what the dataloader cost) usually show up in the comments, and the author often answers there.
+So after a Habr article is extracted, `run` also reads
+
+```
+https://habr.com/kek/v2/articles/<id>/comments/?sort=date&fl=ru&hl=ru
+```
+
+public JSON, one GET, no browser and no auth. The rendered tree is appended to the raw text under
+a `# Комментарии` delimiter, the exact payload is kept as
+`raw/<date>/habr-<slug>.comments.json`, and `items.comments` counts the published comments.
+Roots come from `parentId == null` only — Habr's `threads` array also lists replies, and walking
+both printed the author's answers twice.
+
+The rules that keep it safe:
+
+- **A comment failure never fails the item.** `_fetch_comments` is a module-level seam returning
+  `(payload, error)`; an error is `comments_failed` in the counters and a stderr line, and the
+  article stays `fetched`. The article is the expensive half (a real browser render) and must not
+  be thrown away because a JSON endpoint was throttled.
+- **Comments get their own slice of the pack.** The pack's per-item body is the article head plus
+  `PACK_COMMENT_LIMIT` characters of comment tree, so a 14 kB article no longer hides the
+  discussion behind the 8 000-char budget. The `.txt` itself is still capped at `TEXT_LIMIT`
+  (40 000) by `normalize_text`; a very long thread is truncated *there*, and the
+  `.comments.json` sidecar holds all of it.
+- **The item row says so.** `items.comments` is an added column; an existing `material.db` is
+  migrated in place by a `PRAGMA table_info` check plus `ALTER TABLE` on open (`State._migrate`),
+  because `CREATE TABLE IF NOT EXISTS` never touches a table that already exists and rebuilding
+  the database would throw away weeks of reading history.
+
+**`tree` — the shape of a day.** Three edges make the net: `candidates.parent` (the item a child
+question came from), `items.parent` (inherited from the producing candidate) and the link rows
+hanging off the item URL. `msft material tree` draws exactly those rows:
+
+```
+material tree 2026-11-12 · 9 item(s) · 21 candidate(s) · 1 link node(s) · 1 hint(s)
+root · 8 item(s) whose parent is not in this day
+├─ habr 1 · memorized  Parameter-Efficient Fine-Tuning (PEFT): методы LoRA, Prefix…
+│  ├─ [tag] habr · done  peft
+│  ├─ [author] habr · done  dbaturova
+│  ├─ link github  https://github.com/huggingface/peft
+│  └─ habr 0.36 · memorized  Эффективный инференс множества LoRA адаптеров  ← 791966
+└─ github 0.88 · memorized  modelscope/ms-swift
+```
+
+`--depth` bounds the walk (default 2: the day's items plus their branches), `--json` returns the
+same structure for a dashboard, and a day with no items prints one line instead of an empty box.
+Nothing is inferred from files: the tree is a rendering of the rows, so a link that was never
+fetched still appears (`link`), a lead with no recipe appears as a hint, and an item whose parent
+lives on an earlier day is a root with the parent's id marked (`← 791966`).
+
+**X/Twitter and Grok are search sources too.** `SITES` carries `twitter` and `grok`:
+
+- `kind=query, site=twitter` → `search twitter <query>`, parsed one row per tweet
+  (`author`, `handle`, `text`, ISO `time`, permalink). The permalink is the item URL — a tweet is
+  addressable — and a relative one (`/user/status/1234`) gets the `https://x.com` prefix; the
+  handle lands in `items.author`. A high-scoring tweet expands to `kind=author`, which
+  `candidate_argv` turns into `search twitter from:<handle>`, because X has no author page to
+  extract and `from:` is how its search grammar asks for one account.
+- `kind=note, site=grok` → `ask grok <question>`: grok is a chat site, so the frontier node holds
+  a *question*, not a keyword, and the answer is one item. Its URL is the site home plus a hash
+  of the question (`https://grok.com/?ask=<sha1>`), because a chat answer has no permalink that
+  survives a re-ask: the marker in the *query* (not a fragment — `canonical_url` drops fragments,
+  which would collapse every answer into one item) makes the same question dedupe onto one row
+  and a different question a different row. Grok expands nothing: an answer has no tags, no
+  author and no topics, and turning a model's citations into fetch jobs is not discovery.
+
+Both degrade the way every other source does: a payload with no `items`/`data`/`text` yields no
+items and the candidate is `done` — never an exception, never a failed run.
+
+**A fetch validates the payload, not the exit code.** webbridge drives one shared, stateful
+browser: an `extract` issued while the tab still sits on another page returns *that* page — its
+own `url`, `found: false`, and `text: '""'` (how the client prints an empty extraction). The first
+live run after the re-target stored one such payload as a success: a 3-byte `.txt` for a 12 KB
+article, marked `fetched`. `_extract_error` now refuses a foreign host, `found: false`, and an
+empty-or-quoted-empty text as retryable errors, and a whitespace-only body is an error too — so
+after a bad day read `items.status='error'`, not the run's `errors: 0`.
 
 ## Reading one page on purpose
 
@@ -422,6 +552,7 @@ silently creates a frontier hides a typo in `configs/material.yaml`), then
 | items stuck `packed` for days | the agent never accepted the pack | `SELECT url, error FROM items WHERE status='packed'` |
 | `memorize` 4xx | ai-memory down, wrong workspace/project, stale token | `curl -s localhost:49374/healthz`, then `memory-stack.md` |
 | `memorize` 5xx | the wiki store refused the write; the note file is kept | re-run `memorize` after fixing the service — it is idempotent by path |
+| an item is `fetched` but its `.txt` is a few bytes | the browser tab was still on another page: `extract` returned that page's payload (`found: false`, a foreign `url`, `text: '""'`). `_extract_error` now refuses all three as retryable errors, so this row means it happened *before* that guard | `SELECT url, error FROM items WHERE status='error'`; the next run retries (`limits.retry_errors`) |
 | everything green, report says `0 items` | the sites answered and nothing scored | `items` rows with `scored_out` say why; usually `keep_min` |
 | everything green, report says `0 queries` | the frontier had nothing due: every candidate is `done` and inside `limits.refresh_days`, and synthesis is off or full | `msft material status` (frontier count), then `limits.refresh_days` / `limits.synthesize_queries` in `configs/material.yaml`; a real run also prints `frontier empty: nothing is due` on stderr |
 
@@ -459,6 +590,16 @@ WHERE first_seen_at >= '2026-11-10' GROUP BY site ORDER BY n DESC;
 -- why the funnel narrowed
 SELECT url, site, score, title FROM items
 WHERE status = 'scored_out' ORDER BY score DESC LIMIT 20;
+
+-- comments and links: what each page carried
+SELECT url, comments FROM items WHERE comments > 0 ORDER BY comments DESC LIMIT 10;
+
+SELECT c.parent AS item, c.kind, c.site, c.value
+FROM candidates c WHERE c.reason LIKE 'link:%' OR c.reason LIKE 'hint:%'
+ORDER BY c.parent, c.id;
+
+-- the shape of one day, without the SQL
+-- msft material tree --date 2026-11-12
 
 SELECT url, site, content_sha FROM items WHERE status = 'duplicate';
 

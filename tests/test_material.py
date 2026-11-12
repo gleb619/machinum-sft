@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+import sqlite3
 import stat
 from pathlib import Path
 from typing import Any
@@ -97,6 +99,18 @@ def cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> material.MaterialCfg
     return material.load_material_config(path)
 
 
+@pytest.fixture(autouse=True)
+def offline_comments(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test may open a socket for Habr's comment JSON: the seam answers "nothing" by default.
+
+    A test that wants a comment tree patches `_fetch_comments` itself; this default keeps every
+    other test exactly as offline as it was before comments joined the fetch path.
+    """
+    monkeypatch.setattr(
+        material, "_fetch_comments", lambda article, timeout: (None, "offline test")
+    )
+
+
 @pytest.fixture
 def seeded(cfg: material.MaterialCfg) -> material.MaterialCfg:
     """The same config, with `msft material seed` already run once."""
@@ -181,13 +195,20 @@ def test_shipped_config_loads_and_validates() -> None:
     cfg = material.load_material_config()
     assert cfg.product.name == "machinum-sft"
     assert "qlora" in cfg.product.keywords
-    # six keyword sweeps plus the four committed explicit reads at the top of `seeds:`
-    assert len(cfg.seeds) == 10
+    # The list carries both alphabets: the corpus is mostly Russian, and an English-only keyword
+    # list scores an on-topic habr post at 0 (found on 2026-11-12, six good posts dropped).
+    assert any(re.search(r"[а-яё]", word) for word in cfg.product.keywords), "no Russian stems"
+    # Explicit reads come first — they are the ones a human asked for.
     assert [seed.kind for seed in cfg.seeds[:4]] == ["url"] * 4
+    assert len(cfg.seeds) >= 10
+    assert {seed.site for seed in cfg.seeds} <= set(material.SITES), "a seed names a known site"
+    assert {"twitter", "grok"} <= {seed.site for seed in cfg.seeds}, "social sources are wired"
     assert cfg.limits.items_per_run == 12
     assert cfg.limits.refresh_days == 3, "the daily loop must re-ask its questions"
     assert cfg.limits.synthesize_queries is True
+    assert cfg.limits.links_per_item == 4
     assert cfg.scoring.expand_min == 0.6
+    assert cfg.scoring.site_prior["twitter"] == 0.02
     assert cfg.memory.path_prefix == "projects/machinum-sft/material"
     assert cfg.distill.agent == "ds-code"
 
@@ -270,6 +291,118 @@ def test_site_for_url_maps_known_hosts_and_refuses_unknown() -> None:
     assert material.site_for_url("https://m.habr.com/ru/articles/1/") == "habr"
     with pytest.raises(ConfigError, match="no site recipe"):
         material.site_for_url("https://example.com/x")
+
+
+def test_rescore_brings_back_what_an_older_brief_threw_away(cfg: material.MaterialCfg) -> None:
+    """Re-targeting the brief must reach the posts yesterday's keywords discarded."""
+    url = "https://habr.com/ru/articles/424242/"
+    with material.State(cfg.db_path) as state:
+        state.conn.execute(
+            "INSERT INTO items (url, site, title, summary, score, status, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (url, "habr", "LoRA адаптеры для LLM на практике", "", 0.0, "scored_out",
+             "2026-11-01T00:00:00Z"),
+        )
+        state.conn.commit()
+
+    dry = material.rescore(cfg, dry_run=True)
+    assert dry["scored_out"] == 1
+    assert dry["flipped"] == 1
+    assert "would keep" in material.format_rescore(dry)
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute("SELECT status, score FROM items WHERE url = ?", (url,)).fetchone()
+    assert row["status"] == "scored_out", "a dry run must not touch the row"
+
+    real = material.rescore(cfg)
+    assert real["flipped"] == 1 and real["still_out"] == 0
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute("SELECT status, score FROM items WHERE url = ?", (url,)).fetchone()
+    assert row["status"] == "new"
+    assert row["score"] >= cfg.scoring.keep_min
+    assert material.rescore(cfg)["scored_out"] == 0, "a flipped row is no longer scored_out"
+
+
+def test_rescore_leaves_a_genuinely_off_topic_row_out(cfg: material.MaterialCfg) -> None:
+    url = "https://habr.com/ru/articles/434343/"
+    with material.State(cfg.db_path) as state:
+        state.conn.execute(
+            "INSERT INTO items (url, site, title, summary, score, status, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (url, "habr", "Как я готовил паэлью", "кулинария", 0.0, "scored_out",
+             "2026-11-01T00:00:00Z"),
+        )
+        state.conn.commit()
+    result = material.rescore(cfg)
+    assert result["flipped"] == 0 and result["still_out"] == 1
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute("SELECT status FROM items WHERE url = ?", (url,)).fetchone()
+    assert row["status"] == "scored_out"
+
+
+def test_run_fetches_a_kept_but_unread_item_with_no_query_at_all(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `rescore` flip must actually be read; the query loop alone would never fetch it."""
+    url = "https://habr.com/ru/articles/454545/"
+    with material.State(cfg.db_path) as state:
+        state.conn.execute(
+            "INSERT INTO items (url, site, title, summary, score, status, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (url, "habr", "Структурированный вывод LLM", "", 0.5, "new", "2026-11-01T00:00:00Z"),
+        )
+        state.conn.commit()
+
+    seen: list[str] = []
+
+    def fake_fetch(_cfg, _entry, target, _day):  # noqa: ANN001 - test seam
+        seen.append(target)
+        return material.Fetched(body="длинный текст про LLM", raw=None, article="длинный текст")
+
+    monkeypatch.setattr(material, "_fetch_body", fake_fetch)
+    result = material.run(cfg, day=DAY, limit=0)
+    assert seen == [url], "the pending row must be fetched even though no query ran"
+    assert result["fetched"] == 1
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute(
+            "SELECT status, raw_path FROM items WHERE url = ?", (url,)
+        ).fetchone()
+    assert row["status"] == "fetched"
+    assert row["raw_path"]
+
+
+def test_extract_error_rejects_a_wrong_or_empty_page() -> None:
+    """A stale tab returns another page; that is an error, not a 3-byte article."""
+    habr = "https://habr.com/ru/articles/1057472/"
+    ok = {"url": habr, "text": "настоящая статья про LLM", "found": True}
+    assert material._extract_error(ok, habr) is None
+    # m.habr.com is the same page; www is dropped by the comparison.
+    assert material._extract_error({**ok, "url": "https://m.habr.com/x"}, habr) is None
+    assert "found nothing" in (material._extract_error({**ok, "found": False}, habr) or "")
+    google = {**ok, "url": "https://www.google.com/search?udm=50&q=x"}
+    assert "google.com" in (material._extract_error(google, habr) or "")
+    # the client prints `""` for an empty extraction, and that used to pass as a body
+    assert "empty text" in (material._extract_error({**ok, "text": '""'}, habr) or "")
+    assert "empty text" in (material._extract_error({**ok, "text": "   \n "}, habr) or "")
+
+
+def test_fetch_body_marks_a_stale_tab_as_an_error(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the seam: the payload of the wrong page never becomes a body."""
+    url = "https://habr.com/ru/articles/1057472/"
+    payload = {
+        "site": "habr",
+        "found": False,
+        "op": "extract",
+        "url": "https://www.google.com/search?udm=50&q=go",
+        "text": '""',
+    }
+    monkeypatch.setattr(
+        material, "run_webbridge", lambda argv, timeout: (0, json.dumps(payload), "")
+    )
+    result = material._fetch_body(cfg, {"site": "habr", "url": url}, url, DAY)
+    assert result.error and "google.com" in result.error
+    assert result.body == ""
 
 
 def test_add_urls_canonicalises_dedupes_and_is_idempotent(cfg: material.MaterialCfg) -> None:
@@ -1554,3 +1687,498 @@ def test_config_negative_refresh_days_is_a_config_error(tmp_path: Path) -> None:
     path = write_config(tmp_path, limits__refresh_days=-1)
     with pytest.raises(ConfigError, match="refresh_days"):
         material.load_material_config(path)
+
+
+# --- comments, links and the tree ----------------------------------------
+
+
+def comments_payload() -> dict[str, Any]:
+    """A comment payload in the shape `/kek/v2/articles/<id>/comments/` returns.
+
+    `threads` lists the root *and* the reply — that is the trap: a walker that treats `threads`
+    as the root list renders the reply twice, which is what the side script already paid for.
+    """
+    return {
+        "comments": {
+            "1001": {
+                "id": 1001, "parentId": None, "status": "published", "score": 7,
+                "timePublished": "2026-11-09T12:30:00+00:00", "isPostAuthor": True,
+                "author": {"alias": "alice", "fullname": "Alice"},
+                "message": (
+                    '<p>Обучал на 24 GB, batch 4. Код: '
+                    '<a href="https://github.com/huggingface/peft">PEFT</a></p>'
+                ),
+                "children": ["1002"],
+            },
+            "1002": {
+                "id": 1002, "parentId": 1001, "status": "published", "score": 1,
+                "timePublished": "2026-11-09T13:00:00+00:00", "isPostAuthor": False,
+                "author": {"alias": "bob", "fullname": ""},
+                "message": "<p>Методика из https://arxiv.org/abs/2401.01234 работает лучше</p>",
+                "children": [],
+            },
+        },
+        "threads": [1001, 1002],
+    }
+
+
+def twitter_search(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"site": "twitter", "op": "search", "mode": "all", "items": rows, "count": len(rows)}
+
+
+TWEET = {
+    "author": "Nate Friedman",
+    "handle": "@natfriedman",
+    "text": "QLoRA adapter on one 16 GB card, dataset of 12k pairs — repo in the reply",
+    "time": "2026-11-09T10:00:00.000Z",
+    "link": "/natfriedman/status/1234567890",
+}
+
+
+def test_comments_are_appended_to_the_raw_text_and_counted(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The article body is half the page: the comment tree carries the author's own numbers."""
+    material.seed(cfg)
+    asked: list[str] = []
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", "LoRA fine-tuning LLM"): habr_search([STRONG]),
+            ("extract", "habr", "https://habr.com/ru/articles/900001"): {
+                "site": "habr",
+                "text": "Article body about LoRA",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        material,
+        "_fetch_comments",
+        lambda article, timeout: (asked.append(article) or comments_payload(), None),
+    )
+    result = material.run(cfg, day=DAY, sites=["habr"], no_expand=True)
+
+    assert asked == ["900001"], "the comment API is keyed by the numeric article id"
+    assert result["comments_fetched"] == 1
+    assert result["comments_failed"] == 0
+    assert result["fetched"] == 1 and result["errors"] == 0
+    with material.State(cfg.db_path) as state:
+        row = state.item("https://habr.com/ru/articles/900001")
+    assert row is not None and row["comments"] == 2
+
+    slug = material.slugify(str(row["url"]))
+    text = (cfg.raw_dir / DAY / f"habr-{slug}.txt").read_text(encoding="utf-8")
+    assert "Article body about LoRA" in text
+    assert material.COMMENT_HEADING in text
+    assert "24 GB" in text, "the number only the comments carried must reach the raw text"
+    assert "https://arxiv.org/abs/2401.01234" in text
+    assert (cfg.raw_dir / DAY / f"habr-{slug}.comments.json").is_file()
+
+
+def test_comment_fetch_failure_keeps_the_item_and_increments_a_counter(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A comment timeout must never lose the article a browser already rendered."""
+    material.seed(cfg)
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", "LoRA fine-tuning LLM"): habr_search([STRONG]),
+            ("extract", "habr", "https://habr.com/ru/articles/900001"): {
+                "site": "habr",
+                "text": "Article body about LoRA",
+            },
+        },
+    )
+    monkeypatch.setattr(material, "_fetch_comments", lambda article, timeout: (None, "HTTP 503"))
+    result = material.run(cfg, day=DAY, sites=["habr"], no_expand=True)
+
+    assert result["comments_failed"] == 1
+    assert result["comments_fetched"] == 0
+    assert result["fetched"] == 1, "the item is fetched, only its comments are missing"
+    assert result["errors"] == 0
+    with material.State(cfg.db_path) as state:
+        row = state.item("https://habr.com/ru/articles/900001")
+    assert row is not None
+    assert row["status"] == "fetched"
+    assert row["comments"] == 0
+    text = (cfg.raw_dir / DAY / f"habr-{material.slugify(str(row['url']))}.txt").read_text(
+        encoding="utf-8"
+    )
+    assert "Article body about LoRA" in text
+    assert material.COMMENT_HEADING not in text
+
+
+def test_comment_roots_come_only_from_parentless_comments() -> None:
+    block, count = material.comment_block(comments_payload(), "900001")
+    assert count == 2
+    assert block.count("arxiv.org") == 1, "the reply is listed in `threads` too — render it once"
+    assert block.count("24 GB") == 1
+    assert "[автор статьи]" in block
+    assert "#### 2. bob" in block, "the reply is a child of the root, not a second root"
+    assert block.count("score 7") == 1
+
+
+def test_links_are_extracted_from_body_and_comments(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    material.seed(cfg)
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", "LoRA fine-tuning LLM"): habr_search([STRONG]),
+            ("extract", "habr", "https://habr.com/ru/articles/900001"): {
+                "site": "habr",
+                "text": "Body naming a repo: https://github.com/huggingface/peft",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        material, "_fetch_comments", lambda article, timeout: (comments_payload(), None)
+    )
+    material.run(cfg, day=DAY, sites=["habr"], no_expand=False)
+
+    item_url = "https://habr.com/ru/articles/900001"
+    with material.State(cfg.db_path) as state:
+        rows = {
+            str(row["value"]): dict(row)
+            for row in state.conn.execute(
+                "SELECT * FROM candidates WHERE parent = ?", (item_url,)
+            )
+        }
+    assert "https://github.com/huggingface/peft" in rows, "the body's link is a node"
+    assert "https://arxiv.org/abs/2401.01234" in rows, "a comment's link is a node too"
+    assert rows["https://arxiv.org/abs/2401.01234"]["kind"] == "hint"
+
+
+def test_github_link_becomes_one_url_candidate_with_parent_and_reason(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    material.seed(cfg)
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", "LoRA fine-tuning LLM"): habr_search([STRONG]),
+            ("extract", "habr", "https://habr.com/ru/articles/900001"): {
+                "site": "habr",
+                "text": "Repo: https://github.com/huggingface/peft/ and again "
+                        "https://github.com/huggingface/peft?utm_source=habr",
+            },
+        },
+    )
+    material.run(cfg, day=DAY, sites=["habr"], no_expand=False)
+
+    with material.State(cfg.db_path) as state:
+        rows = [
+            dict(row)
+            for row in state.conn.execute(
+                "SELECT * FROM candidates WHERE kind = 'url' AND value LIKE 'https://github%'"
+            )
+        ]
+    assert len(rows) == 1, "the same link twice — and with utm noise — is one node"
+    row = rows[0]
+    assert row["value"] == "https://github.com/huggingface/peft"
+    assert row["site"] == "github"
+    assert row["parent"] == "https://habr.com/ru/articles/900001"
+    assert row["reason"] == "link:github.com", "the reason names the host the lead came from"
+    assert row["status"] == "new"
+    assert row["priority"] > 0, "the item's score is the link node's priority"
+
+
+def test_arxiv_link_is_a_hint_not_a_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MSFT_MATERIAL_DIR", str(tmp_path / "material"))
+    monkeypatch.setenv("MSFT_MEMORY_TOKEN", "test-token")
+    cfg = material.load_material_config(
+        write_config(
+            tmp_path, seeds=[{"kind": "query", "site": "habr", "value": "LoRA fine-tuning LLM"}]
+        )
+    )
+    material.seed(cfg)
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", "LoRA fine-tuning LLM"): habr_search([STRONG]),
+            ("extract", "habr", "https://habr.com/ru/articles/900001"): {
+                "site": "habr",
+                "text": "Paper: https://arxiv.org/abs/2401.01234",
+            },
+        },
+    )
+    result = material.run(cfg, day=DAY, sites=["habr"], no_expand=False)
+
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute(
+            "SELECT * FROM candidates WHERE value = ?", ("https://arxiv.org/abs/2401.01234",)
+        ).fetchone()
+        frontier = state.frontier()
+        due = state.candidates(limit=10)
+    assert row is not None
+    assert dict(row)["kind"] == "hint"
+    assert dict(row)["status"] == "hint"
+    assert dict(row)["site"] == "arxiv.org"
+    assert result["links_queued"] == 0, "no recipe, so no fetch job"
+    assert frontier == 2, "only the tag/author children are frontier work, not the hint"
+    assert all(cand["kind"] != "hint" for cand in due), "a hint is never handed to the runner"
+
+
+def test_links_per_item_caps_the_enqueue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MSFT_MATERIAL_DIR", str(tmp_path / "material"))
+    monkeypatch.setenv("MSFT_MEMORY_TOKEN", "test-token")
+    cfg = material.load_material_config(
+        write_config(
+            tmp_path,
+            limits__links_per_item=1,
+            seeds=[{"kind": "query", "site": "habr", "value": "LoRA fine-tuning LLM"}],
+        )
+    )
+    material.seed(cfg)
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", "LoRA fine-tuning LLM"): habr_search([STRONG]),
+            ("extract", "habr", "https://habr.com/ru/articles/900001"): {
+                "site": "habr",
+                "text": "https://github.com/a/one https://github.com/b/two "
+                        "https://github.com/c/three",
+            },
+        },
+    )
+    result = material.run(cfg, day=DAY, sites=["habr"], no_expand=False)
+
+    with material.State(cfg.db_path) as state:
+        rows = state.conn.execute(
+            "SELECT value FROM candidates WHERE kind = 'url' AND reason = 'link:github.com'"
+        ).fetchall()
+    assert [str(row["value"]) for row in rows] == ["https://github.com/a/one"]
+    assert result["links_queued"] == 1
+
+
+def test_config_links_per_item_defaults_to_four(tmp_path: Path) -> None:
+    assert "links_per_item" not in BASE_CONFIG["limits"]
+    cfg = material.load_material_config(write_config(tmp_path))
+    assert cfg.limits.links_per_item == 4
+    assert material.LimitsCfg().links_per_item == 4
+
+
+def test_twitter_search_rows_parse_into_items(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MSFT_MATERIAL_DIR", str(tmp_path / "material"))
+    monkeypatch.setenv("MSFT_MEMORY_TOKEN", "test-token")
+    cfg = material.load_material_config(
+        write_config(
+            tmp_path, seeds=[{"kind": "query", "site": "twitter", "value": "lora"}]
+        )
+    )
+    material.seed(cfg)
+    bridge = install(
+        monkeypatch, {("search", "twitter", "lora"): twitter_search([TWEET])}
+    )
+    result = material.run(cfg, day=DAY, sites=["twitter"], no_expand=True)
+
+    assert bridge.argv[0] == ["search", "twitter", "lora"]
+    assert result["items"] == 1
+    assert result["fetched"] == 1
+    with material.State(cfg.db_path) as state:
+        row = state.item("https://x.com/natfriedman/status/1234567890")
+    assert row is not None, "a relative permalink gets the x.com prefix"
+    assert row["site"] == "twitter"
+    assert row["author"] == "@natfriedman", "the handle is the author, the display name is not"
+    assert row["published"] == "2026-11-09T10:00:00.000Z"
+    assert "QLoRA adapter" in (row["summary"] or "")
+
+
+def test_grok_answer_is_one_item_with_a_stable_url(cfg: material.MaterialCfg) -> None:
+    cand = {"kind": "note", "site": "grok", "value": "which rank for a 16 GB card?"}
+    payload = {"site": "grok", "op": "ask", "text": "r=16 with alpha 32.", "answered": True}
+    first = material.items_from_payload(payload, cand, cfg)
+    again = material.items_from_payload(payload, cand, cfg)
+    other = material.items_from_payload(
+        payload, {**cand, "value": "another question"}, cfg
+    )
+
+    assert len(first) == 1
+    assert first[0]["site"] == "grok"
+    assert first[0]["url"].startswith("https://grok.com/")
+    assert first[0]["url"] == again[0]["url"], "the same question dedupes onto one item"
+    assert other[0]["url"] != first[0]["url"], "a different question is a different item"
+    assert material.items_from_payload({"site": "grok", "text": ""}, cand, cfg) == []
+    assert material.items_from_payload(None, cand, cfg) == []
+
+
+def test_grok_node_argv_is_ask(cfg: material.MaterialCfg) -> None:
+    assert material.candidate_argv(
+        {"kind": "note", "site": "grok", "value": "which rank?"}
+    ) == ["ask", "grok", "which rank?"]
+    assert "grok" in material.SITES and "twitter" in material.SITES
+
+
+def test_twitter_expands_a_good_account_and_grok_expands_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MSFT_MATERIAL_DIR", str(tmp_path / "material"))
+    cfg = material.load_material_config(
+        write_config(
+            tmp_path,
+            expansion__per_site={"habr": ["tag", "author"], "twitter": ["author"]},
+            expansion__allow_kinds=["tag", "author", "repo", "model"],
+        )
+    )
+    tweet = {"site": "twitter", "author": "@natfriedman", "tags": []}
+    children = material._children(tweet, 0.9, cfg)
+    assert [child.kind for child in children] == ["author"]
+    assert material.candidate_argv(
+        {"kind": "author", "site": "twitter", "value": "@natfriedman"}
+    ) == ["search", "twitter", "from:natfriedman"]
+
+    assert material._children({"site": "twitter", "author": "@x", "tags": []}, 0.5, cfg) == []
+    assert material._children({"site": "grok", "author": None, "tags": []}, 1.0, cfg) == []
+
+
+def chain_two_items(cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run twice so one fetched page has a child page of its own; returns the child URL."""
+    child = habr_item(
+        "https://habr.com/ru/articles/900010/",
+        "QLoRA adapter follow-up",
+        summary="<p>llm adapter, 12k dataset</p>",
+        published="Tue, 10 Nov 2026 09:00:00 +0000",
+        tags=["ml"],
+        author="alice",
+    )
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", "LoRA fine-tuning LLM"): habr_search([STRONG]),
+            ("extract", "habr", "https://habr.com/ru/articles/900001"): {
+                "site": "habr",
+                "text": "Body naming a repo: https://github.com/huggingface/peft",
+            },
+            ("search", "habr", "machine learning"): habr_search([child]),
+            ("extract", "habr", "https://habr.com/ru/articles/900010"): {
+                "site": "habr",
+                "text": "follow-up body about QLoRA",
+            },
+        },
+    )
+    material.seed(cfg)
+    material.run(cfg, day=DAY, sites=["habr"], no_expand=False)
+    material.run(cfg, day=DAY, sites=["habr"], limit=1, no_expand=False)
+    return "https://habr.com/ru/articles/900010"
+
+
+def test_tree_contains_the_parent_child_relationship(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_url = chain_two_items(cfg, monkeypatch)
+    payload = material.tree(cfg, day=DAY)
+
+    parents = {root["url"]: root for root in payload["roots"]}
+    parent_url = "https://habr.com/ru/articles/900001"
+    assert parent_url in parents, "the article whose parent is outside the day is a root"
+    nested = [kid["url"] for kid in parents[parent_url]["children"]]
+    assert child_url in nested, "the tag child's page hangs off the article that named the tag"
+    assert {"tag", "author"} <= {cand["kind"] for cand in parents[parent_url]["candidates"]}
+    assert [link["url"] for link in parents[parent_url]["links"]] == [
+        "https://github.com/huggingface/peft"
+    ], "a link row is drawn under `links`, not twice as a candidate"
+    assert any(link["url"] == "https://github.com/huggingface/peft"
+               for link in parents[parent_url]["links"])
+
+    text = material.format_tree(payload)
+    lines = text.splitlines()
+    parent_at = next(
+        i for i, line in enumerate(lines) if "LoRA fine-tuning LLM на практике" in line
+    )
+    child_at = next(i for i, line in enumerate(lines) if "QLoRA adapter follow-up" in line)
+    assert parent_at < child_at
+    assert lines[child_at].startswith(("│  ", "   ")), "the child is indented under its parent"
+    assert "link github  https://github.com/huggingface/peft" in text
+
+
+def test_tree_on_a_day_without_items_is_one_line(cfg: material.MaterialCfg) -> None:
+    material.seed(cfg)
+    payload = material.tree(cfg, day="2026-01-01")
+    assert payload["items"] == 0 and payload["roots"] == []
+    text = material.format_tree(payload)
+    assert text.count("\n") == 0
+    assert "no items" in text
+
+
+def test_cli_material_tree_json(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    chain_two_items(cfg, monkeypatch)
+    argv = ["material", "tree", "--date", DAY, "--json", "--config", str(cfg.path)]
+    assert main(argv) == 0
+    payload = one_object(capsys.readouterr().out)
+    assert payload["date"] == DAY
+    assert payload["items"] == 2
+    assert payload["roots"]
+
+    assert main(["material", "tree", "--date", DAY, "--config", str(cfg.path)]) == 0
+    text = capsys.readouterr().out
+    assert text.startswith(f"material tree {DAY} ·")
+
+
+def test_state_migrates_an_old_database_in_place(tmp_path: Path) -> None:
+    """`CREATE TABLE IF NOT EXISTS` never adds a column, so an existing DB is altered, not lost."""
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE items (url TEXT PRIMARY KEY, site TEXT NOT NULL, title TEXT, "
+        "author TEXT, published TEXT, tags TEXT, summary TEXT, content_sha TEXT, "
+        "score REAL NOT NULL DEFAULT 0, status TEXT NOT NULL, raw_path TEXT, "
+        "digest_path TEXT, parent TEXT, error TEXT, first_seen_at TEXT NOT NULL, "
+        "fetched_at TEXT, distilled_at TEXT, memorized_at TEXT);"
+        "INSERT INTO items (url, site, status, first_seen_at) "
+        "VALUES ('https://habr.com/ru/articles/1', 'habr', 'fetched', '2026-11-01');"
+    )
+    conn.commit()
+    conn.close()
+
+    with material.State(db) as state:
+        columns = {str(row["name"]) for row in state.conn.execute("PRAGMA table_info(items)")}
+        kept = state.item("https://habr.com/ru/articles/1")
+        state.update_item("https://habr.com/ru/articles/1", comments=12)
+    assert "comments" in columns
+    assert kept is not None, "the rows an older database holds survive the migration"
+    assert kept["comments"] == 0
+
+    with material.State(db) as state:  # idempotent: a second open is not a second ALTER
+        assert state.item("https://habr.com/ru/articles/1")["comments"] == 12
+
+
+def test_pack_shows_the_links_and_the_comment_count(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    material.seed(cfg)
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", "LoRA fine-tuning LLM"): habr_search([STRONG]),
+            ("extract", "habr", "https://habr.com/ru/articles/900001"): {
+                "site": "habr",
+                "text": "Body naming a repo: https://github.com/huggingface/peft "
+                        "and a paper: https://arxiv.org/abs/2401.01234",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        material, "_fetch_comments", lambda article, timeout: (comments_payload(), None)
+    )
+    material.run(cfg, day=DAY, sites=["habr"], no_expand=False)
+
+    with material.State(cfg.db_path) as state:
+        items = state.items_for_date(DAY)
+    text = material._pack_text(cfg, DAY, items)
+    assert "- comments: 2" in text
+    assert "- links: 1 fetchable, 1 hint" in text
+    assert "  - queued · github · https://github.com/huggingface/peft" in text
+    assert "  - hint · arxiv.org · https://arxiv.org/abs/2401.01234" in text
+    assert "## Links" in text
+    assert "Комментарии" in text, "the rules tell the agent what the comment delimiter means"

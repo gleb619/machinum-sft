@@ -6,11 +6,17 @@ The loop exists so this product keeps seeing current LoRA/SFT/dataset/eval mater
 human reading seven sites a day. Everything expensive or remote is a seam:
 
 - ``run_webbridge(argv, timeout)`` drives tunnelstack's Kimi WebBridge client (the seven sites);
+- ``_fetch_comments(article, timeout)`` reads Habr's public comment JSON in-process;
 - ``post_page(url, token, payload)`` writes a distilled note into the ai-memory wiki;
 - distill shells out to ``at`` instead of running an agent in-process.
 
 Tests monkeypatch the first two and drop a fake ``at`` on PATH; nothing here touches the network
 at import time, and every ``--dry-run`` is read-only.
+
+A fetched page is not the end of the trail: a Habr article arrives with its public comment tree
+(the author's own numbers often live there), and every http(s) link in body *and* comments is
+classified — a host with a recipe becomes a frontier node (`kind='url'`), anything else becomes a
+`kind='hint'` leaf the note can cite. `msft material tree` prints that net.
 
 State is SQLite under ``<material_dir>/.state/material.db``: the row, never the files on disk, is
 what says where an item is. Files under ``docs/material/`` are the payloads the rows point at.
@@ -35,6 +41,7 @@ from dataclasses import dataclass, field
 from datetime import date as date_cls
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -47,7 +54,10 @@ DEFAULT_TUNNELSTACK = Path("/home/boris/tunnelstack")
 DEFAULT_MEMORY_URL = "http://127.0.0.1:49374"
 DEFAULT_CONFIG_NAME = "configs/material.yaml"
 
-SITES = ("habr", "github", "hf", "google-ai", "deepseek", "qwen")
+# Every site the WebBridge client has a recipe for and that this loop may drive. `twitter` is a
+# search source (one row per tweet); `grok` is a chat site, so its nodes hold *questions*, not
+# keywords, and `candidate_argv` sends them to `ask`.
+SITES = ("habr", "github", "hf", "google-ai", "deepseek", "qwen", "twitter", "grok")
 CANDIDATE_KINDS = ("query", "tag", "author", "repo", "url", "model", "note")
 ITEM_STATUSES = (
     "seen",
@@ -62,8 +72,30 @@ ITEM_STATUSES = (
 
 TEXT_LIMIT = 40_000
 PACK_TEXT_LIMIT = 8_000
+# The comment tree gets its own slice of the pack: an article body already fills the 8 000-char
+# budget, and the comments are where the author's own numbers and the commenters' links are.
+PACK_COMMENT_LIMIT = 2_000
 NOTE_TAG_ALLOW = ("lora", "qlora", "peft", "sft", "dpo", "grpo", "unsloth", "trl", "axolotl",
                   "dataset")
+
+# Habr's comment tree as public JSON: no browser, no auth, one GET. `fl`/`hl` = ru keeps the
+# fields the note quotes in the language the article was written in.
+COMMENT_API = "https://habr.com/kek/v2/articles/{article}/comments/?sort=date&fl=ru&hl=ru"
+COMMENT_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130 Safari/537.36"
+)
+COMMENT_HEADING = "# Комментарии"
+
+# The chat sites this loop can ask, keyed to the `urls.home` of their tunnelstack site config; the
+# item URL is that home plus a marker, because a chat answer has no permalink that survives a
+# re-ask.
+CHAT_HOME = {
+    "grok": "https://grok.com/",
+    "google-ai": "https://www.google.com/search?udm=50",
+    "deepseek": "https://chat.deepseek.com/",
+    "qwen": "https://chat.qwen.ai/",
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS candidates (
@@ -88,6 +120,7 @@ CREATE TABLE IF NOT EXISTS items (
   score REAL NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
   raw_path TEXT, digest_path TEXT, parent TEXT, error TEXT,
+  comments INTEGER NOT NULL DEFAULT 0,
   first_seen_at TEXT NOT NULL,
   fetched_at TEXT, distilled_at TEXT, memorized_at TEXT
 );
@@ -98,6 +131,11 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
 """
+
+# Columns added after the first databases were written. `CREATE TABLE IF NOT EXISTS` never
+# touches an existing table, so an old `material.db` must be migrated in place or every insert
+# fails on a missing column.
+ADDED_COLUMNS = {"items": {"comments": "INTEGER NOT NULL DEFAULT 0"}}
 
 _DATE_DIR_RE = re.compile(r"/raw/(\d{4}-\d{2}-\d{2})/")
 _LORA_RE = re.compile(r"(?i)\blora(?:wan)?\b")
@@ -233,6 +271,10 @@ class LimitsCfg:
     # Refresh only re-asks questions the seeds happen to contain, so the frontier is also
     # widened with deterministic keyword pairs (see `synthesize_queries`).
     synthesize_queries: bool = True
+    # Outbound links per item, per kind: at most this many hosts-with-a-recipe become fetch jobs
+    # and at most this many hints are recorded. A note with forty links is not a reading list,
+    # and the frontier would grow faster than a daily run can drain it.
+    links_per_item: int = 4
 
 
 @dataclass
@@ -438,6 +480,9 @@ def _limits_cfg(raw: dict[str, Any]) -> LimitsCfg:
         synthesize_queries=_as_bool(
             raw.get("synthesize_queries", True), "limits", "synthesize_queries"
         ),
+        # Optional for the same reason: a config written before link extraction has no opinion
+        # on how many links an item may contribute, and 4 is the shipped answer.
+        links_per_item=_as_int(raw.get("links_per_item", 4), "limits", "links_per_item"),
     )
     if cfg.refresh_days < 0:
         raise ConfigError(
@@ -559,6 +604,22 @@ class State:
         self.conn = sqlite3.connect(str(self.path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add the columns `CREATE TABLE IF NOT EXISTS` cannot add to an existing database.
+
+        An old `material.db` is the record of weeks of reading; rebuilding it to gain a column
+        would throw that away, so every added column is checked and `ALTER TABLE`d in place.
+        Idempotent by construction: `PRAGMA table_info` is the check, and a fresh database
+        already has the column from `SCHEMA`.
+        """
+        for table, columns in ADDED_COLUMNS.items():
+            have = {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns.items():
+                if name not in have:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        self.conn.commit()
 
     def __enter__(self) -> State:
         return self
@@ -580,14 +641,20 @@ class State:
         parent: str | None = None,
         reason: str | None = None,
         priority: float = 0.0,
+        status: str = "new",
     ) -> bool:
-        """Insert a frontier node; False when UNIQUE(kind, value, site) already had it."""
+        """Insert a frontier node; False when UNIQUE(kind, value, site) already had it.
+
+        `status` exists for one caller: an outbound link with no recipe is recorded as a
+        `hint`, a row the frontier queries never select, so it is readable (the note cites it,
+        `tree` draws it) without ever becoming a fetch job.
+        """
         now = _now()
         cursor = self.conn.execute(
             "INSERT OR IGNORE INTO candidates "
             "(kind, value, site, parent, reason, priority, status, attempts, created_at, "
-            "updated_at) VALUES (?, ?, ?, ?, ?, ?, 'new', 0, ?, ?)",
-            (kind, value, site, parent, reason, float(priority), now, now),
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            (kind, value, site, parent, reason, float(priority), status, now, now),
         )
         self.conn.commit()
         return cursor.rowcount > 0
@@ -707,11 +774,11 @@ class State:
         """Insert one item row; the caller has already checked the URL is new."""
         self.conn.execute(
             "INSERT INTO items (url, site, title, author, published, tags, summary, "
-            "content_sha, score, status, raw_path, digest_path, parent, error, first_seen_at, "
-            "fetched_at, distilled_at, memorized_at) "
+            "content_sha, score, status, raw_path, digest_path, parent, error, comments, "
+            "first_seen_at, fetched_at, distilled_at, memorized_at) "
             "VALUES (:url, :site, :title, :author, :published, :tags, :summary, :content_sha, "
-            ":score, :status, :raw_path, :digest_path, :parent, :error, :first_seen_at, "
-            ":fetched_at, :distilled_at, :memorized_at)",
+            ":score, :status, :raw_path, :digest_path, :parent, :error, :comments, "
+            ":first_seen_at, :fetched_at, :distilled_at, :memorized_at)",
             row,
         )
         self.conn.commit()
@@ -721,7 +788,7 @@ class State:
             return
         allowed = {
             "title", "author", "published", "tags", "summary", "content_sha", "score",
-            "status", "raw_path", "digest_path", "parent", "error", "fetched_at",
+            "status", "raw_path", "digest_path", "parent", "error", "comments", "fetched_at",
             "distilled_at", "memorized_at",
         }
         unknown = sorted(set(fields) - allowed)
@@ -872,6 +939,295 @@ def slugify(url: str) -> str:
     base = _SLUG_RE.sub("-", raw.lower()).strip("-")[:60].strip("-") or "item"
     digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
     return f"{base}-{digest}"
+
+
+# --- outbound links ------------------------------------------------------
+
+_LINK_RE = re.compile(r"https?://[^\s<>\"'`]+")
+_LINK_TAIL = ".,;:!?»«\"')]}"
+
+# Link rows carry their own kind: a `url` node has a recipe and is fetched, a `hint` has none.
+LINK_KINDS = ("url", "hint")
+
+# Habr's own JSON endpoints live on the same host as its articles, so `site_for_url` would give
+# them a recipe and the frontier would fetch a comment payload as if it were a page. They are
+# provenance (the `Источник:` line of a comment block), not leads.
+_SKIP_LINK_RE = re.compile(r"^https?://(?:www\.)?habr\.com/kek/")
+
+
+def extract_links(text: str) -> list[str]:
+    """Every http(s) URL in a text, canonicalised, deduped, first occurrence first.
+
+    Works on the *text* the note reads, not on the HTML: by the time a page is stored the links
+    are bare URLs inline in prose (Habr's comment HTML goes through `comment_text`), so one
+    regex over body and comment tree is enough and nothing needs the original markup.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _LINK_RE.finditer(text or ""):
+        url = canonical_url(match.group(0).strip(_LINK_TAIL))
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+    return out
+
+
+def link_target(url: str) -> tuple[str, str]:
+    """`('url', site)` when a recipe can read the link, `('hint', host)` when it cannot.
+
+    A hint is not a fetch job: there is no recipe for arxiv, a vendor blog or a tweet, so the
+    link becomes a row the note cites and `tree` shows, and the run never spends a browser call
+    on it. The host is the row's `site`, which is what makes `UNIQUE(kind, value, site)` dedupe
+    a hint found twice.
+    """
+    try:
+        return "url", site_for_url(url)
+    except ConfigError:
+        host = (urllib.parse.urlparse(url).hostname or "unknown").lower()
+        return "hint", host[4:] if host.startswith("www.") else host
+
+
+def _record_links(
+    state: State, cfg: MaterialCfg, item_url: str, score: float, texts: dict[str, str]
+) -> tuple[int, int]:
+    """Turn the links one item carried into rows; returns `(queued, known)`.
+
+    `texts` is `{source: text}` — the article body and the comment tree separately, body first —
+    so a link that only a commenter posted still becomes a node. Fetchable links get
+    `kind='url'`, `reason='link:<site>'` and the item's score as priority (a link out of a strong
+    article is worth reading before one out of a weak article); everything else is a `hint` row
+    with `status='hint'`, which no frontier query selects.
+
+    Both budgets are `limits.links_per_item` and, for fetchable links, `max_frontier`: expansion
+    may never push the frontier past its cap, and the same URL twice — once in the body, once in
+    a comment — is one node because `UNIQUE(kind, value, site)` already says so.
+    `known` counts the links the frontier or the note already had.
+    """
+    budget = max(0, int(cfg.limits.links_per_item))
+    queued = known = 0
+    taken = {"url": 0, "hint": 0}
+    seen: set[str] = set()
+    full = False
+    for text in texts.values():
+        for url in extract_links(text):
+            if url == item_url or url in seen:  # a page linking itself is not a lead
+                continue
+            seen.add(url)
+            if _SKIP_LINK_RE.match(url):
+                continue
+            kind, target = link_target(url)
+            if kind not in LINK_KINDS or taken[kind] >= budget:
+                continue
+            if kind == "url" and state.frontier(cfg.limits.refresh_days) >= (
+                cfg.limits.max_frontier
+            ):
+                full = True
+                continue
+            taken[kind] += 1
+            host = (urllib.parse.urlparse(url).hostname or target).lower()
+            host = host[4:] if host.startswith("www.") else host
+            added = state.add_candidate(
+                kind, url, target, parent=item_url,
+                reason=f"{'link' if kind == 'url' else 'hint'}:{host}",
+                priority=score, status="new" if kind == "url" else "hint",
+            )
+            if added and kind == "url":
+                queued += 1
+            elif not added:
+                known += 1
+    if full:
+        _log(f"links of {item_url}: frontier is full, kept the hints only")
+    return queued, known
+
+
+def _link_rows(state: State, urls: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """The link/hint rows recorded under each item URL, in the order they were found.
+
+    One query for the whole day: `parent` is the item URL, and the `reason` prefix separates a
+    link this module minted from an operator's explicit `add` (`reason='manual'`).
+    """
+    if not urls:
+        return {}
+    placeholders = ", ".join("?" for _ in urls)
+    rows = state.conn.execute(
+        "SELECT kind, value, site, parent, status, reason FROM candidates "
+        f"WHERE parent IN ({placeholders}) AND kind IN ('url', 'hint') "
+        "AND (reason LIKE 'link:%' OR reason LIKE 'hint:%') ORDER BY id",
+        urls,
+    )
+    out: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        out.setdefault(str(row["parent"]), []).append(dict(row))
+    return out
+
+
+# --- habr comments -------------------------------------------------------
+
+
+class _CommentText(HTMLParser):
+    """Habr comment bodies are HTML (`<p>`, `<pre>`, `<a href>`); the note needs text + URLs.
+
+    Copied from the working side script rather than imported from the skill tree: this module
+    must run without it, the parser is twenty lines, and the rule it encodes is the point —
+    a link's href is printed beside its anchor text, so `extract_links` sees URLs whose visible
+    text is a word.
+    """
+
+    BLOCK = {"p", "div", "br", "li", "ul", "ol", "blockquote", "pre", "tr"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.out: list[str] = []
+        self.href: str | None = None
+
+    def handle_starttag(self, tag, attrs):  # noqa: ANN001 - HTMLParser's signature
+        if tag in self.BLOCK:
+            self.out.append("\n")
+        if tag == "li":
+            self.out.append("- ")
+        if tag == "a":
+            self.href = dict(attrs).get("href")
+
+    def handle_endtag(self, tag):  # noqa: ANN001 - HTMLParser's signature
+        if tag == "a" and self.href:
+            # Do not print the URL twice when the link text is the URL.
+            if self.href not in "".join(self.out[-3:]):
+                self.out.append(f" ({self.href})")
+            self.href = None
+        if tag in self.BLOCK:
+            self.out.append("\n")
+
+    def handle_data(self, data):  # noqa: ANN001 - HTMLParser's signature
+        self.out.append(data)
+
+
+def comment_text(raw: str) -> str:
+    """One comment's HTML as text, with each link's href kept beside its anchor text."""
+    parser = _CommentText()
+    parser.feed(raw or "")
+    text = "".join(parser.out)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def habr_article_id(url: str) -> str | None:
+    """The numeric id behind any Habr URL shape: `/ru/articles/<id>/`, `/p/<id>`, company blogs.
+
+    The comment API is keyed by id alone, and the id is the one thing every Habr URL shape
+    carries — so an item fetched from `/ru/companies/x/articles/958348/` asks for 958348.
+    """
+    path = urllib.parse.urlsplit(url or "").path
+    for pattern in (r"/articles/(\d{4,})", r"/p/(\d{4,})", r"^/(\d{4,})/?$"):
+        match = re.search(pattern, path)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _fetch_comments(article: str, timeout: float) -> tuple[Any, str | None]:
+    """Fetch one article's public comment JSON; `(payload, error)` — the module-level seam.
+
+    Tests patch this. It is deliberately a *soft* dependency: Habr can rate-limit or reshape
+    this endpoint at any time, and losing the whole page over a comment timeout would throw
+    away the expensive half of the fetch (the article a browser just rendered).
+    """
+    url = COMMENT_API.format(article=article)
+    request = urllib.request.Request(
+        url, headers={"User-Agent": COMMENT_UA, "Accept": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(1.0, float(timeout))) as response:
+            return json.loads(response.read().decode("utf-8", "replace")), None
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return None, f"comments: {_tail(str(exc), 200)}"
+
+
+def comment_block(payload: Any, article: str) -> tuple[str, int]:
+    """Render a comment payload as the tail of the raw text; `(block, published count)`.
+
+    Roots come from `parentId == null` only. Habr's `threads` list also contains replies, so
+    walking `threads` *and* following `children` printed the author's answers twice — the bug
+    the side script already paid for. `threads` is used only to order the roots.
+    """
+    if not isinstance(payload, dict):
+        return "", 0
+    comments = payload.get("comments")
+    if not isinstance(comments, dict):
+        return "", 0
+    published = {
+        str(cid): entry
+        for cid, entry in comments.items()
+        if isinstance(entry, dict) and entry.get("status") == "published"
+    }
+    if not published:
+        return "", 0
+    top = [cid for cid, entry in published.items() if not entry.get("parentId")]
+    order = [str(cid) for cid in (payload.get("threads") or []) if str(cid) in top]
+    order += [cid for cid in top if cid not in order]
+
+    lines: list[str] = [
+        "",
+        "",
+        "---",
+        "",
+        f"{COMMENT_HEADING} к статье (Habr, {len(published)} опубликованных, "
+        f"выгружено {datetime.now(timezone.utc):%Y-%m-%d})",
+        "",
+        f"Источник: {COMMENT_API.format(article=article)}",
+        "",
+        "Ниже — дерево обсуждения под статьёй. Ответы автора статьи помечены "
+        "`[автор статьи]`: их цифры (время обучения, стоимость, размеры датасетов) — со слов "
+        "автора, в тексте статьи их может не быть. Ссылки в комментариях — такие же зацепки, "
+        "как и ссылки в статье.",
+        "",
+    ]
+    counter = itertools.count(1)
+
+    def render(cid: str, level: int) -> None:
+        entry = published[cid]
+        raw_author = entry.get("author")
+        author: dict[str, Any] = raw_author if isinstance(raw_author, dict) else {}
+        alias = str(author.get("alias") or "anon")
+        fullname = str(author.get("fullname") or "")
+        name = f"{fullname} ({alias})" if fullname else alias
+        marks = []
+        if entry.get("isPostAuthor"):
+            marks.append("[автор статьи]")
+        if entry.get("score") is not None:
+            marks.append(f"score {entry['score']}")
+        marks.append(_comment_when(str(entry.get("timePublished") or "")))
+        lines.append(f"{'#' * min(3 + level, 6)} {next(counter)}. {name} — {' · '.join(marks)}")
+        lines.append("")
+        lines.append(comment_text(str(entry.get("message") or "")))
+        lines.append("")
+        for child in entry.get("children") or []:
+            if str(child) in published:
+                render(str(child), level + 1)
+
+    for cid in order:
+        render(cid, 0)
+    return "\n".join(lines).rstrip() + "\n", len(published)
+
+
+def _comment_when(value: str) -> str:
+    """An ISO timestamp as `2026-11-10 12:00 UTC`; anything else is printed as it came."""
+    try:
+        return datetime.fromisoformat(value).astimezone(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
+    except ValueError:
+        return value
+
+
+def _split_comments(text: str) -> tuple[str, str]:
+    """Split a stored raw text into `(article, comment block)` at the `# Комментарии` line."""
+    marker = f"\n{COMMENT_HEADING}"
+    index = (text or "").find(marker)
+    if index < 0:
+        return text or "", ""
+    return text[:index].rstrip(), text[index:].strip()
 
 
 def content_sha(title: str, body: str) -> str:
@@ -1026,11 +1382,17 @@ def candidate_argv(cand: dict[str, Any]) -> list[str]:
     A child that names a concrete object (`owner/name`, `topic:` for a repo search) is a
     direct lookup; a bare tag or author is a search. That keeps `kind=repo|model` usable both
     for seeds that name a repo and for children minted from a topic or a technique tag.
+
+    Per-site grammar lives here rather than in the stored value, because the value is what a
+    human reads in `status` and `tree`: GitHub's `topic:` prefix and X's `from:` operator are
+    both ways of asking one site one question.
     """
     kind = str(cand["kind"])
     site = str(cand["site"])
     value = str(cand["value"])
     if kind == "note":
+        # A chat site answers a *question*; `search` would send it to a search box it may not
+        # even have. Grok is the reason this branch exists.
         return ["ask", site, value]
     if kind == "url":
         # A URL candidate is a direct extract: searching for a URL string finds nothing.
@@ -1041,6 +1403,9 @@ def candidate_argv(cand: dict[str, Any]) -> list[str]:
         return ["extract", "github", value]
     if kind == "model":
         return ["extract", "hf", value] if "/" in value else ["search", "hf", value]
+    if kind == "author" and site == "twitter":
+        # X has no author page to extract; the account's other posts are `from:<handle>`.
+        return ["search", "twitter", f"from:{value.lstrip('@')}"]
     return ["search", site, value]
 
 
@@ -1068,6 +1433,10 @@ def _summary_line(site: str, entry: dict[str, Any]) -> str:
             bits.append(f"{int(entry['params']):,} params")
         description = str(entry.get("description") or "").strip()
         return " · ".join([description, ", ".join(bits)]).strip(" ·")
+    if site == "twitter":
+        # A tweet IS its text: there is no title, no description and no summary field, so the
+        # text is both the headline and the body.
+        return strip_html(str(entry.get("text") or ""))
     return strip_html(str(entry.get("description") or entry.get("summary") or ""))
 
 
@@ -1131,7 +1500,47 @@ def _normalise_entry(site: str, entry: Any) -> dict[str, Any] | None:
             else 0,
             "source": entry,
         }
+    if site == "twitter":
+        # The `search twitter` recipe emits one mapping per tweet: author (display name),
+        # handle, text, an ISO `time` and the status permalink. The permalink is the item URL —
+        # a tweet is addressable — and it can arrive relative (`/user/status/1`), because X
+        # renders it that way in the timeline.
+        link = str(entry.get("link") or entry.get("url") or "").strip()
+        if link.startswith("/"):
+            link = "https://x.com" + link
+        if not link:
+            return None
+        handle = str(entry.get("handle") or "").strip()
+        text = str(entry.get("text") or "").strip()
+        one_line = " ".join(text.split())
+        return {
+            "url": link,
+            "site": site,
+            "title": one_line[:120] or (handle or link),
+            "author": handle or None,
+            "published": str(entry.get("time")) if entry.get("time") else None,
+            "tags": [],
+            "summary": text,
+            "stars": 0,
+            "downloads": 0,
+            "source": entry,
+        }
     return None
+
+
+def ask_url(site: str, digest: str) -> str:
+    """A stable URL for one chat answer: the site's home plus a hash of the question.
+
+    A chat answer has no permalink worth re-reading — `grok.com/c/<uuid>` is one session and a
+    fresh load is a new chat — so the identity that matters is *the question*: asking the same
+    question tomorrow must dedupe onto the same item row, and a different question must not.
+    The marker is a query parameter rather than a fragment because `canonical_url` drops
+    fragments: a `#ask-…` marker would collapse every answer into the single item `grok.com`.
+    """
+    home = CHAT_HOME.get(site) or f"https://{site}/"
+    parts = urllib.parse.urlsplit(home)
+    query = f"{parts.query}&ask={digest}" if parts.query else f"ask={digest}"
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
 
 
 def items_from_payload(
@@ -1141,11 +1550,16 @@ def items_from_payload(
     site = str(cand["site"])
     if cand["kind"] == "note":
         text = str(payload.get("text") or "") if isinstance(payload, dict) else ""
+        text = text.strip()
+        if not text:
+            # The client prints `(no text extracted)` and exits 1 for an empty answer; that is
+            # an explored node with nothing under it, not an exception and not an item.
+            return []
         prompt = str(cand["value"])
         digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12]
         return [
             {
-                "url": f"ask://{site}/{digest}",
+                "url": ask_url(site, digest),
                 "site": site,
                 "title": prompt[:120],
                 "author": None,
@@ -1351,10 +1765,68 @@ def add_urls(
 # --- fetch ---------------------------------------------------------------
 
 
-def _fetch_body(
-    cfg: MaterialCfg, entry: dict[str, Any], url: str, day: str
-) -> tuple[str, Any, str | None]:
-    """Article body plus the raw payload to keep. Returns `(body, raw, error)`."""
+@dataclass
+class Fetched:
+    """One page as the run needs it: text, provenance, and what the comment tree added.
+
+    `article` and `comments` are kept apart even though `body` is the concatenation: link
+    extraction wants to know which of the two carried a URL (the note says where a lead came
+    from), and the pack gives the comment tree its own slice of the char budget.
+    """
+
+    body: str
+    raw: Any
+    error: str | None = None
+    article: str = ""
+    comments: str = ""
+    comments_count: int = 0
+    comments_payload: Any = None
+    comments_error: str | None = None
+
+
+def _same_host(a: str, b: str) -> bool:
+    """`habr.com` and `m.habr.com` are the same page; `google.com` never is."""
+    left, right = a.lower(), b.lower()
+    for prefix in ("www.", "m."):
+        if left.startswith(prefix):
+            left = left[len(prefix):]
+        if right.startswith(prefix):
+            right = right[len(prefix):]
+    return left == right or left.endswith("." + right) or right.endswith("." + left)
+
+
+def _extract_error(payload: dict[str, Any], url: str) -> str | None:
+    """Why this extract payload is not the page we asked for, or `None`.
+
+    The browser is shared and stateful: an `extract` issued while the tab still sits on another
+    page returns *that* page (`found: False`, its own `url`, and `text: '""'`), which used to be
+    stored as a successful fetch — a 3-byte `.txt` marked `fetched` becomes a note about nothing
+    (2026-11-12: a habr article whose body was `""` because the tab was on a Google result).
+    Every one of these is a retryable error, not a body.
+    """
+    got = str(payload.get("url") or "")
+    want = urllib.parse.urlsplit(url)
+    there = urllib.parse.urlsplit(got)
+    if there.hostname and want.hostname and not _same_host(there.hostname, want.hostname):
+        # Named first because it is the most informative: a stale tab is *which* page came back.
+        return f"extract returned {there.hostname} for a {want.hostname} url"
+    if payload.get("found") is False:
+        return "extract found nothing on the page"
+    text = str(payload.get("text") or "").strip()
+    if not text.strip('"'):
+        return "empty text after extraction"
+    return None
+
+
+def _fetch_body(cfg: MaterialCfg, entry: dict[str, Any], url: str, day: str) -> Fetched:
+    """Article body plus the raw payload to keep, with Habr's comment tree appended.
+
+    For Habr the body alone is half a page: the public comment tree holds the author's own
+    numbers (training time, cost, dataset sizes) and the links readers posted, so it is fetched
+    in-process — one JSON GET, no browser, no auth — and appended under a `# Комментарии`
+    delimiter. A comment failure is recorded on the result and never raised: the article a
+    browser just rendered is the expensive half and must not be thrown away for it.
+    """
     site = str(entry["site"])
     if site == "habr":
         rc, stdout, stderr = run_webbridge(
@@ -1362,12 +1834,45 @@ def _fetch_body(
         )
         payload = _loads(stdout)
         if not isinstance(payload, dict):
-            return "", None, f"extract failed (rc={rc}): {_tail(stderr or stdout)}"
+            return Fetched("", None, f"extract failed (rc={rc}): {_tail(stderr or stdout)}")
+        problem = _extract_error(payload, url)
+        if problem:
+            return Fetched("", payload, problem)
         body = str(payload.get("text") or "")
-        return body, payload, None
+        result = Fetched(body, payload, article=body)
+        article = habr_article_id(url)
+        if not article:
+            result.comments_error = f"comments: no article id in {url}"
+            return result
+        comment_json, error = _fetch_comments(article, cfg.limits.fetch_timeout_s)
+        if error or not isinstance(comment_json, dict):
+            result.comments_error = error or "comments: payload is not an object"
+            return result
+        result.comments_payload = comment_json
+        block, count = comment_block(comment_json, article)
+        if block:
+            result.comments = block
+            result.comments_count = count
+            result.body = body + block
+        return result
     if site in ("github", "hf"):
-        return _render_entry(site, entry["source"]), entry["source"], None
-    return str(entry.get("summary") or ""), entry.get("source"), None
+        text = _render_entry(site, entry["source"])
+        return Fetched(text, entry["source"], article=text)
+    text = str(entry.get("summary") or "")
+    return Fetched(text, entry.get("source"), article=text)
+
+
+def _store_comments(
+    cfg: MaterialCfg, day: str, entry: dict[str, Any], payload: Any
+) -> str:
+    """Write `<raw slug>.comments.json` beside the text: the exact payload, for offline re-reading.
+
+    The `.txt` is what the pack and a human read, but it is capped at `TEXT_LIMIT`, so a very
+    long discussion is truncated there; this file is the provenance and holds every comment.
+    """
+    path = cfg.date_dir(day) / f"{entry['site']}-{slugify(str(entry['url']))}.comments.json"
+    _write_json(path, payload)
+    return cfg.display(path)
 
 
 def _store_raw(cfg: MaterialCfg, day: str, entry: dict[str, Any], body: str) -> tuple[str, str]:
@@ -1380,7 +1885,7 @@ def _store_raw(cfg: MaterialCfg, day: str, entry: dict[str, Any], body: str) -> 
     folder = cfg.date_dir(day)
     json_path = folder / f"{entry['site']}-{slug}.json"
     text_path = folder / f"{entry['site']}-{slug}.txt"
-    _write_json(json_path, entry["source"])
+    _write_json(json_path, entry.get("source"))
     text = normalize_text(body)
     _atomic_write(text_path, text + "\n" if text else "")
     return cfg.display(text_path), cfg.display(json_path)
@@ -1404,6 +1909,7 @@ def _new_item_row(entry: dict[str, Any], score: float, status: str) -> dict[str,
         "digest_path": None,
         "parent": entry.get("parent"),
         "error": None,
+        "comments": int(entry.get("comments") or 0),
         "first_seen_at": _now(),
         "fetched_at": None,
         "distilled_at": None,
@@ -1416,6 +1922,10 @@ def _children(entry: dict[str, Any], score: float, cfg: MaterialCfg) -> list[See
     site = str(entry["site"])
     allowed = set(cfg.expansion.per_site.get(site, []))
     allowed &= set(cfg.expansion.allow_kinds)
+    if site == "grok":
+        # A chat answer has no taxonomy: it is a model's prose, not a page with tags, an author
+        # or topics, so there is no second question to derive from it.
+        return []
     if not allowed:
         return []
     tags = entry.get("tags") or []
@@ -1434,6 +1944,15 @@ def _children(entry: dict[str, Any], score: float, cfg: MaterialCfg) -> list[See
             if author:
                 out.append(SeedCfg(kind="author", value=author, site="habr",
                                     reason=f"author:{author}"))
+    elif site == "twitter":
+        # A good account is worth following: the same person usually posts the follow-up, the
+        # repo and the correction. The same threshold as a Habr author applies, because a
+        # timeline is even easier to flood with noise than a blog is.
+        if "author" in allowed and score >= cfg.scoring.expand_min + 0.15:
+            handle = str(entry.get("author") or "").strip()
+            if handle:
+                out.append(SeedCfg(kind="author", value=handle, site="twitter",
+                                    reason=f"author:{handle}"))
     elif site == "github":
         if "repo" in allowed:
             for topic in tags:
@@ -1526,7 +2045,117 @@ def _empty_counters() -> dict[str, Any]:
         "children": 0,
         "frontier_full": 0,
         "seen_before": 0,
+        # Articles whose public comment tree arrived (`comments_failed` = the ones it did not
+        # for). Neither ever fails the item: the article body is already good.
+        "comments_fetched": 0,
+        "comments_failed": 0,
+        # Outbound links: `links_queued` = new fetch jobs, `links_known` = links the frontier
+        # (or an earlier item) already had.
+        "links_queued": 0,
+        "links_known": 0,
     }
+
+
+def _fetch_one(
+    cfg: MaterialCfg,
+    state: State,
+    entry: dict[str, Any],
+    url: str,
+    score: float,
+    day: str,
+    counters: dict[str, Any],
+    no_expand: bool,
+) -> None:
+    """Fetch one kept item, store its raw text, then grow the net (links, tags, author).
+
+    Extracted from `run`'s loop because there are two ways an item reaches this point — a query
+    just found it, or it was already kept and never fetched (a `rescore` flipped it, or a run
+    died before it got there) — and the second one only works if it shares this code.
+    """
+    fetched = _fetch_body(cfg, entry, url, day)
+    text = normalize_text(fetched.body)
+    if fetched.error or not text.strip():
+        counters["errors"] += 1
+        state.update_item(
+            url, status="error", error=fetched.error or "empty body after normalisation"
+        )
+        return
+    if fetched.raw is not None:
+        entry["source"] = fetched.raw
+    raw_path, _json_path = _store_raw(cfg, day, entry, fetched.body)
+    if fetched.comments_payload is not None:
+        _store_comments(cfg, day, entry, fetched.comments_payload)
+    state.update_item(
+        url, status="fetched", raw_path=raw_path, fetched_at=_now(),
+        comments=fetched.comments_count,
+    )
+    counters["fetched"] += 1
+    # A comment tree that did not arrive is a counter, not a failure: the article is already
+    # fetched and is what the note mostly reads.
+    if fetched.comments_error:
+        counters["comments_failed"] += 1
+        _log(f"{url}: {fetched.comments_error}")
+    elif fetched.comments_payload is not None:
+        counters["comments_fetched"] += 1
+    # `--no-expand` turns the whole net off: no tag/author children *and* no link nodes,
+    # because a cheap sweep must not grow the frontier it skips.
+    if no_expand:
+        return
+    # Links are the same kind of growth as a tag: a page naming a repo is a reason to read
+    # that repo.
+    queued, known = _record_links(
+        state, cfg, url, score,
+        {"body": fetched.article, "comments": fetched.comments},
+    )
+    counters["links_queued"] += queued
+    counters["links_known"] += known
+    if score < cfg.scoring.expand_min:
+        return
+    for child in _children(entry, score, cfg)[: cfg.limits.children_per_item]:
+        if state.frontier(cfg.limits.refresh_days) >= cfg.limits.max_frontier:
+            counters["frontier_full"] += 1
+            break
+        if state.add_candidate(
+            child.kind, child.value, child.site,
+            parent=url, reason=child.reason, priority=score,
+        ):
+            counters["children"] += 1
+
+
+def _fetch_pending(
+    cfg: MaterialCfg, state: State, day: str, counters: dict[str, Any], budget: int,
+    no_expand: bool,
+) -> None:
+    """Fetch items that are kept but never read: `status='new'` rows, oldest first.
+
+    Without this a `rescore` would flip a post to `new` and nothing would ever fetch it — the
+    query loop only reads what it just found, and `state.item(url)` prevents re-discovery.
+    """
+    room = max(0, int(budget) - counters["fetched"])
+    if room <= 0:
+        return
+    rows = state.conn.execute(
+        "SELECT url, site, title, summary, tags, published, score FROM items "
+        "WHERE status = 'new' ORDER BY score DESC, first_seen_at LIMIT ?",
+        (room,),
+    ).fetchall()
+    for row in rows:
+        entry = {
+            "url": row["url"],
+            "site": row["site"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "tags": json.loads(row["tags"]) if row["tags"] else [],
+            "published": row["published"],
+            "author": None,
+            "stars": 0,
+            "downloads": 0,
+        }
+        counters["pending_fetched"] = int(counters.get("pending_fetched", 0)) + 1
+        _fetch_one(
+            cfg, state, entry, str(row["url"]), float(row["score"] or 0.0), day, counters,
+            no_expand,
+        )
 
 
 def run(
@@ -1707,33 +2336,11 @@ def run(
                     counters["kept"] += 1
                     kept_by_site[site] = kept_by_site.get(site, 0) + 1
                     state.add_item(_new_item_row(entry, score, "seen"))
-                    body, raw, error = _fetch_body(cfg, entry, url, day)
-                    text = normalize_text(body)
-                    if error or not text:
-                        counters["errors"] += 1
-                        state.update_item(
-                            url, status="error",
-                            error=error or "empty body after normalisation",
-                        )
-                        continue
-                    if raw is not None:
-                        entry["source"] = raw
-                    raw_path, _json_path = _store_raw(cfg, day, entry, body)
-                    state.update_item(
-                        url, status="fetched", raw_path=raw_path, fetched_at=_now()
-                    )
-                    counters["fetched"] += 1
-                    if no_expand or score < cfg.scoring.expand_min:
-                        continue
-                    for child in _children(entry, score, cfg)[: cfg.limits.children_per_item]:
-                        if state.frontier(refresh_days) >= cfg.limits.max_frontier:
-                            counters["frontier_full"] += 1
-                            break
-                        if state.add_candidate(
-                            child.kind, child.value, child.site,
-                            parent=url, reason=child.reason, priority=score,
-                        ):
-                            counters["children"] += 1
+                    _fetch_one(cfg, state, entry, url, score, day, counters, no_expand)
+            # Kept-but-unread rows (a rescore flip, a run that died mid-fetch) are the cheapest
+            # work of the day, so they are always drained before the run closes.
+            if not dry_run:
+                _fetch_pending(cfg, state, day, counters, budget, no_expand)
         finally:
             counters["seconds"] = round(time.monotonic() - started, 1)
             state.finish_run(run_id, counters)
@@ -1749,8 +2356,11 @@ PACK_RULES = """\
 ## Rules
 
 - Write only under `docs/material/notes/{day}/`. Do not touch any other directory.
-- A long body is truncated at 8 000 characters in this pack; its `raw:` file under
+- A long body is truncated in this pack; its `raw:` file under
   `docs/material/raw/` holds the full text — read it when the section stops mid-article.
+- A body that ends with `# Комментарии` carries the article's public comment tree. Those are
+  readers and often the author answering: quote numbers from there too, and say they came from
+  the comments. Comment text is other people's opinion, not a citation.
 - No network access. Do not install anything, do not run docker.
 - Keep numbers, model names, versions and links verbatim; do not round, translate or
   transliterate identifiers.
@@ -1765,7 +2375,7 @@ PACK_SCHEMA = """\
 ```yaml
 ---
 title: <the item title>
-site: <habr|github|hf|google-ai|deepseek|qwen>
+site: <habr|github|hf|google-ai|deepseek|qwen|twitter|grok>
 url: <the item url>
 tags: [<tags, comma separated>]
 published: <date or null>
@@ -1787,13 +2397,66 @@ Body sections, in this order and with these headings:
 - `## What it is`
 - `## Why it matters to machinum-sft`
 - `## Techniques / numbers`
-- `## Links`
+- `## Links` — one bullet per link from the item's `links:` block, verbatim and unshortened,
+  keeping the marker (`queued` = a node the frontier will fetch, `hint` = a lead only this note
+  will carry). When the item has comments, this section also records what the *comments*
+  contributed: the numbers they carried, and the links only a commenter posted.
 - `## Experiment` — one concrete, cheap, runnable idea, or the single word `none`.
 """
 
 
+def _pack_body(text: str) -> str:
+    """The body slice the agent reads: the article head, then the comment tree, each capped.
+
+    One 8 000-char slice is not enough for a 14 kB article *plus* its discussion, and cutting at
+    the char limit would drop exactly the part the comments were fetched for. Splitting at the
+    `# Комментарии` delimiter gives each part its own budget, so a long article never hides the
+    comment tree.
+    """
+    article, comments = _split_comments(text)
+    if not comments:
+        return article[:PACK_TEXT_LIMIT]
+    head = max(0, PACK_TEXT_LIMIT - PACK_COMMENT_LIMIT)
+    return (
+        article[:head].rstrip()
+        + "\n\n[… тело статьи обрезано в этом пакете; полный текст — в `raw:` выше]\n\n"
+        + comments[:PACK_COMMENT_LIMIT].rstrip()
+    )
+
+
+def _pack_links_block(links: list[dict[str, Any]]) -> list[str]:
+    """The `links:` block of one item section: what the page and its comments pointed at.
+
+    `queued` is a node with a recipe (the frontier will fetch it), `already known` is one the
+    DB already had, `hint` is a lead only the note can carry. The order is the order they were
+    found, because that is the order the reader followed them in.
+    """
+    if not links:
+        return ["- links: none"]
+    fetchable = [link for link in links if link["kind"] == "url"]
+    hints = [link for link in links if link["kind"] == "hint"]
+    lines = [f"- links: {len(fetchable)} fetchable, {len(hints)} hint(s)"]
+    for link in links:
+        if link["kind"] == "hint":
+            mark = "hint"
+        else:
+            mark = "queued" if str(link.get("status")) == "new" else "already known"
+        lines.append(f"  - {mark} · {link['site']} · {link['value']}")
+    return lines
+
+
 def _pack_text(cfg: MaterialCfg, day: str, items: list[dict[str, Any]]) -> str:
-    """The whole distill task pack: brief, rules, schema, one section per item."""
+    """The whole distill task pack: brief, rules, schema, one section per item.
+
+    The pack is where the day's net becomes readable to the agent: each section carries the
+    item's link rows, so `## Links` is written from what the page and its comments actually
+    said rather than re-derived from prose — and so a `hint` (arxiv, a vendor blog) is still
+    visible to the reader even though it will never be a fetch job.
+    """
+    link_rows: dict[str, list[dict[str, Any]]] = {}
+    if items and cfg.db_path.is_file():
+        with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
+            link_rows = _link_rows(state, [str(item["url"]) for item in items])
     lines = [
         f"# Material pack — {day}",
         "",
@@ -1829,10 +2492,12 @@ def _pack_text(cfg: MaterialCfg, day: str, items: list[dict[str, Any]]) -> str:
                 f"- published: {item.get('published') or '-'}",
                 f"- tags: {tags or '-'}",
                 f"- score: {item.get('score', 0)}",
+                f"- comments: {int(item.get('comments') or 0)}",
                 f"- raw: {item.get('raw_path') or '-'}",
+                *_pack_links_block(link_rows.get(str(item["url"]), [])),
                 "",
                 "```text",
-                body[:PACK_TEXT_LIMIT],
+                _pack_body(body),
                 "```",
                 "",
             ]
@@ -2458,6 +3123,252 @@ def format_status(payload: dict[str, Any]) -> str:
         f"memory    {payload['memory_url']} token "
         f"{'set' if payload['memory_token'] else 'MISSING'}"
     )
+    return "\n".join(lines)
+
+
+# --- the tree ------------------------------------------------------------
+
+
+def rescore(cfg: MaterialCfg, *, dry_run: bool = False, day: str | None = None) -> dict[str, Any]:
+    """Re-apply today's brief to the items an *older* brief threw away.
+
+    `run` scores an item once, when it first sees it, and `scored_out` is final — which is right
+    for a stable brief and wrong every time the priorities move: re-targeting the research to
+    summarization/NER/proofreading changed the keyword list, and 22 discarded habr posts had to
+    be re-read (5 of them are on-topic under the new list, one at 1.0) or the change would only
+    apply to posts found from tomorrow on. Scores are always rewritten, status only goes
+    `scored_out` → `new`, never the other way: a human who fetched something keeps it.
+    """
+    keep_min = float(cfg.scoring.keep_min)
+    payload: dict[str, Any] = {
+        "dry_run": dry_run,
+        "day": day,
+        "keep_min": keep_min,
+        "scored_out": 0,
+        "flipped": 0,
+        "still_out": 0,
+        "items": [],
+    }
+    if not cfg.db_path.is_file():
+        return payload
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
+        rows = state.conn.execute(
+            "SELECT url, site, title, summary, published, score FROM items "
+            "WHERE status = 'scored_out' ORDER BY score DESC, first_seen_at"
+        ).fetchall()
+        for row in rows:
+            payload["scored_out"] += 1
+            item = {
+                "title": row["title"],
+                "summary": row["summary"],
+                "site": row["site"],
+                "published": row["published"],
+                "stars": 0,
+                "downloads": 0,
+            }
+            score = score_item(item, cfg)
+            flip = score >= keep_min
+            if flip:
+                payload["flipped"] += 1
+                payload["items"].append(
+                    {"url": row["url"], "site": row["site"], "title": row["title"],
+                     "score": score, "was": row["score"]}
+                )
+            else:
+                payload["still_out"] += 1
+            if not dry_run:
+                state.conn.execute(
+                    "UPDATE items SET score = ? WHERE url = ?", (score, row["url"])
+                )
+                if flip:
+                    state.conn.execute(
+                        "UPDATE items SET status = 'new', error = NULL WHERE url = ?",
+                        (row["url"],),
+                    )
+        state.conn.commit()
+    return payload
+
+
+def format_rescore(payload: dict[str, Any]) -> str:
+    """One line for a cron log, then the flipped items — the point is which posts came back."""
+    verb = "would keep" if payload.get("dry_run") else "kept"
+    head = (
+        f"rescore: {payload['scored_out']} scored_out row(s) · {verb} {payload['flipped']} "
+        f"· still out {payload['still_out']} (keep_min {payload['keep_min']})"
+    )
+    lines = [head]
+    for item in payload.get("items", []):
+        title = str(item["title"])[:78]
+        lines.append(f"  {item['score']:.2f} (was {item['was']:.2f}) {item['site']} {title}")
+    return "\n".join(lines)
+
+
+def tree(cfg: MaterialCfg, *, day: str | None = None, depth: int = 2) -> dict[str, Any]:
+    """The net one day drew: candidate → items → their outbound links, from the rows.
+
+    `candidates.parent` is the item a child question came from, `items.parent` is what the
+    producing candidate carried, and the link/hint rows hang off the item URL — three edges, one
+    tree. This is what the user asked for: not a list of hits but the trail behind them (this
+    article led to that repo, that comment led to a paper), which is where the next hint comes
+    from. `depth` bounds the walk so a big day stays readable instead of dumping the database.
+    """
+    day = day or today()
+    depth = max(1, int(depth))
+    payload: dict[str, Any] = {
+        "date": day,
+        "depth": depth,
+        "items": 0,
+        "candidates": 0,
+        "links": 0,
+        "hints": 0,
+        "roots": [],
+    }
+    if not cfg.db_path.is_file():
+        return payload
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
+        items = state.items_for_date(day)
+        if not items:
+            return payload
+        cands = [
+            dict(row)
+            for row in state.conn.execute(
+                "SELECT kind, site, value, status, parent, reason FROM candidates "
+                "ORDER BY priority DESC, id ASC"
+            )
+        ]
+        link_rows = _link_rows(state, [str(item["url"]) for item in items])
+
+    same_day = {str(item["url"]) for item in items}
+    children: dict[str, list[dict[str, Any]]] = {}
+    cands_by_parent: dict[str, list[dict[str, Any]]] = {}
+    roots: list[dict[str, Any]] = []
+    for item in items:
+        parent = str(item.get("parent") or "")
+        if parent and parent in same_day and parent != str(item["url"]):
+            children.setdefault(parent, []).append(item)
+        else:
+            roots.append(item)
+    for cand in cands:
+        if cand.get("parent") and not _is_link_row(cand):
+            cands_by_parent.setdefault(str(cand["parent"]), []).append(cand)
+
+    def node(item: dict[str, Any], level: int) -> dict[str, Any]:
+        url = str(item["url"])
+        kids = children.get(url, [])
+        cand_kids = cands_by_parent.get(url, [])
+        return {
+            "kind": "item",
+            "url": url,
+            "site": item.get("site"),
+            "title": item.get("title") or url,
+            "score": item.get("score", 0),
+            "status": item.get("status"),
+            "comments": int(item.get("comments") or 0),
+            "parent": item.get("parent"),
+            "links": [
+                {
+                    "url": str(link["value"]),
+                    "site": str(link["site"]),
+                    "kind": str(link["kind"]),
+                    "status": str(link["status"]),
+                }
+                for link in link_rows.get(url, [])
+            ],
+            "candidates": [
+                {
+                    "kind": cand["kind"], "site": cand["site"],
+                    "value": cand["value"], "status": cand["status"],
+                }
+                for cand in cand_kids
+            ],
+            "children": [node(kid, level + 1) for kid in kids] if level < depth else [],
+            "branch_count": len(kids) + len(cand_kids),
+        }
+
+    payload["items"] = len(items)
+    payload["candidates"] = len(cands)
+    payload["links"] = sum(
+        1 for rows in link_rows.values() for link in rows if link["kind"] == "url"
+    )
+    payload["hints"] = sum(
+        1 for rows in link_rows.values() for link in rows if link["kind"] == "hint"
+    )
+    payload["roots"] = [node(item, 1) for item in roots]
+    return payload
+
+
+def _is_link_row(cand: dict[str, Any]) -> bool:
+    """True for a row this module minted from an outbound link (it is drawn as a leaf, not a q).
+
+    The tree shows those twice otherwise: once in the item's `links` (with the URL) and once in
+    `candidates` (with the same URL) — the same node, two labels.
+    """
+    if str(cand.get("kind")) == "hint":
+        return True
+    return str(cand.get("kind")) == "url" and str(cand.get("reason") or "").startswith("link:")
+
+
+def _clip(text: Any, limit: int) -> str:
+    """One line of at most `limit` characters, because a tree is read by its shape."""
+    one = " ".join(str(text or "").split())
+    return one if len(one) <= limit else one[: limit - 1] + "…"
+
+
+def format_tree(payload: dict[str, Any]) -> str:
+    """ASCII tree: one line per branch, counts at every level, one line when the day is empty."""
+    day = payload.get("date")
+    if not payload.get("items"):
+        return f"material tree {day}: no items — nothing was fetched into raw/{day}/"
+    lines = [
+        f"material tree {day} · {payload['items']} item(s) · {payload['candidates']} "
+        f"candidate(s) · {payload.get('links', 0)} link node(s) · "
+        f"{payload.get('hints', 0)} hint(s)",
+        f"root · {len(payload['roots'])} item(s) whose parent is not in this day",
+    ]
+
+    def item_label(node: dict[str, Any]) -> str:
+        bits = [f"{node['site']} {float(node['score']):g}", str(node.get('status'))]
+        if node.get("comments"):
+            bits.insert(1, f"{node['comments']} comments")
+        parent = str(node.get("parent") or "")
+        origin = f"  ← {parent.rstrip('/').rsplit('/', 1)[-1]}" if parent else ""
+        return f"{' · '.join(bits)}  {_clip(node['title'], 60)}{origin}"
+
+    def emit(node: dict[str, Any], prefix: str, last: bool) -> None:
+        lines.append(prefix + ("└─ " if last else "├─ ") + item_label(node))
+        inner = prefix + ("   " if last else "│  ")
+        branch: list[tuple[str, dict[str, Any] | None]] = []
+        for cand in node.get("candidates") or []:
+            branch.append(
+                (
+                    f"[{cand['kind']}] {cand['site']} · {cand['status']}  "
+                    f"{_clip(cand['value'], 56)}",
+                    None,
+                )
+            )
+        for link in node.get("links") or []:
+            mark = "link" if link["kind"] == "url" else "hint"
+            state = ""
+            if mark == "link" and link["status"] != "new":
+                state = f" · {link['status']}"
+            branch.append((f"{mark} {link['site']}{state}  {_clip(link['url'], 70)}", None))
+        for kid in node.get("children") or []:
+            branch.append(("", kid))
+        hidden = int(node.get("branch_count") or 0) - len(branch)
+        if hidden > 0:
+            # Drawn as the last leaf, so the branch above it gets the ├─ connector instead of two
+            # bottom corners in a row.
+            branch.append((f"… {hidden} more branch(es) not drawn (raise --depth)", None))
+        for index, (text, kid) in enumerate(branch):
+            last_one = index == len(branch) - 1
+            if kid is None:
+                lines.append(inner + ("└─ " if last_one else "├─ ") + text)
+            else:
+                emit(kid, inner, last_one)
+
+    roots = payload.get("roots") or []
+    for index, root in enumerate(roots):
+        emit(root, "", index == len(roots) - 1)
     return "\n".join(lines)
 
 

@@ -1,20 +1,49 @@
-# `msft material` — the daily research loop for the translation fine-tune.
+# `msft material` — the daily research loop for the book-text model.
 #
-# Read by `msft material seed|run|distill|memorize|report|status`; nothing else reads it.
+# Read by `msft material seed|run|distill|memorize|report|status|tree`; nothing else reads it.
 # The brief and the keyword list are the scoring inputs: a page that does not mention any of
 # them is not worth an agent's time, and a page about the *radio* standard LoRa is noise.
+#
+# THE PRIORITY ORDER IS THE POINT (user, 2026-11-12). The model's job is long-form book text,
+# and its tasks are, in order:
+#   1. summarization into a markdown bullet list   (machinum-pipeline: llm-summary / to-markdown)
+#   2. NER into `<term>` entries + terminology     (named-entity-recognizer, term-tagger, glossary)
+#   3. proofreading / cleantyping / typo fixing    (proofread, llm-typo-fix, ru-grammar)
+#   4. translation — LAST: the current quality reads oddly to the user, so we keep the case in the
+#      arena but spend research on the other three and watch for better approaches.
+# Two properties outrank "quality" as scored by a judge: the model must follow the requested
+# OUTPUT FORMAT exactly (bullets, one JSON object, a term table, edit pairs), and it must be
+# FAST — tokens/s is a feature for a tool that runs over a whole book.
+#
+# The keyword list therefore leads with format/instruction compliance, then NER/terminology,
+# then proofreading, and only then the serving/training terms (which are still what makes this
+# project's fine-tunes and experiments possible).
 product:
   name: machinum-sft
   brief: >
-    A small local model that translates long-form English prose into Russian for the
-    machinum-pipeline book tools. We care about: LoRA/QLoRA/PEFT, dataset construction,
-    completion-only loss, GGUF export, evaluation, VRAM/latency on 2x RTX 4060 Ti 16GB.
-  keywords: [lora, qlora, peft, sft, dpo, grpo, fine-tun, adapter, quantization, gguf,
-             unsloth, trl, axolotl, dataset, synthetic data, eval, benchmark, vram, context]
-  negative: [hiring, webinar, podcast, discount, black friday]
+    A small local model (Qwen3.5, LoRA/QLoRA) that processes long-form English and Russian
+    book text: summarize into markdown bullet lists, extract named entities and terminology
+    into <term> tables, proofread/cleantype/typofix, and — last — translate. We care about
+    strict output-format compliance (bullet counts, one JSON object, term tables, edit pairs),
+    instruction following (IFEval-style), constrained decoding (outlines/GBNF/JSON mode),
+    NER/terminology extraction, grammatical error correction and typo fixing, and throughput:
+    tokens/s, vLLM, speculative decoding, quantization/GGUF on 2x RTX 4060 Ti 16GB. LoRA/QLoRA,
+    dataset construction and evaluation are the means, not the goal.
+  keywords: [structured output, json mode, json schema, constrained decoding, grammar constrained,
+             outlines, gbnf, instruction following, ifeval, format compliance, markdown summary,
+             bullet points, summariz, ner, named entity, entity extraction, term extraction,
+             terminology, glossary, proofread, typo, grammar correction, gec, cleantyping,
+             tokens per second, speculative decoding, vllm, lora, qlora, sft, dataset,
+             synthetic data, gguf, quantization, translation quality,
+             # The corpus is mostly Russian (habr), so the same priorities need Russian stems:
+             # an English-only list scores a perfectly on-topic Russian post at 0.
+             структурированн, json-схем, извлечен сущност, сущност, глоссари, терминолог,
+             опечатк, исправлен, корректур, дообучен, инструкц, промпт, перевод]
+  negative: [hiring, webinar, podcast, discount, black friday, вакансия, вебинар]
   # LoRa (the radio standard) is a different product entirely; an item is dropped unless it
   # also mentions one of these.
   domain_terms: [llm, language model, fine-tun, adapter, peft, qlora, neural, transformer,
+                 prompt, instruct, gpt, qwen, llama, gguf, квантизац,
                  нейросет, модел, обучен, токениз, весов]
 
 seeds:                              # `msft material seed`
@@ -23,12 +52,29 @@ seeds:                              # `msft material seed`
   - {kind: url, site: habr, value: "https://habr.com/ru/articles/1054710/"}
   - {kind: url, site: habr, value: "https://habr.com/ru/companies/rwb/articles/1069148/"}
   - {kind: url, site: habr, value: "https://habr.com/ru/companies/otus/articles/1026700/"}
+  # Priority 1: output format / instruction compliance / structured generation.
+  - {kind: query, site: habr,   value: "структурированный вывод LLM JSON"}
+  - {kind: query, site: github, value: "constrained decoding grammars"}
+  - {kind: query, site: github, value: "outlines structured generation"}
+  # Priority 2: NER / terminology.
+  - {kind: query, site: habr,   value: "NER извлечение сущностей"}
+  - {kind: query, site: github, value: "named entity recognition russian"}
+  - {kind: query, site: hf,     value: "ner"}
+  # Priority 3: proofreading / typo fixing.
+  - {kind: query, site: habr,   value: "исправление опечаток нейросеть"}
+  - {kind: query, site: github, value: "grammatical error correction"}
+  # Priority 4 (kept, not chased): translation.
+  - {kind: query, site: habr,   value: "перевод текста LLM качество"}
+  # Training/serving, still the machinery under the model.
   - {kind: query, site: habr,   value: "LoRA fine-tuning LLM"}
   - {kind: query, site: habr,   value: "QLoRA обучение больших языковых моделей"}
   - {kind: query, site: github, value: "lora fine-tuning"}
   - {kind: query, site: hf,     value: "lora"}
-  - {kind: query, site: hf,     value: "qlora"}
-  - {kind: query, site: github, value: "sft trainer"}
+  # The social half of webbridge: x/twitter search is where format/constrained-decoding work is
+  # announced first, and grok is a chat site — the frontier node holds the *question*, not a tag.
+  - {kind: query, site: twitter, value: "constrained decoding llm"}
+  - {kind: query, site: twitter, value: "structured output json llm"}
+  - {kind: note,  site: grok,    value: "Which techniques in 2026 make a small local model follow a strict output format — markdown bullet lists, a single JSON object, a term table — with the least fine-tuning?"}
 
 limits:
   queries_per_run: 6
@@ -36,6 +82,9 @@ limits:
   items_per_site: 6
   max_frontier: 200
   children_per_item: 3
+  # Outbound links per item: a github/hf/habr link becomes a frontier node, anything else an
+  # arxiv-style hint the note cites. Comments count — that is where the real repo links live.
+  links_per_item: 4
   fetch_timeout_s: 120
   ask_timeout_s: 240
   # A frontier node that failed (timeout, 502, a site mid-deploy) is retried on the next
@@ -52,11 +101,11 @@ scoring:
   keep_min: 0.35        # below: status=scored_out
   expand_min: 0.60      # below: no tag/author expansion
   recency_days: [30, 180]   # bonuses 0.20 / 0.10
-  site_prior: {github: 0.05, hf: 0.05, habr: 0.0}
+  site_prior: {github: 0.05, hf: 0.05, habr: 0.0, twitter: 0.02}
 
 expansion:
   allow_kinds: [tag, author, repo, model]
-  per_site: {habr: [tag, author], github: [repo], hf: [model]}
+  per_site: {habr: [tag, author], github: [repo], hf: [model], twitter: [author]}
 
 distill:
   agent: ds-code

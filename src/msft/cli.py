@@ -749,6 +749,30 @@ def _cmd_material_status(cfg: RunConfig | None, args: argparse.Namespace) -> int
     return EXIT_OK
 
 
+def _cmd_material_tree(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Print the net one day drew: candidate → item(s) → their outbound links (read-only)."""
+    material = _impl("msft.material")
+    result = _jsonable(
+        _func(material, "tree")(
+            _material_config(args),
+            day=getattr(args, "date", None),
+            depth=int(getattr(args, "depth", 2)),
+        )
+    )
+    _emit(args.as_json, result, _func(material, "format_tree")(result))
+    return EXIT_OK
+
+
+def _cmd_material_rescore(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Re-score the discarded items against today's brief (status only ever goes out → new)."""
+    material = _impl("msft.material")
+    result = _jsonable(
+        _func(material, "rescore")(_material_config(args), dry_run=args.dry_run)
+    )
+    _emit(args.as_json, result, _func(material, "format_rescore")(result))
+    return EXIT_OK
+
+
 # --- experiments: the queue between the notes and the box ------------------
 
 
@@ -1524,6 +1548,26 @@ def build_parser() -> argparse.ArgumentParser:
         "status", parents=[mat], help="offline frontier, item counts and last run"
     )
     p_m_status.set_defaults(handler=_cmd_material_status)
+    p_m_tree = mat_sub.add_parser(
+        "tree",
+        parents=[mat],
+        help="the net one day drew: candidate → item(s) → their outbound links",
+    )
+    p_m_tree.add_argument("--date", metavar="YYYY-MM-DD", default=None)
+    p_m_tree.add_argument(
+        "--depth",
+        type=int,
+        default=2,
+        metavar="N",
+        help="how many item levels to draw (default 2: items, their branches)",
+    )
+    p_m_tree.set_defaults(handler=_cmd_material_tree)
+    p_m_rescore = mat_sub.add_parser(
+        "rescore",
+        parents=[mat],
+        help="re-apply the current brief to items an older brief threw away",
+    )
+    p_m_rescore.set_defaults(handler=_cmd_material_rescore)
 
     # `experiments` is a sibling of `material`, not a child: it reads the material tree and
     # its own catalog, never a RunConfig. `--catalog` replaces `--config` here for the same
