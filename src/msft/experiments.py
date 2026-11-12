@@ -282,11 +282,8 @@ def load_catalog(
             args=_as_args(raw, where),
         )
     fallback = data.get("fallback")
-    if fallback is not None:
-        if not isinstance(fallback, str) or fallback not in recipes:
-            raise CatalogError(
-                f"{p}: 'fallback' must name one of the recipes above, got {fallback!r}"
-            )
+    if fallback is not None and (not isinstance(fallback, str) or fallback not in recipes):
+        raise CatalogError(f"{p}: 'fallback' must name one of the recipes above, got {fallback!r}")
     return ExperimentsCfg(
         path=p,
         recipes=recipes,
