@@ -56,6 +56,10 @@ Candidates are the frontier — what to look for, not what was found. Items are 
                            +-----------+
 ```
 
+`dropped` is terminal and never selected again: an empty candidate value, a link that answered
+404/410 (it can never work), or a link whose shape the site's recipe cannot read (a profile page,
+a gist, a page with no markdown twin).
+
 ```
   items: pages (one row per canonicalised URL)
       search hit / ask answer
@@ -101,6 +105,18 @@ Nothing is inferred from files on disk. A note file without a `distilled` row is
 a `packed` row without a pack entry is a bug. That is deliberate — `status` is the only
 truth, so a re-run after a crash resumes instead of guessing.
 
+**One pack is one prompt, and one prompt is one `exec` argument.** `at -f <pack>` hands the pack
+to the agent process as a *single* argv entry, and Linux caps one argument at 128 KiB
+(`MAX_ARG_STRLEN`), so a pack above that dies in `execve` before the agent starts — the failure
+is instant and total (measured 2026-11-12: a 242 KB pack → `E2BIG` in 35 ms with `0 distilled`;
+the same command on a 100 KB pack ran fine). `distill` therefore packs a bounded slice in
+`items_for_date` order: at most `PACK_MAX_ITEMS` (10) items **and** `PACK_MAX_BYTES` (100 000
+bytes, measured as bytes because the corpus is Russian). Everything else stays `fetched` and a
+log line says `pack holds N of M fetched item(s); the rest wait for the next run`; the next run
+packs the remainder, so a backlog drains one pack per run instead of stalling for ever. Ten items
+is also the agent's own unit of work — nine items took ~15 min — so the cap fits the step's
+1500 s budget as well.
+
 ## Subcommands
 
 | Command | What it does | Writes |
@@ -108,7 +124,7 @@ truth, so a re-run after a crash resumes instead of guessing.
 | `seed` | inserts the configured queries into the frontier | `candidates` |
 | `add` | inserts explicit URLs into the frontier, ahead of every query | `candidates` |
 | `run` | calls webbridge for the due candidates (fresh, retryable, and `done` ones past `limits.refresh_days`), tops a short day up with synthesized pairs, scores, fetches (with Habr's comment tree), expands, records outbound links | `candidates`, `items`, `raw/` |
-| `distill` | packs `packed` items into one file, runs the `at` agent over it | `pack/`, `notes/`, `experiments.md` |
+| `distill` | packs a bounded slice (≤ `PACK_MAX_ITEMS` items / `PACK_MAX_BYTES` bytes) of `fetched`/`packed` items into one file, runs the `at` agent over it; the rest of the day waits for the next run | `pack/`, `notes/`, `experiments.md` |
 | `memorize` | posts each `distilled` note to ai-memory | wiki, `INDEX.md` |
 | `report` | one line (or one JSON object) for a date | nothing |
 | `status` | counters for the whole state dir | nothing |
@@ -118,6 +134,9 @@ truth, so a re-run after a crash resumes instead of guessing.
 Exit codes are the contract: `0` ok, `1` the run finished but some items failed, `2` a
 config or environment error (bad YAML, missing token, unwritable directory). Only `2` means
 "fix the operator, then re-run"; `1` means the loop worked and some sites did not.
+`scripts/material-daily.sh` treats `1` the same way: it still runs `distill` (the day's pack is
+worth the agent) and keeps the final exit at 1 so the alert fires. Only `2`, `124` (a step killed
+at its budget) and `137` abort the rest of the loop.
 
 ```bash
 msft material seed                                  # once, and again after editing configs/material.yaml
@@ -164,10 +183,12 @@ material 2026-11-10: 6 queries → 12 items, 8 kept (habr 5, github 2, hf 1), 3 
 
 The numbers above are the *format*, not a measurement from this machine. With `--json` the
 same facts arrive as `{date, queries, items, kept, duplicates, fetched, packed, distilled,
-memorized, experiments, frontier, errors, seconds}` — and then everything human-readable goes
-to stderr, so `report --json | jq` is safe in a pipeline. `run --json` additionally carries
-`comments_fetched`, `comments_failed`, `links_queued` and `links_known`; `report` does not sum
-those four, because they describe the fetch, not the funnel.
+memorized, experiments, frontier, errors, dropped, links_unreadable, seconds}` — and then
+everything human-readable goes to stderr, so `report --json | jq` is safe in a pipeline.
+`run --json` additionally carries `comments_fetched`, `comments_failed`, `links_queued` and
+`links_known`; `report` does not sum those four, because they describe the fetch, not the funnel.
+It does sum `dropped` and `links_unreadable`, and both appear in the printed line **only when
+non-zero**, so a clean day reads exactly as it did before they existed.
 
 Environment overrides the CLI reads itself (the script only forwards the path ones):
 
@@ -213,6 +234,8 @@ docs/material/
   raw/<date>/<site>-<slug>.txt  normalize_text(body) + the comment tree, what the agent reads
   raw/<date>/<site>-<slug>.comments.json  the exact Habr comment payload, provenance
   pack/<date>.md                the distill task file: brief, rules, schema, one section per item
+                                (capped at `PACK_MAX_ITEMS`/`PACK_MAX_BYTES`; a backlog day's
+                                remainder waits for the next run)
   notes/<date>/<slug>.md        written by the agent: frontmatter + five sections
   INDEX.md                      table of memorized notes (date, title, site, score, experiment)
   experiments.md                append-only list of concrete experiment proposals
@@ -277,19 +300,37 @@ turns the whole mechanism off for a cheap sweep — tags, authors *and* links.
 **Links — a page is also a list of leads.** Expansion asks what a page *is*; links ask what it
 *points at*, and for this product that is usually the more useful question (an article about
 QLoRA ends with the repo, the paper and the dataset). After a successful fetch every http(s) URL
-in the article body **and** in the comment tree is classified by host:
+in the article body **and** in the comment tree is classified by host **and by a resolve-only
+probe** — `webbridge.py extract <site> <url> --dry-run`, which runs the recipe's own resolve step
+and drives no browser and no network (~0.1 s). So this repo keeps no per-site URL grammar: the
+recipe's regex decides whether the *shape* is readable.
 
 | Link host | Row | What happens |
 | --- | --- | --- |
-| `github.com`, `huggingface.co`, `habr.com`, `x.com`/`twitter.com` | `kind='url'`, `reason='link:<host>'`, `parent=<item url>`, `priority=<item score>` | a real frontier node: the next run extracts it like any other URL |
+| a recipe host, and the probe resolves the shape (`rc 0`) | `kind='url'`, `reason='link:<host>'`, `parent=<item url>`, `priority=<item score>` | a real frontier node: the next run extracts it like any other URL |
+| a recipe host, but the recipe refuses the shape (`rc 2`, `site config error`) — a profile page, a gist, a page with no markdown twin | `kind='hint'`, `status='hint'`, `site=<host>` | a leaf the note and `tree` can show; never a fetch job |
 | anything else (arxiv, a vendor blog) | `kind='hint'`, `status='hint'` | a leaf the note and `tree` can show; no recipe, so it is *never* a fetch job |
+
+The probe **fails open**: only `rc 2` plus `site config error` on stderr is a shape verdict. A
+timeout (`124`), a missing client (`127`) or a crash is *unknown*, not unreadable, and the link
+stays a `url` candidate — a hint is permanent for that article, so a transient probe failure must
+not lose the lead. `rc 0` proves the shape, not the page: `unsloth.ai/download` resolves to
+`/download.md` and only the real fetch sees the 404. A refusal only *demotes* when the site's
+recipe still reads a URL it fetched before (the most recent `items.url` of that site is probed as
+a canary); if the canary fails too, the recipe is rotted, every link of that site would silently
+become a hint, and the run logs `recipe <site> no longer resolves a page it fetched` and keeps the
+link a `url` so the failure is booked as a real error.
 
 Both kinds hang off the item URL, so the chain is readable in both directions. `UNIQUE(kind,
 value, site)` makes a link found twice — in the body and in a comment — one node, and
 `limits.links_per_item` caps each kind per item, because a note with forty links is not a reading
 list. A hint is stored in `candidates` with `status='hint'`, which no frontier query selects:
 `candidates()`, `frontier()` and `status` never see it as work, and the tree can still draw it.
-Counters: `links_queued` (new fetch jobs), `links_known` (the frontier already had it).
+Counters: `links_queued` (new fetch jobs), `links_known` (the frontier already had it),
+`links_unreadable` (a lead whose fetch or shape failed; retried while the budget allows but never
+fails the day) and `dropped` (a dead or unreadable link, written off — `dropped` rows are never
+selected again). Neither of the last two sets `ok`: a rotten link is a property of the link, not
+of the run.
 
 Habr's own JSON endpoints (`habr.com/kek/…`) are excluded on purpose: they sit on a host with a
 recipe, but fetching a comment payload as if it were an article wastes a browser call.
@@ -479,6 +520,12 @@ The site is inferred from the host: `habr.com` → `habr`, `github.com` → `git
 for host '…'`), never a search — there is no recipe to extract a page from an unknown site, and
 searching for a URL string finds nothing.
 
+A **shape the recipe refuses** is the same exit 2, before anything is written:
+`msft material add` runs the resolve-only probe and fails with `habr cannot read <url>: site
+config error: …` for a profile page, a gist, or a page with no markdown twin. `add --dry-run`
+reports it too. A probe that fails open (timeout, missing client) stays silent and the URL is
+queued — the fetch decides.
+
 A vendor docs site with a markdown endpoint is a `url` source like any other: the `unsloth`
 recipe reads the page's `.md` twin (`https://unsloth.ai/docs/models/qwen3.8` →
 `…/qwen3.8.md`), so the body is markdown — headings, code fences, tables — not text scraped
@@ -579,12 +626,14 @@ silently creates a frontier hides a typo in `configs/material.yaml`), then
 | `another run holds the lock`, exit 0 | a run is in flight, or a killed run left a live process | `pgrep -af 'material'`; if nothing, `fuser docs/material/.state/lock` |
 | exit 2, `error: …` on stderr | config or environment: unreadable YAML, missing token, unwritable dir | `msft material status` then re-read the message; the CLI prints the offending path |
 | exit 1, `collect failed` | webbridge: site down, browser not attached, JSON garbage — **not** an empty search (zero results are a `done` candidate) | `msft material run --limit 1 --site habr` and read the candidate's `error` column |
-| `distill: skipped (collect failed)` | correct behaviour, not a bug | nothing; tomorrow's run picks the `packed` items up |
+| `site config error` on a **link** candidate | the site's recipe refused that URL's shape (profile, gist, no markdown twin). The link is `dropped` under a healthy recipe (counted, never retried); if the site's canary fails too, the recipe itself is rotted and the row stays `error` — look for `recipe <site> no longer resolves a page it fetched` on stderr | `webbridge.py extract <site> <url> --dry-run`; if a page the site fetched before also fails, fix `sites/<site>.yml` |
+| `distill: skipped (collect did not finish…)` | correct behaviour: only exit 2/124/137 skips it (exit 0/1 both distill) | nothing; tomorrow's run picks the `packed` items up |
 | `at` non-zero / no summary | agent crashed, timed out, or printed no JSON. The note files are the evidence, not the exit code: `distill` books every note that landed, so a kill *after* the notes were written is a success with `agent_failed: true` and the items go to `distilled`. Only notes that are missing leave their item `packed` | read `docs/material/pack/<date>.md` and `docs/material/notes/<date>/`, then run `at` by hand on that file with a bigger `--timeout` |
+| `distill` FAILED in under a second, `error: ('E2BIG') code: "ERR_INVALID_ARG_TYPE" … status":"failed"` (0.3–1 s) | the pack outgrew one `exec` argument (128 KiB `MAX_ARG_STRLEN`) and died before the agent started. Packs are capped at `PACK_MAX_BYTES`, so this means something bypassed `_pack_slice` — an old binary, or a hand-written pack | `ls -l docs/material/pack/<date>.md`: a file near or above 128 KiB is the proof; re-run with the current `distill`, which slices it |
 | items stuck `packed` for days | the agent never accepted the pack | `SELECT url, error FROM items WHERE status='packed'` |
 | `memorize` 4xx | ai-memory down, wrong workspace/project, stale token | `curl -s localhost:49374/healthz`, then `memory-stack.md` |
 | `memorize` 5xx | the wiki store refused the write; the note file is kept | re-run `memorize` after fixing the service — it is idempotent by path |
-| an item is `fetched` but its `.txt` is a few bytes | the browser tab was still on another page: `extract` returned that page's payload (`found: false`, a foreign `url`, `text: '""'`). `_extract_error` now refuses all three as retryable errors, so this row means it happened *before* that guard | `SELECT url, error FROM items WHERE status='error'`; the next run retries (`limits.retry_errors`) |
+| an item is `fetched` but its `.txt` is a few bytes | the browser tab was still on another page: `extract` returned that page's payload (`found: false`, a foreign `url`, `text: '""'`). `_extract_error` now refuses all three as retryable errors, so this row means it happened *before* that guard. **Item rows are not retried** — `limits.retry_errors` governs candidates only; a link-discovered item's failure counts as `links_unreadable`, not as a run error | `SELECT url, error FROM items WHERE status='error'`, then re-queue a transient failure with `UPDATE items SET status='new' WHERE url='<url>'` — adding the URL again does **not** refetch it, because the existing item row dedupes the URL |
 | everything green, report says `0 items` | the sites answered and nothing scored | `items` rows with `scored_out` say why; usually `keep_min` |
 | everything green, report says `0 queries` | the frontier had nothing due: every candidate is `done` and inside `limits.refresh_days`, and synthesis is off or full | `msft material status` (frontier count), then `limits.refresh_days` / `limits.synthesize_queries` in `configs/material.yaml`; a real run also prints `frontier empty: nothing is due` on stderr |
 

@@ -12,7 +12,9 @@
 # stdout carries exactly one line — the report — so a cron DM/mail is readable at a glance.
 # Progress, warnings and the reason a step died go to stderr. Exit codes follow the CLI:
 #   0 clean · 1 finished with item-level failures · 2 config/env error (bad YAML, no token,
-#   no state directory). A locked run prints one line and exits 0: cron must not retry-storm.
+#   no state directory). rc 1 still runs distill — the pack collected is worth the agent — and
+#   the final exit stays 1 so the alert fires; only rc 2/124/137 skips the rest of the loop.
+#   A locked run prints one line and exits 0: cron must not retry-storm.
 #
 # The whole design is in docs/material-pipeline.md; the contract is in the spec that shipped
 # with `src/msft/material.py`.
@@ -148,15 +150,20 @@ PASS=()
 [ "$DRY_RUN" -eq 1 ] && PASS=(--dry-run)
 
 # 1. collect — the only step that touches the network aside from the agent's own reads.
+# rc 1 means "the loop worked and some sites did not" (docs/material-pipeline.md), so the day's
+# pack is still worth distilling; `run_step` has already set FAILED, so the final exit is 1 and
+# the alert still fires. Only a config/env error or a killed step (2/124/137) skips distill.
+collect_rc=0
+run_step collect "$T_COLLECT" run --limit "$LIMIT" "${PASS[@]}" || collect_rc=$?
 collected=0
-if run_step collect "$T_COLLECT" run --limit "$LIMIT" "${PASS[@]}"; then
+if [ "$collect_rc" -eq 0 ] || [ "$collect_rc" -eq 1 ]; then
   collected=1
 fi
 
-# 2. distill — delegated to `at`, expensive, and pointless on a pack built from a broken
-# collect. Never run it after a failed collect: the items stay `packed` for tomorrow.
+# 2. distill — delegated to `at`, expensive, and pointless on a pack built from a collect that
+# did not finish. Never run it after that: the items stay `packed` for tomorrow.
 if [ "$collected" -eq 0 ]; then
-  note "→ distill: skipped (collect failed; packed items wait for the next run)"
+  note "→ distill: skipped (collect did not finish; packed items wait for the next run)"
 elif [ "${MATERIAL_SKIP_DISTILL:-0}" = "1" ]; then
   note "→ distill: skipped (MATERIAL_SKIP_DISTILL=1)"
 elif run_step distill "$T_DISTILL" distill "${PASS[@]}"; then

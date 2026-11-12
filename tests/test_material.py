@@ -24,6 +24,10 @@ from msft.material import ConfigError
 
 DAY = "2026-11-10"
 
+# The autouse `offline_probes` fixture replaces `material.run_webbridge` module-wide; the one
+# test that verifies the seam itself needs the original function.
+REAL_RUN_WEBBRIDGE = material.run_webbridge
+
 BASE_CONFIG: dict[str, Any] = {
     "product": {
         "name": "machinum-sft",
@@ -109,6 +113,26 @@ def offline_comments(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         material, "_fetch_comments", lambda article, timeout: (None, "offline test")
     )
+
+
+@pytest.fixture(autouse=True)
+def offline_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test may run a real URL probe: every `--dry-run` resolve is answered locally.
+
+    A probe is a subprocess, and `link_target` now asks one for every link a page carries, so
+    without this fixture the `add` and link tests would shell out to the real tunnelstack. The
+    fake says "every shape is readable" — which, thanks to fail-open probing, leaves every
+    existing classification exactly as it was. A test that wants a refusal cans
+    `("extract", site, url, "--dry-run"): (2, "", "site config error: …")` in its `Bridge`,
+    and `install()` still overrides this fixture per test.
+    """
+
+    def fake(argv: list[str], timeout: float, json_flag: bool = True) -> tuple[int, str, str]:
+        if argv and argv[-1] == "--dry-run":
+            return 0, json.dumps({"url": argv[2]}), ""
+        return 1, "", "offline test: no canned response"
+
+    monkeypatch.setattr(material, "run_webbridge", fake)
 
 
 @pytest.fixture
@@ -574,7 +598,10 @@ def test_run_fetches_an_explicit_url_below_keep_min(
     material.add_urls(cfg, [CANONICAL])
     result = material.run(cfg, limit=1, day=DAY, sites=["habr"])
 
-    assert bridge.argv[0] == ["extract", "habr", CANONICAL]
+    assert ["extract", "habr", CANONICAL] in bridge.argv
+    assert bridge.argv[0] == ["extract", "habr", CANONICAL, "--dry-run"], (
+        "add probes the shape before queueing, then the run does the real extract"
+    )
     assert result["items"] == 1
     assert result["kept"] == 1
     assert result["fetched"] == 1
@@ -1116,10 +1143,21 @@ def prepare_fetched(
 
 
 def fake_at(
-    tmp_path: Path, *, status: str = "ok", exit_code: int = 0, write_notes: bool = True
+    tmp_path: Path,
+    *,
+    status: str = "ok",
+    exit_code: int = 0,
+    write_notes: bool = True,
+    record_size: Path | None = None,
 ) -> Path:
     """A stand-in for `at`: reads the pack, writes one note per slug, prints a JSON summary."""
     script = tmp_path / "fake-at"
+    record = (
+        f"pathlib.Path({str(record_size)!r}).open('a')"
+        ".write(str(len(pack.read_bytes())) + '\\n')\n"
+        if record_size is not None
+        else ""
+    )
     note_body = (
         """
 slugs = [line.split(": ", 1)[1] for line in pack.read_text().splitlines()
@@ -1144,7 +1182,7 @@ for slug in slugs:
         f"""#!/usr/bin/env python3
 import json, pathlib, sys
 pack = pathlib.Path(sys.argv[sys.argv.index("-f") + 1])
-notes = pathlib.Path({str(tmp_path / "material" / "notes")!r}) / pack.stem
+{record}notes = pathlib.Path({str(tmp_path / "material" / "notes")!r}) / pack.stem
 notes.mkdir(parents=True, exist_ok=True)
 {note_body}
 print("Now using node v22.20.0 (npm v10.9.3)")
@@ -1155,6 +1193,30 @@ sys.exit({exit_code})
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return script
+
+
+def seed_fetched_day(
+    cfg: material.MaterialCfg, count: int, *, body_chars: int = 3_000
+) -> list[str]:
+    """`count` fetched items on DAY, each with its own raw body file, all at score 1.0.
+
+    Returned in `items_for_date` order (`score DESC, url ASC`), which is the order `_pack_slice`
+    slices in.
+    """
+    urls: list[str] = []
+    with material.State(cfg.db_path) as state:
+        for index in range(1, count + 1):
+            url = f"https://habr.com/ru/articles/9100{index:02d}/"
+            raw = cfg.material_dir / "raw" / DAY / f"habr-{index:02d}.txt"
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            raw.write_text("Body " + "z" * body_chars, encoding="utf-8")
+            row = material._new_item_row(
+                {"url": url, "site": "habr", "title": f"Item {index}"}, 1.0, "fetched"
+            )
+            row["raw_path"] = cfg.display(raw)
+            state.add_item(row)
+            urls.append(url)
+    return urls
 
 
 def test_pack_contains_brief_rules_schema_and_truncated_body(
@@ -1262,6 +1324,72 @@ def test_distill_books_the_notes_a_timed_out_agent_did_write(
 
     # Nothing is left to do, so tomorrow's run does not re-pack and re-read the same page.
     assert material.distill(cfg, day=DAY)["items"] == 0
+
+
+def test_distill_packs_a_bounded_slice_and_defers_the_rest(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One `at` run carries one prompt, so a backlog day drains one pack per run."""
+    urls = seed_fetched_day(cfg, material.PACK_MAX_ITEMS + 3)
+    size_file = tmp_path / "pack-size"
+    monkeypatch.setenv("MSFT_AT_BIN", str(fake_at(tmp_path, record_size=size_file)))
+
+    result = material.distill(cfg, day=DAY)
+
+    assert result["ok"] is True
+    assert result["items"] == material.PACK_MAX_ITEMS, "one `at` run gets one prompt's worth"
+    assert result["packed"] == material.PACK_MAX_ITEMS
+    assert result["deferred"] == 3
+    assert result["missing_notes"] == 0
+    sizes = size_file.read_text().split()
+    assert len(sizes) == 1, "exactly one `at` call for the day's first pack"
+    assert int(sizes[0]) <= material.PACK_MAX_BYTES
+
+    with material.State(cfg.db_path) as state:
+        statuses = {str(row["url"]): row["status"] for row in state.items_for_date(DAY)}
+    assert [statuses[url] for url in urls[: material.PACK_MAX_ITEMS]] == (
+        ["distilled"] * material.PACK_MAX_ITEMS
+    )
+    assert [statuses[url] for url in urls[material.PACK_MAX_ITEMS :]] == ["fetched"] * 3, (
+        "the deferred rows stay fetched, not packed; the next run packs them"
+    )
+
+    rest = material.distill(cfg, day=DAY)
+    assert rest["items"] == 3
+    assert rest["deferred"] == 0
+    assert len(size_file.read_text().split()) == 2, "the remainder is one more `at` call"
+    with material.State(cfg.db_path) as state:
+        statuses = {str(row["url"]): row["status"] for row in state.items_for_date(DAY)}
+    assert set(statuses.values()) == {"distilled"}, "a backlog drains, it does not deadlock"
+
+
+def test_distill_takes_one_item_even_past_the_byte_cap(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A section bigger than `PACK_MAX_BYTES` still packs: an empty pack would deadlock the day."""
+    url = seed_fetched_day(cfg, 1)[0]
+    with material.State(cfg.db_path) as state:
+        for index in range(400):
+            state.add_candidate(
+                "hint",
+                f"https://example.com/p/{index:04d}/" + "x" * 280,
+                "example.com",
+                parent=url,
+                reason="hint:example.com",
+                status="hint",
+            )
+    with material.State(cfg.db_path) as state:
+        items = state.items_for_date(DAY, statuses=("fetched", "packed"))
+    assert len(material._pack_text(cfg, DAY, items).encode("utf-8")) > material.PACK_MAX_BYTES
+
+    monkeypatch.setenv(
+        "MSFT_AT_BIN", str(fake_at(tmp_path, record_size=tmp_path / "pack-size"))
+    )
+    result = material.distill(cfg, day=DAY)
+
+    assert result["items"] == 1, "the first item is always taken, whatever its section costs"
+    assert result["ok"] is True
+    assert result["deferred"] == 0
 
 
 # --- memorize -------------------------------------------------------------
@@ -2102,6 +2230,381 @@ def test_config_links_per_item_defaults_to_four(tmp_path: Path) -> None:
     assert material.LimitsCfg().links_per_item == 4
 
 
+# --- url shapes the recipe refuses ---------------------------------------
+#
+# `link_target` asks the recipe itself, with a resolve-only probe, whether it can read a URL's
+# shape. These tests can the probe's verdict; the fail-open and canary cases are the ones that
+# keep a broken or missing client from silently emptying the frontier.
+
+HABR_QUERY = "LoRA fine-tuning LLM"
+HABR_ITEM = "https://habr.com/ru/articles/900001"
+GIST = "https://gist.github.com/alice/abc123"
+PROFILE = "https://habr.com/ru/users/bob"
+CANARY_ITEM = "https://github.com/huggingface/peft"
+REFUSAL = "site config error: resolve.path: 'x' does not match '^[^/]+/[^/]+$'"
+
+
+def habr_only_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> material.MaterialCfg:
+    """A seeded config with one habr query, so a link test's frontier is only its children."""
+    monkeypatch.setenv("MSFT_MATERIAL_DIR", str(tmp_path / "material"))
+    monkeypatch.setenv("MSFT_MEMORY_TOKEN", "test-token")
+    cfg = material.load_material_config(
+        write_config(
+            tmp_path, seeds=[{"kind": "query", "site": "habr", "value": HABR_QUERY}]
+        )
+    )
+    material.seed(cfg)
+    return cfg
+
+
+def add_url_candidate(
+    cfg: material.MaterialCfg,
+    value: str,
+    site: str,
+    *,
+    reason: str = "link:github.com",
+    parent: str | None = HABR_ITEM,
+) -> None:
+    """A row as an earlier run would have left it, minted from a link (or by an operator)."""
+    with material.State(cfg.db_path) as state:
+        state.add_candidate("url", value, site, parent=parent, reason=reason, priority=0.5)
+
+
+def add_fetched_item(cfg: material.MaterialCfg, url: str, site: str) -> None:
+    """A page this site's recipe really did read — the canary `_recipe_reads_site` probes."""
+    with material.State(cfg.db_path) as state:
+        state.add_item(
+            material._new_item_row({"url": url, "site": site, "title": "canary"}, 0.5, "fetched")
+        )
+
+
+def candidate_row(cfg: material.MaterialCfg, value: str) -> dict[str, Any]:
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute(
+            "SELECT * FROM candidates WHERE value = ?", (value,)
+        ).fetchone()
+    assert row is not None
+    return dict(row)
+
+
+def test_gist_link_is_a_hint_because_the_recipe_refuses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = habr_only_cfg(tmp_path, monkeypatch)
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", HABR_QUERY): habr_search([STRONG]),
+            ("extract", "habr", HABR_ITEM): {"site": "habr", "text": f"A gist: {GIST}"},
+            ("extract", "github", GIST, "--dry-run"): (2, "", REFUSAL),
+        },
+    )
+    result = material.run(cfg, day=DAY, sites=["habr"], no_expand=False)
+
+    row = candidate_row(cfg, GIST)
+    assert row["kind"] == "hint"
+    assert row["status"] == "hint"
+    assert row["site"] == "gist.github.com", "the hint keeps the host it came from"
+    assert result["links_queued"] == 0, "a hint is never a fetch job"
+    with material.State(cfg.db_path) as state:
+        assert state.frontier() == 2, "only the tag/author children are work"
+        assert all(cand["value"] != GIST for cand in state.candidates(limit=10))
+
+
+def test_habr_profile_link_is_a_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = habr_only_cfg(tmp_path, monkeypatch)
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", HABR_QUERY): habr_search([STRONG]),
+            ("extract", "habr", HABR_ITEM): {"site": "habr", "text": f"By {PROFILE} here"},
+            ("extract", "habr", PROFILE, "--dry-run"): (2, "", REFUSAL),
+        },
+    )
+    result = material.run(cfg, day=DAY, sites=["habr"], no_expand=False)
+
+    row = candidate_row(cfg, PROFILE)
+    assert row["kind"] == "hint", "a profile page is not an article, even on a recipe host"
+    assert result["links_queued"] == 0
+
+
+def test_probe_timeout_keeps_the_link_a_fetch_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail open: an unknown probe outcome must not lose the lead."""
+    cfg = habr_only_cfg(tmp_path, monkeypatch)
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", HABR_QUERY): habr_search([STRONG]),
+            ("extract", "habr", HABR_ITEM): {"site": "habr", "text": f"Repo: {CANARY_ITEM}"},
+            ("extract", "github", CANARY_ITEM, "--dry-run"): (
+                124, "", "webbridge timed out after 30s",
+            ),
+        },
+    )
+    result = material.run(cfg, day=DAY, sites=["habr"], no_expand=False)
+
+    row = candidate_row(cfg, CANARY_ITEM)
+    assert row["kind"] == "url"
+    assert row["status"] == "new"
+    assert result["links_queued"] == 1
+
+
+def test_probe_success_with_an_empty_url_keeps_the_link_a_fetch_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`hf` is `mode: api`: a valid model URL resolves to `"url": ""`. rc 0 is the verdict."""
+    cfg = habr_only_cfg(tmp_path, monkeypatch)
+    model = "https://huggingface.co/unsloth/Qwen3.5-8B-GGUF"
+    install(
+        monkeypatch,
+        {
+            ("search", "habr", HABR_QUERY): habr_search([STRONG]),
+            ("extract", "habr", HABR_ITEM): {"site": "habr", "text": f"Model: {model}"},
+            ("extract", "hf", model, "--dry-run"): (0, json.dumps({"url": ""}), ""),
+        },
+    )
+    result = material.run(cfg, day=DAY, sites=["habr"], no_expand=False)
+
+    row = candidate_row(cfg, model)
+    assert row["kind"] == "url", "never test the payload's url — rc 0 is what proves the shape"
+    assert result["links_queued"] == 1
+
+
+def test_a_refusal_does_not_outvote_a_rotted_recipe(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rotted regex would turn every link of a site into a hint; that must be loud, not quiet."""
+    link = "https://github.com/broken/shape"
+    add_url_candidate(cfg, link, "github")
+    add_fetched_item(cfg, CANARY_ITEM, "github")
+    install(
+        monkeypatch,
+        {
+            ("extract", "github", link): (2, "", REFUSAL),
+            ("extract", "github", CANARY_ITEM, "--dry-run"): (2, "", REFUSAL),
+        },
+    )
+    result = material.run(cfg, day=DAY, sites=["github"])
+
+    assert result["ok"] is False, "a broken recipe is the run's problem, not the link's"
+    assert result["errors"] == 1
+    assert result["dropped"] == 0
+    row = candidate_row(cfg, link)
+    assert row["kind"] == "url", "the refusal was not trusted, so it stays a fetch job"
+    assert row["status"] == "error"
+
+
+def test_a_refused_link_with_a_healthy_recipe_is_dropped(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    link = "https://github.com/broken/shape"
+    add_url_candidate(cfg, link, "github")
+    add_fetched_item(cfg, CANARY_ITEM, "github")
+    install(
+        monkeypatch,
+        {
+            ("extract", "github", link): (2, "", REFUSAL),
+            ("extract", "github", CANARY_ITEM, "--dry-run"): (
+                0, json.dumps({"url": CANARY_ITEM}), "",
+            ),
+        },
+    )
+    result = material.run(cfg, day=DAY, sites=["github"])
+
+    assert result["ok"] is True
+    assert result["errors"] == 0
+    assert result["dropped"] == 1
+    assert result["links_unreadable"] == 1
+    assert candidate_row(cfg, link)["status"] == "dropped", "never selected, so never retried"
+
+
+def test_the_canary_tolerates_an_item_url_the_recipe_never_accepted(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`items.url` can be an API URL the recipe never accepted; an older canary still proves it."""
+    api_url = "https://api.github.com/repos/ggml-org/llama.cpp"
+    add_url_candidate(cfg, GIST, "github")
+    add_fetched_item(cfg, CANARY_ITEM, "github")
+    add_fetched_item(cfg, api_url, "github")
+    bridge = install(
+        monkeypatch,
+        {
+            ("extract", "github", GIST): (2, "", REFUSAL),
+            ("extract", "github", GIST, "--dry-run"): (2, "", REFUSAL),
+            ("extract", "github", CANARY_ITEM, "--dry-run"): (
+                0, json.dumps({"url": CANARY_ITEM}), "",
+            ),
+        },
+    )
+    result = material.run(cfg, day=DAY, sites=["github"])
+
+    api_probe = ["extract", "github", api_url, "--dry-run"]
+    healthy_probe = ["extract", "github", CANARY_ITEM, "--dry-run"]
+    assert api_probe in bridge.argv and healthy_probe in bridge.argv
+    assert bridge.argv.index(api_probe) < bridge.argv.index(healthy_probe), (
+        "canaries are tried newest first"
+    )
+    assert result["ok"] is True
+    assert result["errors"] == 0
+    assert result["dropped"] == 1
+    assert candidate_row(cfg, GIST)["status"] == "dropped"
+
+
+def test_a_manual_url_refused_by_the_recipe_stays_a_visible_error(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An operator's explicit URL is never silently dropped."""
+    install(
+        monkeypatch,
+        {
+            # `add` probes: the shape passed then, and the recipe rotted afterwards.
+            ("extract", "habr", PROFILE, "--dry-run"): (0, json.dumps({"url": PROFILE}), ""),
+            ("extract", "habr", PROFILE): (2, "", REFUSAL),
+        },
+    )
+    material.add_urls(cfg, [PROFILE])
+    result = material.run(cfg, day=DAY, sites=["habr"])
+
+    assert result["ok"] is False
+    assert result["errors"] == 1
+    assert result["dropped"] == 0
+    assert result["links_unreadable"] == 0
+    assert candidate_row(cfg, PROFILE)["status"] == "error"
+
+
+def test_a_link_minted_404_is_dropped_without_failing_the_run(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    link = "https://github.com/gone/repo"
+    add_url_candidate(cfg, link, "github")
+    install(
+        monkeypatch,
+        {("extract", "github", link): (1, "", "HTTP Error 404: Not Found")},
+    )
+    result = material.run(cfg, day=DAY, sites=["github"])
+
+    assert result["ok"] is True
+    assert result["errors"] == 0
+    assert result["links_unreadable"] == 1
+    assert result["dropped"] == 1, "a 404 can never work, so no retry is spent on it"
+    assert candidate_row(cfg, link)["status"] == "dropped"
+
+
+def test_a_link_minted_502_is_retryable_but_does_not_fail_the_run(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    link = "https://github.com/flaky/repo"
+    add_url_candidate(cfg, link, "github")
+    install(
+        monkeypatch,
+        {("extract", "github", link): (1, "", "HTTP Error 502: Bad Gateway")},
+    )
+    result = material.run(cfg, day=DAY, sites=["github"])
+
+    assert result["ok"] is True
+    assert result["errors"] == 0
+    assert result["links_unreadable"] == 1
+    assert result["dropped"] == 0
+    assert candidate_row(cfg, link)["status"] == "error", "still visible and retryable"
+
+
+def test_add_urls_rejects_a_shape_the_recipe_cannot_read(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install(
+        monkeypatch,
+        {("extract", "habr", CANONICAL, "--dry-run"): (2, "", REFUSAL)},
+    )
+    with pytest.raises(ConfigError, match="habr cannot read"):
+        material.add_urls(cfg, [ARTICLE])
+    assert not cfg.db_path.exists(), "a rejected URL must not create state"
+
+
+def test_a_rescored_link_item_failure_is_not_a_run_error(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link-discovered item whose body is a stale tab must not fail the day.
+
+    It reaches `_fetch_pending` (a rescore flipped it to `new`), which must carry the item's
+    `parent` so the loop knows the row came from a lead rather than from a query.
+    """
+    url = "https://habr.com/ru/articles/900009"
+    stale = {
+        "site": "habr",
+        "found": False,
+        "url": "https://www.google.com/search?udm=50&q=go",
+        "text": '""',
+    }
+    install(monkeypatch, {("extract", "habr", url): stale})
+    with material.State(cfg.db_path) as state:
+        state.add_item(
+            material._new_item_row(
+                {"url": url, "site": "habr", "parent": HABR_ITEM}, 0.5, "new"
+            )
+        )
+
+    result = material.run(cfg, day=DAY, limit=0)
+
+    assert result["ok"] is True
+    assert result["errors"] == 0
+    assert result["links_unreadable"] == 1
+    with material.State(cfg.db_path) as state:
+        row = state.item(url)
+    assert row is not None and row["status"] == "error", "the item row is still visible"
+
+
+def test_the_probe_cache_makes_two_links_one_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    twin = habr_item(
+        "https://habr.com/ru/articles/900003/",
+        "QLoRA adapter training notes",
+        summary="<p>QLoRA adapter, VRAM, dataset of 20k samples</p>",
+        published="Mon, 09 Nov 2026 12:00:00 +0000",
+        tags=["machine learning"],
+        author="dave",
+    )
+    cfg = habr_only_cfg(tmp_path, monkeypatch)
+    bridge = install(
+        monkeypatch,
+        {
+            ("search", "habr", HABR_QUERY): habr_search([STRONG, twin]),
+            ("extract", "habr", HABR_ITEM): {"site": "habr", "text": f"Repo: {CANARY_ITEM}"},
+            ("extract", "habr", "https://habr.com/ru/articles/900003"): {
+                "site": "habr", "text": f"Same repo again: {CANARY_ITEM}",
+            },
+        },
+    )
+    material.run(cfg, day=DAY, sites=["habr"], no_expand=False)
+
+    probe = ["extract", "github", CANARY_ITEM, "--dry-run"]
+    assert bridge.argv.count(probe) == 1, "the run's cache answers the second body locally"
+
+
+def test_a_link_the_db_already_knows_is_not_probed_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-reading an article must not pay a probe for every link it already produced."""
+    cfg = habr_only_cfg(tmp_path, monkeypatch)
+    body = f"Repo: {CANARY_ITEM}"
+    probe = ["extract", "github", CANARY_ITEM, "--dry-run"]
+    bridge = install(monkeypatch, {tuple(probe): {"url": CANARY_ITEM}})
+
+    with material.State(cfg.db_path) as state:
+        first = material._record_links(state, cfg, HABR_ITEM, 1.0, {"body": body}, {}, 5.0)
+    assert first == (1, 0)
+    assert bridge.argv.count(probe) == 1
+
+    with material.State(cfg.db_path) as state:
+        second = material._record_links(state, cfg, HABR_ITEM, 1.0, {"body": body}, {}, 5.0)
+    assert second == (0, 1), "the row dedupes to `known`, exactly as before"
+    assert bridge.argv.count(probe) == 1, "the DB already classified it, so no probe is spent"
+
+
 def test_twitter_search_rows_parse_into_items(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2298,8 +2801,8 @@ def test_run_webbridge_appends_json_only_when_asked(
         return Done()
 
     monkeypatch.setattr(material.subprocess, "run", fake_run)
-    material.run_webbridge(["extract", "twitter", TWEET_URL], 5)
-    material.run_webbridge(["send", "evaluate", "{}"], 5, json_flag=False)
+    REAL_RUN_WEBBRIDGE(["extract", "twitter", TWEET_URL], 5)
+    REAL_RUN_WEBBRIDGE(["send", "evaluate", "{}"], 5, json_flag=False)
 
     assert seen[0][-1] == "--json"
     assert "--json" not in seen[1], "send has no --json option and rejects it"

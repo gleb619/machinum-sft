@@ -77,6 +77,14 @@ PACK_TEXT_LIMIT = 8_000
 # The comment tree gets its own slice of the pack: an article body already fills the 8 000-char
 # budget, and the comments are where the author's own numbers and the commenters' links are.
 PACK_COMMENT_LIMIT = 2_000
+# `at` passes the prompt to the agent as ONE argv entry and Linux caps an argument at 128 KiB
+# (MAX_ARG_STRLEN), so a pack above that dies in execve with E2BIG before the agent starts
+# (measured 2026-11-12: 242 KB -> E2BIG in 35 ms, 100 KB -> fine). One pack therefore holds a
+# bounded slice of the day, and the rest stay `fetched` for the next run.
+PACK_MAX_BYTES = 100_000
+# ... and the agent's own budget: nine items took ~15 min, so a pack is capped well below the
+# step's 1500 s as well.
+PACK_MAX_ITEMS = 10
 NOTE_TAG_ALLOW = ("lora", "qlora", "peft", "sft", "dpo", "grpo", "unsloth", "trl", "axolotl",
                   "dataset")
 
@@ -982,23 +990,74 @@ def extract_links(text: str) -> list[str]:
     return out
 
 
-def link_target(url: str) -> tuple[str, str]:
+# A resolve-only probe drives no browser and touches no network (~0.1 s), but it is still a
+# subprocess: this is the ceiling for one, before the config's own fetch budget is applied.
+URL_PROBE_TIMEOUT_S = 30.0
+
+# A link that answered 404/410 can never work, whatever the recipe: `dropped`, not `error`, so
+# a retry budget is not spent re-asking for a page that does not exist.
+_GONE_LINK_RE = re.compile(r"HTTP Error (404|410)")
+
+
+@dataclass(frozen=True)
+class ProbeVerdict:
+    """One resolve-only probe's answer, in three states rather than two.
+
+    Three outcomes: resolves (proves the URL's shape), refused (condemns it), and unknown — a
+    timeout, a missing client, a crash — which proves nothing and must fail open. Collapsing
+    unknown into refused would let a transient probe failure condemn a healthy recipe.
+    """
+
+    resolved: bool = False
+    refused: bool = False
+    reason: str | None = None
+
+
+# One run's probe results, keyed `(site, url)`. Never kept across runs, because a recipe can be
+# fixed and the next run must see that.
+ProbeCache = dict[tuple[str, str], ProbeVerdict]
+
+
+def _link_host(url: str) -> str:
+    """The host a hint row is keyed by: lowercase, no `www.`, `unknown` when unparsable."""
+    host = (urllib.parse.urlparse(url).hostname or "unknown").lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def link_target(
+    url: str,
+    probes: ProbeCache,
+    timeout: float = URL_PROBE_TIMEOUT_S,
+) -> tuple[str, str]:
     """`('url', site)` when a recipe can read the link, `('hint', host)` when it cannot.
 
-    A hint is not a fetch job: there is no recipe for arxiv, a vendor blog or a tweet, so the
-    link becomes a row the note cites and `tree` shows, and the run never spends a browser call
-    on it. The host is the row's `site`, which is what makes `UNIQUE(kind, value, site)` dedupe
-    a hint found twice.
+    A hint is not a fetch job: there is no recipe for arxiv, a vendor blog or a tweet, **and a
+    host with a recipe can still refuse one shape of URL** (a profile page, a gist, a page with
+    no markdown twin). Both are hints: the link becomes a row the note cites and `tree` shows,
+    and the run never spends a browser call on it. The host is the row's `site`, which is what
+    makes `UNIQUE(kind, value, site)` dedupe a hint found twice.
+
+    The probe is resolve-only, so it judges the URL's *shape*: a dead page with a readable
+    shape stays a `url` and fails (visibly) at fetch time, where the run loop books it as a
+    property of the link rather than of the run.
     """
     try:
-        return "url", site_for_url(url)
+        site = site_for_url(url)
     except ConfigError:
-        host = (urllib.parse.urlparse(url).hostname or "unknown").lower()
-        return "hint", host[4:] if host.startswith("www.") else host
+        return "hint", _link_host(url)
+    if probe_url(site, url, timeout, probes) is not None:
+        return "hint", _link_host(url)
+    return "url", site
 
 
 def _record_links(
-    state: State, cfg: MaterialCfg, item_url: str, score: float, texts: dict[str, str]
+    state: State,
+    cfg: MaterialCfg,
+    item_url: str,
+    score: float,
+    texts: dict[str, str],
+    probes: ProbeCache,
+    probe_timeout: float,
 ) -> tuple[int, int]:
     """Turn the links one item carried into rows; returns `(queued, known)`.
 
@@ -1006,7 +1065,9 @@ def _record_links(
     so a link that only a commenter posted still becomes a node. Fetchable links get
     `kind='url'`, `reason='link:<site>'` and the item's score as priority (a link out of a strong
     article is worth reading before one out of a weak article); everything else is a `hint` row
-    with `status='hint'`, which no frontier query selects.
+    with `status='hint'`, which no frontier query selects. `probes` is the run's probe cache, so
+    two items linking the same URL cost one subprocess — and a URL the DB already classified
+    costs none at all: its row is reused and `add_candidate` dedupes it to `known`.
 
     Both budgets are `limits.links_per_item` and, for fetchable links, `max_frontier`: expansion
     may never push the frontier past its cap, and the same URL twice — once in the body, once in
@@ -1025,7 +1086,18 @@ def _record_links(
             seen.add(url)
             if _SKIP_LINK_RE.match(url):
                 continue
-            kind, target = link_target(url)
+            if taken["url"] >= budget and taken["hint"] >= budget:
+                # Neither kind can record this one, so do not spend a probe on it.
+                continue
+            known_row = state.conn.execute(
+                "SELECT kind, site FROM candidates WHERE value = ? LIMIT 1", (url,)
+            ).fetchone()
+            if known_row is not None and str(known_row["kind"]) in LINK_KINDS:
+                # The DB already classified this URL, so reuse the row verbatim and spend no
+                # probe: `add_candidate` below returns False -> `known += 1`, exactly as before.
+                kind, target = str(known_row["kind"]), str(known_row["site"])
+            else:
+                kind, target = link_target(url, probes, probe_timeout)
             if kind not in LINK_KINDS or taken[kind] >= budget:
                 continue
             if kind == "url" and state.frontier(cfg.limits.refresh_days) >= (
@@ -1342,6 +1414,109 @@ def run_webbridge(
     except OSError as exc:
         return 127, "", f"cannot run webbridge: {exc}"
     return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _probe_verdict(
+    site: str,
+    url: str,
+    timeout: float,
+    cache: ProbeCache,
+) -> ProbeVerdict:
+    """Classify one URL *shape* with a resolve-only probe, cached for the run.
+
+    Resolve-only (`extract <site> <url> --dry-run`): the recipe's own regex decides, so this repo
+    keeps no per-site URL grammar, and a probe drives no browser and no network (~0.1 s). `rc ==
+    0` resolves, `rc == 2` plus `site config error` refuses, and everything else — a timeout (rc
+    124), a missing client (rc 127), a crash — is *unknown*. The distinction is load-bearing: an
+    unknown is not evidence against a URL or a recipe, so callers fail open.
+    """
+    key = (site, url)
+    if key in cache:
+        return cache[key]
+    rc, stdout, stderr = run_webbridge(["extract", site, url, "--dry-run"], timeout)
+    if rc == 0:
+        verdict = ProbeVerdict(resolved=True)
+    elif rc == 2 and "site config error" in (stderr or ""):
+        verdict = ProbeVerdict(refused=True, reason=_tail(stderr or stdout))
+    else:
+        verdict = ProbeVerdict()
+    cache[key] = verdict
+    return verdict
+
+
+def probe_url(
+    site: str,
+    url: str,
+    timeout: float,
+    cache: ProbeCache,
+) -> str | None:
+    """Why the `site` recipe cannot read this URL *shape*, or `None` when it might.
+
+    Resolve-only (`extract <site> <url> --dry-run`): the recipe's own regex decides, so this repo
+    keeps no per-site URL grammar, and a probe drives no browser and no network (~0.1 s).
+    Fail OPEN: only `rc == 2` plus `site config error` on stderr is a shape verdict. A timeout
+    (rc 124), a missing client (rc 127) or a crash is *unknown*, not unreadable — a hint is
+    permanent for that article, so a transient probe failure must not lose the lead; the real
+    fetch decides instead. `rc == 0` proves the shape, not the page (`unsloth /download`
+    resolves to `/download.md` and only the fetch sees the 404). Callers that must tell an
+    unknown apart from a resolve use `_probe_verdict`, which shares this cache.
+
+    `cache` is the run's, keyed `(site, url)`: never kept across runs, because a recipe can be
+    fixed and the next run must see that.
+    """
+    return _probe_verdict(site, url, timeout, cache).reason
+
+
+# A row in one of these states was produced by a real fetch, so its URL is proof that the
+# site's recipe resolves that shape — which is exactly what the canary needs.
+_FETCHED_STATUSES = ("fetched", "packed", "distilled", "memorized")
+
+# One unreadable example URL is not proof of a rotted recipe, so try a few of the site's most
+# recent fetched URLs before condemning it.
+_CANARY_TRIES = 5
+
+
+def _recipe_reads_site(
+    state: State,
+    site: str,
+    probes: ProbeCache,
+    timeout: float,
+) -> tuple[bool, int, str | None]:
+    """Whether the site's recipe still resolves any of the pages it fetched before.
+
+    Returns `(reads, tried, last_refusal)`; the caller logs the last refusal's reason.
+
+    Canaries = up to `_CANARY_TRIES` most recent `items.url` rows of that site with a
+    fetched-ish status, tried newest first and cached in `probes`, so each URL costs one probe
+    per run. One unreadable example URL is not proof of a rotted recipe: `items.url` is not
+    guaranteed to be recipe-shaped (`mode: api` items store `api.github.com/...`, which the
+    recipe never accepted). The recipe is condemned (`False`) only when at least one canary was
+    explicitly refused and none resolved; an unknown probe — a timeout, a crash — is a skip,
+    never counted as a refusal, and no canaries at all is `True`.
+
+    This exists because a rotted `sites/<site>.yml` regex would turn *every* link of that site
+    into a hint, silently and for ever, since `_record_links` runs once per item. A refusal only
+    demotes a link when the recipe still reads a URL we know it read; otherwise the refusal is
+    the recipe's fault, not the link's, and the run must say so.
+    """
+    rows = state.conn.execute(
+        "SELECT url FROM items WHERE site = ? "
+        f"AND status IN ({', '.join('?' for _ in _FETCHED_STATUSES)}) "
+        "ORDER BY COALESCE(fetched_at, first_seen_at) DESC, rowid DESC LIMIT ?",
+        (site, *_FETCHED_STATUSES, _CANARY_TRIES),
+    ).fetchall()
+    if not rows:
+        return True, 0, None
+    tried = 0
+    last_refusal: str | None = None
+    for row in rows:
+        tried += 1
+        verdict = _probe_verdict(site, str(row["url"]), timeout, probes)
+        if verdict.resolved:
+            return True, tried, None
+        if verdict.refused:
+            last_refusal = verdict.reason
+    return last_refusal is None, tried, last_refusal
 
 
 def post_page(url: str, token: str, payload: dict[str, Any]) -> tuple[int, str]:
@@ -1743,6 +1918,16 @@ def add_urls(
             continue
         seen.add(pair)
         resolved.append(pair)
+
+    # An operator URL is worth a resolve-only probe: queuing a shape the recipe refuses would
+    # cost a browser call and a permanent `error` row to learn what 0.1 s answers now. A probe
+    # that fails open writes nothing, so a missing client never blocks an explicit `add`.
+    probes: ProbeCache = {}
+    timeout = min(URL_PROBE_TIMEOUT_S, float(cfg.limits.fetch_timeout_s))
+    for canonical, site in resolved:
+        reason = probe_url(site, canonical, timeout, probes)
+        if reason is not None:
+            raise ConfigError(f"{site} cannot read {canonical}: {reason}")
 
     if dry_run and not cfg.db_path.exists():
         would_add = [f"url/{site}: {canonical}" for canonical, site in resolved]
@@ -2225,6 +2410,12 @@ def _empty_counters() -> dict[str, Any]:
         # (or an earlier item) already had.
         "links_queued": 0,
         "links_known": 0,
+        # Links the sites refused: a dead or unreadable lead, written off. Neither counter sets
+        # `ok` — a rotten link is a property of the link, not of the run.
+        "dropped": 0,
+        # `links_unreadable` = a lead (link or link-discovered item) whose fetch or shape
+        # failed; it is retried while the budget allows but never fails the day.
+        "links_unreadable": 0,
     }
 
 
@@ -2237,6 +2428,8 @@ def _fetch_one(
     day: str,
     counters: dict[str, Any],
     no_expand: bool,
+    probes: ProbeCache | None = None,
+    probe_timeout: float = URL_PROBE_TIMEOUT_S,
 ) -> None:
     """Fetch one kept item, store its raw text, then grow the net (links, tags, author).
 
@@ -2247,7 +2440,14 @@ def _fetch_one(
     fetched = _fetch_body(cfg, entry, url, day)
     text = normalize_text(fetched.body)
     if fetched.error or not text.strip():
-        counters["errors"] += 1
+        # A row with a `parent` was discovered from another node, so this failure is a property
+        # of the lead, not of the day's queries: count it where a rotten link is counted and
+        # keep the run green. The item row still goes to `error` (item rows are never retried by
+        # `_fetch_pending` anyway).
+        if entry.get("parent"):
+            counters["links_unreadable"] += 1
+        else:
+            counters["errors"] += 1
         state.update_item(
             url, status="error", error=fetched.error or "empty body after normalisation"
         )
@@ -2278,6 +2478,7 @@ def _fetch_one(
     queued, known = _record_links(
         state, cfg, url, score,
         {"body": fetched.article, "comments": fetched.comments},
+        {} if probes is None else probes, probe_timeout,
     )
     counters["links_queued"] += queued
     counters["links_known"] += known
@@ -2297,6 +2498,8 @@ def _fetch_one(
 def _fetch_pending(
     cfg: MaterialCfg, state: State, day: str, counters: dict[str, Any], budget: int,
     no_expand: bool,
+    probes: ProbeCache | None = None,
+    probe_timeout: float = URL_PROBE_TIMEOUT_S,
 ) -> None:
     """Fetch items that are kept but never read: `status='new'` rows, oldest first.
 
@@ -2307,7 +2510,7 @@ def _fetch_pending(
     if room <= 0:
         return
     rows = state.conn.execute(
-        "SELECT url, site, title, summary, tags, published, score FROM items "
+        "SELECT url, site, title, summary, tags, published, score, parent FROM items "
         "WHERE status = 'new' ORDER BY score DESC, first_seen_at LIMIT ?",
         (room,),
     ).fetchall()
@@ -2319,6 +2522,8 @@ def _fetch_pending(
             "summary": row["summary"],
             "tags": json.loads(row["tags"]) if row["tags"] else [],
             "published": row["published"],
+            # Kept so a rescored link-discovered item fails like the link it came from.
+            "parent": row["parent"],
             "author": None,
             "stars": 0,
             "downloads": 0,
@@ -2326,7 +2531,7 @@ def _fetch_pending(
         counters["pending_fetched"] = int(counters.get("pending_fetched", 0)) + 1
         _fetch_one(
             cfg, state, entry, str(row["url"]), float(row["score"] or 0.0), day, counters,
-            no_expand,
+            no_expand, probes, probe_timeout,
         )
 
 
@@ -2347,6 +2552,11 @@ def run(
     budget = min(budget, cfg.limits.items_per_run)
     query_budget = cfg.limits.queries_per_run if limit is None else max(0, int(limit))
     counters = _empty_counters()
+    # One probe cache per run: link classification and the recipe canary share it, so a URL
+    # seen twice — or a site's canary — costs one subprocess. Never persisted across runs,
+    # because a fixed recipe must be visible to the next one.
+    probes: ProbeCache = {}
+    probe_timeout = min(URL_PROBE_TIMEOUT_S, float(cfg.limits.fetch_timeout_s))
 
     if dry_run and not cfg.db_path.is_file():
         # A plan is a read: with no state yet there is no frontier and nothing to create.
@@ -2430,6 +2640,7 @@ def run(
         run_id = state.start_run(argv if argv is not None else sys.argv[1:])
         started = time.monotonic()
         per_site: dict[str, int] = {}
+        recipe_warned: set[str] = set()
         # Stored *before* `finish_run` persists the counters: `report --date` looks a run up
         # by the day it collected for, not by the wall clock, so `run --date 2026-11-09` on
         # the 12th is still readable as the 9th (see `State.runs_for_date`).
@@ -2459,10 +2670,54 @@ def run(
                 # it is one frontier node that has been explored and is now empty. Only an
                 # unparsable/absent stdout is a real failure (bad argv, dead site, no JSON).
                 if payload is None:
+                    detail = _tail(stderr or stdout)
+                    # A candidate this module minted from an outbound link, as opposed to one an
+                    # operator asked for (`manual`/`seed`) — those must stay loud.
+                    is_link = str(cand.get("reason") or "").startswith("link:")
+                    refused = rc == 2 and "site config error" in (stderr or "")
+                    if is_link and refused:
+                        reads, tried, canary_reason = _recipe_reads_site(
+                            state, str(cand["site"]), probes, probe_timeout
+                        )
+                        if reads:
+                            # The recipe still reads what it read before, so this shape is
+                            # genuinely unreadable: `dropped` is never selected again.
+                            state.set_candidate(
+                                int(cand["id"]), "dropped", f"unreadable url: {detail}"
+                            )
+                            counters["dropped"] += 1
+                            counters["links_unreadable"] += 1
+                            _log(
+                                f"{cand['kind']}/{cand['site']} unreadable, dropped: {detail}"
+                            )
+                            continue
+                        # No canary resolved: the recipe itself is broken, not this link.
+                        # Silence would let every link of the site rot into hints, so say it
+                        # once per site and let the ordinary error path below book it.
+                        if str(cand["site"]) not in recipe_warned:
+                            recipe_warned.add(str(cand["site"]))
+                            _log(
+                                f"recipe {cand['site']} no longer resolves any page it "
+                                f"fetched ({tried} tried): {canary_reason}"
+                            )
+                    elif is_link:
+                        counters["links_unreadable"] += 1
+                        if _GONE_LINK_RE.search(detail):
+                            state.set_candidate(
+                                int(cand["id"]), "dropped", f"unreadable url: {detail}"
+                            )
+                            counters["dropped"] += 1
+                            _log(f"{cand['kind']}/{cand['site']} gone, dropped: {detail}")
+                            continue
+                        # Retryable: a 502 or an unparsable answer must not delete the lead,
+                        # and must not fail the day either.
+                        state.set_candidate(int(cand["id"]), "error", f"rc={rc}: {detail}")
+                        _log(f"{cand['kind']}/{cand['site']} unreadable: rc={rc}")
+                        continue
                     counters["errors"] += 1
                     state.set_candidate(
                         int(cand["id"]), "error",
-                        f"rc={rc}: {_tail(stderr or stdout)}",
+                        f"rc={rc}: {detail}",
                     )
                     _log(f"{cand['kind']}/{cand['site']} failed: rc={rc}")
                     continue
@@ -2508,11 +2763,16 @@ def run(
                     counters["kept"] += 1
                     kept_by_site[site] = kept_by_site.get(site, 0) + 1
                     state.add_item(_new_item_row(entry, score, "seen"))
-                    _fetch_one(cfg, state, entry, url, score, day, counters, no_expand)
+                    _fetch_one(
+                        cfg, state, entry, url, score, day, counters, no_expand,
+                        probes, probe_timeout,
+                    )
             # Kept-but-unread rows (a rescore flip, a run that died mid-fetch) are the cheapest
             # work of the day, so they are always drained before the run closes.
             if not dry_run:
-                _fetch_pending(cfg, state, day, counters, budget, no_expand)
+                _fetch_pending(
+                    cfg, state, day, counters, budget, no_expand, probes, probe_timeout
+                )
         finally:
             counters["seconds"] = round(time.monotonic() - started, 1)
             state.finish_run(run_id, counters)
@@ -2617,19 +2877,9 @@ def _pack_links_block(links: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def _pack_text(cfg: MaterialCfg, day: str, items: list[dict[str, Any]]) -> str:
-    """The whole distill task pack: brief, rules, schema, one section per item.
-
-    The pack is where the day's net becomes readable to the agent: each section carries the
-    item's link rows, so `## Links` is written from what the page and its comments actually
-    said rather than re-derived from prose — and so a `hint` (arxiv, a vendor blog) is still
-    visible to the reader even though it will never be a fetch job.
-    """
-    link_rows: dict[str, list[dict[str, Any]]] = {}
-    if items and cfg.db_path.is_file():
-        with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
-            link_rows = _link_rows(state, [str(item["url"]) for item in items])
-    lines = [
+def _pack_header(cfg: MaterialCfg, day: str) -> list[str]:
+    """The pack's preamble: brief, rules, schema, and the `---` the first section follows."""
+    return [
         f"# Material pack — {day}",
         "",
         f"Product: {cfg.product.name}",
@@ -2641,40 +2891,99 @@ def _pack_text(cfg: MaterialCfg, day: str, items: list[dict[str, Any]]) -> str:
         "---",
         "",
     ]
+
+
+def _pack_section(
+    cfg: MaterialCfg,
+    index: int,
+    item: dict[str, Any],
+    link_rows: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    """One item's section: its metadata, its link rows, and the bounded body slice."""
+    slug = slugify(str(item["url"]))
+    tags = item.get("tags") or "[]"
+    try:
+        tags = ", ".join(json.loads(tags)) if isinstance(tags, str) else ", ".join(tags)
+    except (ValueError, TypeError):
+        tags = str(tags)
+    text_path = cfg.resolve(item.get("raw_path"))
+    body = ""
+    if text_path and text_path.is_file():
+        body = text_path.read_text(encoding="utf-8", errors="replace")
+    return [
+        f"## {index}. {item.get('title') or item['url']}",
+        "",
+        f"- slug: {slug}",
+        f"- url: {item['url']}",
+        f"- site: {item['site']}",
+        f"- title: {item.get('title') or '-'}",
+        f"- author: {item.get('author') or '-'}",
+        f"- published: {item.get('published') or '-'}",
+        f"- tags: {tags or '-'}",
+        f"- score: {item.get('score', 0)}",
+        f"- comments: {int(item.get('comments') or 0)}",
+        f"- raw: {item.get('raw_path') or '-'}",
+        *_pack_links_block(link_rows.get(str(item["url"]), [])),
+        "",
+        "```text",
+        _pack_body(body),
+        "```",
+        "",
+    ]
+
+
+def _link_rows_for(
+    cfg: MaterialCfg, items: list[dict[str, Any]]
+) -> dict[str, list[dict[str, Any]]]:
+    """One query for the whole pack: the link rows hanging off each item's URL."""
+    if not items or not cfg.db_path.is_file():
+        return {}
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
+        return _link_rows(state, [str(item["url"]) for item in items])
+
+
+def _pack_text(cfg: MaterialCfg, day: str, items: list[dict[str, Any]]) -> str:
+    """The whole distill task pack: brief, rules, schema, one section per item.
+
+    The pack is where the day's net becomes readable to the agent: each section carries the
+    item's link rows, so `## Links` is written from what the page and its comments actually
+    said rather than re-derived from prose — and so a `hint` (arxiv, a vendor blog) is still
+    visible to the reader even though it will never be a fetch job.
+    """
+    link_rows = _link_rows_for(cfg, items)
+    lines = _pack_header(cfg, day)
     for index, item in enumerate(items, 1):
-        slug = slugify(str(item["url"]))
-        tags = item.get("tags") or "[]"
-        try:
-            tags = ", ".join(json.loads(tags)) if isinstance(tags, str) else ", ".join(tags)
-        except (ValueError, TypeError):
-            tags = str(tags)
-        text_path = cfg.resolve(item.get("raw_path"))
-        body = ""
-        if text_path and text_path.is_file():
-            body = text_path.read_text(encoding="utf-8", errors="replace")
-        lines.extend(
-            [
-                f"## {index}. {item.get('title') or item['url']}",
-                "",
-                f"- slug: {slug}",
-                f"- url: {item['url']}",
-                f"- site: {item['site']}",
-                f"- title: {item.get('title') or '-'}",
-                f"- author: {item.get('author') or '-'}",
-                f"- published: {item.get('published') or '-'}",
-                f"- tags: {tags or '-'}",
-                f"- score: {item.get('score', 0)}",
-                f"- comments: {int(item.get('comments') or 0)}",
-                f"- raw: {item.get('raw_path') or '-'}",
-                *_pack_links_block(link_rows.get(str(item["url"]), [])),
-                "",
-                "```text",
-                _pack_body(body),
-                "```",
-                "",
-            ]
-        )
+        lines.extend(_pack_section(cfg, index, item, link_rows))
     return "\n".join(lines)
+
+
+def _pack_slice(
+    cfg: MaterialCfg, day: str, items: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The longest leading run of `items` one `at` invocation can carry.
+
+    Greedy and in item order: an item joins while the pack stays under `PACK_MAX_ITEMS` items
+    and `PACK_MAX_BYTES` bytes. The byte cap is *bytes* (the Russian corpus makes the character
+    count a poor proxy), and the first item is always taken even if its own section alone
+    exceeds it — a section is already bounded by `PACK_TEXT_LIMIT`/`PACK_COMMENT_LIMIT`, and an
+    empty pack would leave the day's backlog packed for ever.
+    """
+    if not items:
+        return []
+    link_rows = _link_rows_for(cfg, items)
+    header = "\n".join(_pack_header(cfg, day))
+    size = len(header.encode("utf-8"))
+    chosen: list[dict[str, Any]] = []
+    for index, item in enumerate(items, 1):
+        if len(chosen) >= PACK_MAX_ITEMS:
+            break
+        section = "\n".join(_pack_section(cfg, index, item, link_rows))
+        trial = size + len(section.encode("utf-8")) + 1  # +1 for the newline before the section
+        if chosen and trial > PACK_MAX_BYTES:
+            break
+        chosen.append(item)
+        size = trial
+    return chosen
 
 
 def _last_json_line(text: str) -> dict[str, Any] | None:
@@ -2836,16 +3145,26 @@ def distill(
         "distilled": 0,
         "missing_notes": 0,
         "experiments": 0,
+        "deferred": 0,
         "pack": cfg.display(pack_path),
         "note": "nothing to pack",
     }
     if dry_run and not cfg.db_path.is_file():
         return empty
     with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
-        items = state.items_for_date(day, statuses=("fetched", "packed"))
-        if not items:
+        fetched = state.items_for_date(day, statuses=("fetched", "packed"))
+        if not fetched:
             return empty
+        # One `at` run carries one prompt, and one prompt must fit in one argv entry (see
+        # `PACK_MAX_BYTES`). The rest of the day stays `fetched` and is packed next run.
+        items = _pack_slice(cfg, day, fetched)
+        deferred = len(fetched) - len(items)
         pack_text = _pack_text(cfg, day, items)
+        if deferred:
+            _log(
+                f"pack holds {len(items)} of {len(fetched)} fetched item(s); "
+                "the rest wait for the next run"
+            )
         if dry_run:
             return {
                 "dry_run": True,
@@ -2856,6 +3175,7 @@ def distill(
                 "distilled": 0,
                 "missing_notes": 0,
                 "experiments": 0,
+                "deferred": deferred,
                 "pack": cfg.display(pack_path),
                 "command": command,
                 "cwd": str(cfg.repo),
@@ -2890,6 +3210,8 @@ def distill(
                 "distilled": 0,
                 "missing_notes": len(items),
                 "experiments": 0,
+                "deferred": deferred,
+                "chars": len(pack_text),
                 "pack": cfg.display(pack_path),
                 "command": command,
                 "error": f"cannot run {command[0]}: {exc}",
@@ -2914,6 +3236,8 @@ def distill(
                 "distilled": distilled,
                 "missing_notes": missing,
                 "experiments": written,
+                "deferred": deferred,
+                "chars": len(pack_text),
                 "pack": cfg.display(pack_path),
                 "command": command,
                 "returncode": proc.returncode,
@@ -2933,6 +3257,8 @@ def distill(
             "distilled": distilled,
             "missing_notes": missing,
             "experiments": written,
+            "deferred": deferred,
+            "chars": len(pack_text),
             "pack": cfg.display(pack_path),
             "command": command,
             "returncode": proc.returncode,
@@ -3154,6 +3480,8 @@ def report(cfg: MaterialCfg, *, day: str | None = None) -> dict[str, Any]:
         "frontier": 0,
         "raw": _raw_files(cfg, day),
         "errors": 0,
+        "dropped": 0,
+        "links_unreadable": 0,
         "seconds": 0.0,
     }
     if not cfg.db_path.is_file():
@@ -3163,6 +3491,7 @@ def report(cfg: MaterialCfg, *, day: str | None = None) -> dict[str, Any]:
         items = state.items_for_date(day)
         frontier = state.frontier(cfg.limits.refresh_days)
     queries = items_count = kept = duplicates = fetched = errors = 0
+    dropped = links_unreadable = 0
     kept_by_site: dict[str, int] = {}
     seconds = 0.0
     for row in runs:
@@ -3173,6 +3502,8 @@ def report(cfg: MaterialCfg, *, day: str | None = None) -> dict[str, Any]:
         duplicates += int(counters.get("duplicates", 0))
         fetched += int(counters.get("fetched", 0))
         errors += int(counters.get("errors", 0))
+        dropped += int(counters.get("dropped", 0))
+        links_unreadable += int(counters.get("links_unreadable", 0))
         for site, count in (counters.get("kept_by_site") or {}).items():
             kept_by_site[site] = kept_by_site.get(site, 0) + int(count)
         seconds += float(counters.get("seconds", 0) or 0)
@@ -3194,8 +3525,24 @@ def report(cfg: MaterialCfg, *, day: str | None = None) -> dict[str, Any]:
         "frontier": frontier,
         "raw": _raw_files(cfg, day),
         "errors": errors,
+        "dropped": dropped,
+        "links_unreadable": links_unreadable,
         "seconds": round(seconds, 1),
     }
+
+
+def _dropped_suffix(payload: dict[str, Any]) -> str:
+    """`, N dropped, M link(s) unreadable` — printed only when non-zero.
+
+    Both counters describe links the sites refused, and neither fails the run, so on a clean day
+    the line this feeds is byte-for-byte what it was before those counters existed.
+    """
+    out = ""
+    if payload.get("dropped"):
+        out += f", {payload['dropped']} dropped"
+    if payload.get("links_unreadable"):
+        out += f", {payload['links_unreadable']} link(s) unreadable"
+    return out
 
 
 def format_report(payload: dict[str, Any]) -> str:
@@ -3208,7 +3555,8 @@ def format_report(payload: dict[str, Any]) -> str:
     return (
         f"material {payload['date']}: {payload.get('queries', 0)} queries → "
         f"{payload.get('items', 0)} items, {payload.get('kept', 0)} kept{breakdown}, "
-        f"{payload.get('duplicates', 0)} duplicates, {payload.get('distilled', 0)} distilled, "
+        f"{payload.get('duplicates', 0)} duplicates{_dropped_suffix(payload)}, "
+        f"{payload.get('distilled', 0)} distilled, "
         f"{payload.get('memorized', 0)} memorized, {payload.get('experiments', 0)} experiment "
         f"· frontier {payload.get('frontier', 0)} · raw {payload.get('raw', 0)} files · "
         f"{payload.get('seconds', 0):g} s"
@@ -3286,10 +3634,17 @@ def format_status(payload: dict[str, Any]) -> str:
     last = payload.get("last_run")
     if last:
         counters = last.get("counters") or {}
+        # `status` is the first thing an operator runs after an alert, so the day's link junk
+        # has to be visible here — but only when there is any, or a clean line stays clean.
+        link_junk = ""
+        if counters.get("dropped"):
+            link_junk += f" dropped={counters['dropped']}"
+        if counters.get("links_unreadable"):
+            link_junk += f" links_unreadable={counters['links_unreadable']}"
         lines.append(
             f"last run  #{last['id']} {last['started_at']} "
             f"queries={counters.get('queries', 0)} items={counters.get('items', 0)} "
-            f"errors={counters.get('errors', 0)}"
+            f"errors={counters.get('errors', 0)}{link_junk}"
         )
     lines.append(
         f"memory    {payload['memory_url']} token "
@@ -3600,17 +3955,20 @@ def format_run(payload: dict[str, Any]) -> str:
         f"run {payload.get('date')}: {payload.get('queries', 0)} queries, "
         f"{payload.get('items', 0)} items, {payload.get('kept', 0)} kept{breakdown}, "
         f"{payload.get('duplicates', 0)} duplicates, {payload.get('fetched', 0)} fetched, "
-        f"{payload.get('children', 0)} children, {payload.get('errors', 0)} error(s) "
+        f"{payload.get('children', 0)} children, {payload.get('errors', 0)} error(s)"
+        f"{_dropped_suffix(payload)} "
         f"· frontier {payload.get('frontier', 0)} · {payload.get('seconds', 0):g} s"
     )
 
 
 def format_distill(payload: dict[str, Any]) -> str:
     """Pack size, the exact `at` command, and how many notes came back."""
+    deferred = payload.get("deferred") or 0
+    deferred_note = f", {deferred} deferred" if deferred else ""
     if payload.get("dry_run"):
         lines = [
             f"distill plan {payload['date']}: {payload.get('items', 0)} item(s) → "
-            f"{payload.get('pack')} ({payload.get('chars', 0)} chars)"
+            f"{payload.get('pack')} ({payload.get('chars', 0)} chars{deferred_note})"
         ]
         for entry in payload.get("items_list") or []:
             lines.append(f"  {entry['slug']}  score={entry['score']}  {entry['url']}")
@@ -3623,7 +3981,8 @@ def format_distill(payload: dict[str, Any]) -> str:
         f"distill {payload['date']}: {'ok' if payload.get('ok') else 'FAILED'} · "
         f"{payload.get('packed', 0)} packed, {payload.get('distilled', 0)} distilled, "
         f"{payload.get('missing_notes', 0)} missing note(s), "
-        f"{payload.get('experiments', 0)} experiment(s) · {payload.get('seconds', 0):g} s"
+        f"{payload.get('experiments', 0)} experiment(s){deferred_note} · "
+        f"{payload.get('seconds', 0):g} s"
     )
     if payload.get("error"):
         head += f"\n  error: {payload['error']}"
