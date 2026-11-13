@@ -72,11 +72,29 @@ ITEM_STATUSES = (
     "error",
 )
 
-TEXT_LIMIT = 40_000
+# The fetch-level cap: what `normalize_text` keeps and what an item's `.txt` holds. 120 000 chars
+# keeps a very long article or a whole catalogue page (hft.md's 103 model cards are 102 316), and
+# the raw file is the only place that text lives — SQLite stores the row, not the body. What
+# reaches the *pack* is a different, shared budget: `PACK_TEXT_LIMIT`/`PACK_TEXT_MAX` below.
+TEXT_LIMIT = 120_000
+# One item's body slice in the pack is not a fixed size: `_pack_body_budget` shares
+# `PACK_MAX_BYTES` across the day. `PACK_TEXT_LIMIT` is the floor every section gets — a busy day
+# packs exactly as before — and `PACK_TEXT_MAX` is the most one section may take when the pack is
+# light, so one long article can never eat a busy day's budget. Both are characters; the byte cap
+# is enforced separately in `_pack_slice`.
 PACK_TEXT_LIMIT = 8_000
-# The comment tree gets its own slice of the pack: an article body already fills the 8 000-char
-# budget, and the comments are where the author's own numbers and the commenters' links are.
+PACK_TEXT_MAX = 80_000
+# What a pack costs besides the body characters: the header, every section's metadata, link
+# rows and fences, and each cut's truncation marker. Measured at 6 774 B for a 10-section pack
+# whose bodies hit the cap (100 274 B pack, 93 500 B of bodies, 2026-11-13), so 7 500 is what
+# keeps a full 10-item day inside `PACK_MAX_BYTES`.
+PACK_RESERVE_BYTES = 7_500
+# The comment tree gets its own slice of the pack: an article body already fills the body budget,
+# and the comments are where the author's own numbers and the commenters' links are.
 PACK_COMMENT_LIMIT = 2_000
+# The cut is marked in the body, not left silent: the rules tell the agent to read the `raw:` file
+# when a section stops mid-article, and only the marker says that it did.
+PACK_TRUNC_MARKER = "\n\n[… обрезано в этом пакете; полный текст — в `raw:` выше]\n\n"
 # `at` passes the prompt to the agent as ONE argv entry and Linux caps an argument at 128 KiB
 # (MAX_ARG_STRLEN), so a pack above that dies in execve with E2BIG before the agent starts
 # (measured 2026-11-12: 242 KB -> E2BIG in 35 ms, 100 KB -> fine). One pack therefore holds a
@@ -910,7 +928,7 @@ def _fold(text: str) -> str:
 
 
 def normalize_text(text: str) -> str:
-    """Strip script/style/nav/aside/footer blocks and tags, tidy whitespace, cap at 40 000."""
+    """Strip script/style/nav/aside/footer blocks and tags, tidy whitespace, cap at 120 000."""
     if not text:
         return ""
     out = _BLOCK_RE.sub(" ", text)
@@ -2855,21 +2873,36 @@ Body sections, in this order and with these headings:
 """
 
 
-def _pack_body(text: str) -> str:
+def _pack_body_budget(items: list[dict[str, Any]]) -> int:
+    """The per-item body budget in characters, shared across the day's pack.
+
+    `PACK_MAX_BYTES` is the argv cap, not a body cap: the header plus every section's metadata,
+    link rows and fences cost bytes too, so `PACK_RESERVE_BYTES` of them are reserved. What is
+    left is split evenly over the day's items — a few items share a large budget (one item may
+    take `PACK_TEXT_MAX`), a backlog shares it thinly and settles on the `PACK_TEXT_LIMIT` floor,
+    so a busy day is packed exactly as it was when the slice was fixed at that floor.
+    """
+    count = max(1, len(items))
+    return max(PACK_TEXT_LIMIT, min(PACK_TEXT_MAX, (PACK_MAX_BYTES - PACK_RESERVE_BYTES) // count))
+
+
+def _pack_body(text: str, budget: int) -> str:
     """The body slice the agent reads: the article head, then the comment tree, each capped.
 
-    One 8 000-char slice is not enough for a 14 kB article *plus* its discussion, and cutting at
-    the char limit would drop exactly the part the comments were fetched for. Splitting at the
-    `# Комментарии` delimiter gives each part its own budget, so a long article never hides the
-    comment tree.
+    `budget` comes from `_pack_body_budget` and is what the day can afford for this item. When
+    the text carries a comment tree (`# Комментарии`) the tree keeps its own `PACK_COMMENT_LIMIT`
+    slice out of that budget, so a long article never hides the comments. A cut leaves
+    `PACK_TRUNC_MARKER` where the text stopped, pointing the agent at the `raw:` file.
     """
     article, comments = _split_comments(text)
     if not comments:
-        return article[:PACK_TEXT_LIMIT]
-    head = max(0, PACK_TEXT_LIMIT - PACK_COMMENT_LIMIT)
+        if len(article) <= budget:
+            return article
+        return article[:budget].rstrip() + PACK_TRUNC_MARKER.rstrip()
+    head = max(0, budget - PACK_COMMENT_LIMIT)
     return (
         article[:head].rstrip()
-        + "\n\n[… тело статьи обрезано в этом пакете; полный текст — в `raw:` выше]\n\n"
+        + PACK_TRUNC_MARKER
         + comments[:PACK_COMMENT_LIMIT].rstrip()
     )
 
@@ -2916,6 +2949,7 @@ def _pack_section(
     index: int,
     item: dict[str, Any],
     link_rows: dict[str, list[dict[str, Any]]],
+    body_budget: int,
 ) -> list[str]:
     """One item's section: its metadata, its link rows, and the bounded body slice."""
     slug = slugify(str(item["url"]))
@@ -2944,7 +2978,7 @@ def _pack_section(
         *_pack_links_block(link_rows.get(str(item["url"]), [])),
         "",
         "```text",
-        _pack_body(body),
+        _pack_body(body, body_budget),
         "```",
         "",
     ]
@@ -2960,18 +2994,29 @@ def _link_rows_for(
         return _link_rows(state, [str(item["url"]) for item in items])
 
 
-def _pack_text(cfg: MaterialCfg, day: str, items: list[dict[str, Any]]) -> str:
+def _pack_text(
+    cfg: MaterialCfg,
+    day: str,
+    items: list[dict[str, Any]],
+    body_budget: int | None = None,
+) -> str:
     """The whole distill task pack: brief, rules, schema, one section per item.
 
     The pack is where the day's net becomes readable to the agent: each section carries the
     item's link rows, so `## Links` is written from what the page and its comments actually
     said rather than re-derived from prose — and so a `hint` (arxiv, a vendor blog) is still
     visible to the reader even though it will never be a fetch job.
+
+    `body_budget` is the budget `_pack_slice` measured the pack against; `distill` passes it so
+    the pack written to disk is the pack that was measured. Without it the budget is derived
+    from `items` — correct when the caller already holds the final list.
     """
     link_rows = _link_rows_for(cfg, items)
+    if body_budget is None:
+        body_budget = _pack_body_budget(items)
     lines = _pack_header(cfg, day)
     for index, item in enumerate(items, 1):
-        lines.extend(_pack_section(cfg, index, item, link_rows))
+        lines.extend(_pack_section(cfg, index, item, link_rows, body_budget))
     return "\n".join(lines)
 
 
@@ -2982,20 +3027,23 @@ def _pack_slice(
 
     Greedy and in item order: an item joins while the pack stays under `PACK_MAX_ITEMS` items
     and `PACK_MAX_BYTES` bytes. The byte cap is *bytes* (the Russian corpus makes the character
-    count a poor proxy), and the first item is always taken even if its own section alone
-    exceeds it — a section is already bounded by `PACK_TEXT_LIMIT`/`PACK_COMMENT_LIMIT`, and an
-    empty pack would leave the day's backlog packed for ever.
+    count a poor proxy), so the body budget is shared over the whole day's list up front — the
+    slice does not grow a section just because fewer items ended up fitting. The first item is
+    always taken even if its own section alone exceeds the cap — a section is already bounded by
+    the shared budget and `PACK_COMMENT_LIMIT`, and an empty pack would leave the day's backlog
+    packed for ever.
     """
     if not items:
         return []
     link_rows = _link_rows_for(cfg, items)
+    body_budget = _pack_body_budget(items)
     header = "\n".join(_pack_header(cfg, day))
     size = len(header.encode("utf-8"))
     chosen: list[dict[str, Any]] = []
     for index, item in enumerate(items, 1):
         if len(chosen) >= PACK_MAX_ITEMS:
             break
-        section = "\n".join(_pack_section(cfg, index, item, link_rows))
+        section = "\n".join(_pack_section(cfg, index, item, link_rows, body_budget))
         trial = size + len(section.encode("utf-8")) + 1  # +1 for the newline before the section
         if chosen and trial > PACK_MAX_BYTES:
             break
@@ -3177,7 +3225,10 @@ def distill(
         # `PACK_MAX_BYTES`). The rest of the day stays `fetched` and is packed next run.
         items = _pack_slice(cfg, day, fetched)
         deferred = len(fetched) - len(items)
-        pack_text = _pack_text(cfg, day, items)
+        # The same budget the slice was measured against: with fewer items packed than the day
+        # holds, re-deriving it from `items` would grow every section and could push the written
+        # pack back over the argv cap.
+        pack_text = _pack_text(cfg, day, items, _pack_body_budget(fetched))
         if deferred:
             _log(
                 f"pack holds {len(items)} of {len(fetched)} fetched item(s); "

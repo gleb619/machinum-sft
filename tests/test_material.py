@@ -748,9 +748,12 @@ def test_normalize_text_strips_blocks_tags_and_blank_runs() -> None:
     assert "First   line" not in out
 
 
-def test_normalize_text_caps_at_40k() -> None:
-    out = material.normalize_text("x" * 50_000)
-    assert len(out) == material.TEXT_LIMIT == 40_000
+def test_normalize_text_caps_at_120k() -> None:
+    raw = "<p>" + "x" * 150_000 + "</p><script>var x=1;</script>"
+    out = material.normalize_text(raw)
+    assert len(out) == material.TEXT_LIMIT == 120_000
+    assert set(out) == {"x"}, "the cap still runs after tags and script blocks are stripped"
+    assert "var x" not in out
 
 
 def test_slug_is_60_chars_plus_sha1_suffix() -> None:
@@ -1273,7 +1276,12 @@ def seed_fetched_day(
     return urls
 
 
-def test_pack_contains_brief_rules_schema_and_truncated_body(
+def pack_bodies(text: str) -> list[str]:
+    """The `text` fenced body of each pack section, in section order."""
+    return [chunk.split("\n```", 1)[0] for chunk in text.split("```text\n")[1:]]
+
+
+def test_pack_contains_brief_rules_schema_and_carries_a_body_past_8k(
     cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prepare_fetched(cfg, monkeypatch)
@@ -1289,9 +1297,11 @@ def test_pack_contains_brief_rules_schema_and_truncated_body(
     assert "docs/material/notes/" in text
     assert "## What it is" in text and "## Experiment" in text
     assert "https://habr.com/ru/articles/900001" in text
-    # the section body is truncated to 8 000 chars: "Body " plus z's, so the run is 7 995 long
-    assert text.count("z") == 8_000 - len("Body ")
-    assert "z" * 8_000 not in text
+    # One item alone has the whole light-day budget: the 9 005-char body arrives whole, where the
+    # old fixed 8 000-char slice would have cut 1 005 chars off it.
+    assert material._pack_body_budget(items) == material.PACK_TEXT_MAX
+    assert pack_bodies(text)[0].count("z") == 9_000
+    assert "обрезано" not in text, "nothing was cut, so no marker"
 
 
 def test_distill_dry_run_never_runs_at(
@@ -1384,7 +1394,7 @@ def test_distill_packs_a_bounded_slice_and_defers_the_rest(
     cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """One `at` run carries one prompt, so a backlog day drains one pack per run."""
-    urls = seed_fetched_day(cfg, material.PACK_MAX_ITEMS + 3)
+    urls = seed_fetched_day(cfg, material.PACK_MAX_ITEMS + 3, body_chars=12_000)
     size_file = tmp_path / "pack-size"
     monkeypatch.setenv("MSFT_AT_BIN", str(fake_at(tmp_path, record_size=size_file)))
 
@@ -1398,6 +1408,14 @@ def test_distill_packs_a_bounded_slice_and_defers_the_rest(
     sizes = size_file.read_text().split()
     assert len(sizes) == 1, "exactly one `at` call for the day's first pack"
     assert int(sizes[0]) <= material.PACK_MAX_BYTES
+
+    # The budget is shared, not raised: 13 items settle on the 8 000-char floor, so a busy day
+    # still packs the same 10 items it did before the budget was shared.
+    bodies = pack_bodies((cfg.pack_dir / f"{DAY}.md").read_text(encoding="utf-8"))
+    assert len(bodies) == material.PACK_MAX_ITEMS
+    assert all(body.count("z") <= material.PACK_TEXT_LIMIT for body in bodies), (
+        "the carried article text stays at the floor; the truncation marker rides on top"
+    )
 
     with material.State(cfg.db_path) as state:
         statuses = {str(row["url"]): row["status"] for row in state.items_for_date(DAY)}
@@ -1415,6 +1433,75 @@ def test_distill_packs_a_bounded_slice_and_defers_the_rest(
     with material.State(cfg.db_path) as state:
         statuses = {str(row["url"]): row["status"] for row in state.items_for_date(DAY)}
     assert set(statuses.values()) == {"distilled"}, "a backlog drains, it does not deadlock"
+
+
+def test_pack_gives_a_single_item_the_light_day_budget(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One item on a light day may fill the pack: no other item is there to be starved."""
+    seed_fetched_day(cfg, 1, body_chars=100_000)
+    size_file = tmp_path / "pack-size"
+    monkeypatch.setenv("MSFT_AT_BIN", str(fake_at(tmp_path, record_size=size_file)))
+
+    result = material.distill(cfg, day=DAY)
+
+    assert result["items"] == 1
+    assert result["deferred"] == 0
+    pack = (cfg.pack_dir / f"{DAY}.md").read_text(encoding="utf-8")
+    assert len(pack.encode("utf-8")) <= material.PACK_MAX_BYTES
+    assert int(size_file.read_text().split()[0]) == len(pack.encode("utf-8"))
+    body = pack_bodies(pack)[0]
+    assert body.count("z") == material.PACK_TEXT_MAX - len("Body "), "the body fills the budget"
+    assert "обрезано" in body, "the cut is marked, so the agent knows to read the raw file"
+    assert "## What it is" in pack and "## Experiment" in pack
+    assert "- raw: " in pack
+
+
+def test_two_big_items_both_fit_the_pack(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The shared reserve is what lets two 60 000-char bodies share one pack."""
+    seed_fetched_day(cfg, 2, body_chars=60_000)
+    size_file = tmp_path / "pack-size"
+    monkeypatch.setenv("MSFT_AT_BIN", str(fake_at(tmp_path, record_size=size_file)))
+
+    result = material.distill(cfg, day=DAY)
+
+    assert result["items"] == 2, "both items fit one `at` call"
+    assert result["deferred"] == 0
+    assert len(size_file.read_text().split()) == 1
+    pack = (cfg.pack_dir / f"{DAY}.md").read_text(encoding="utf-8")
+    assert len(pack.encode("utf-8")) <= material.PACK_MAX_BYTES
+    with material.State(cfg.db_path) as state:
+        items = state.items_for_date(DAY)
+    assert material._pack_body_budget(items) == 46_250
+    bodies = pack_bodies(pack)
+    assert len(bodies) == 2
+    assert [body.count("z") for body in bodies] == [46_250 - len("Body ")] * 2
+    assert all(len(body) > material.PACK_TEXT_LIMIT for body in bodies)
+    assert all("обрезано" in body for body in bodies)
+
+
+def test_a_full_ten_item_pack_still_fits_in_one_at_call(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The reserve must cover the overhead of a full pack, or item ten is silently deferred."""
+    size_file = tmp_path / "pack-size"
+    seed_fetched_day(cfg, material.PACK_MAX_ITEMS, body_chars=9_600)
+    monkeypatch.setenv("MSFT_AT_BIN", str(fake_at(tmp_path, record_size=size_file)))
+
+    result = material.distill(cfg, day=DAY)
+
+    assert result["items"] == material.PACK_MAX_ITEMS, "a full day is still one `at` call"
+    assert result["deferred"] == 0
+    assert len(size_file.read_text().split()) == 1
+    pack = (cfg.pack_dir / f"{DAY}.md").read_text(encoding="utf-8")
+    assert len(pack.encode("utf-8")) <= material.PACK_MAX_BYTES
+    budget = (material.PACK_MAX_BYTES - material.PACK_RESERVE_BYTES) // material.PACK_MAX_ITEMS
+    assert budget == 9_250
+    bodies = pack_bodies(pack)
+    assert len(bodies) == material.PACK_MAX_ITEMS
+    assert [body.count("z") for body in bodies] == [budget - len("Body ")] * len(bodies)
 
 
 def test_distill_takes_one_item_even_past_the_byte_cap(
