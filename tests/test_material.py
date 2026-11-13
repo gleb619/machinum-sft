@@ -2698,6 +2698,124 @@ def test_a_rescored_link_item_failure_is_not_a_run_error(
     assert row is not None and row["status"] == "error", "the item row is still visible"
 
 
+# --- a re-queued item is re-read, never rebuilt from its summary ----------
+
+
+HFT_BODY = "Catalogue card: Qwen3.8 31B, Uncensored IQ 9/10, Reasoning 8/10.\n" * 60
+
+
+def pending_item(url: str, site: str, summary: str, **fields: Any) -> dict[str, Any]:
+    """The row `_fetch_pending` sees: a summary and no page payload (`source`)."""
+    row = material._new_item_row({"url": url, "site": site, "summary": summary}, 0.5, "new")
+    row.update(fields)
+    return row
+
+
+def test_a_requeued_url_site_is_read_from_the_page(cfg: material.MaterialCfg, monkeypatch) -> None:
+    """`hft` has no branch of its own: re-queueing it used to store its own summary."""
+    summary = "hft.md catalogue preview. " * 50
+    bridge = install(
+        monkeypatch,
+        {
+            ("extract", "hft", HFT_PAGE): {
+                "site": "hft",
+                "op": "extract",
+                "mode": "text",
+                "url": HFT_PAGE + "/",
+                "title": "Uncensored AI",
+                "text": HFT_BODY,
+            }
+        },
+    )
+    with material.State(cfg.db_path) as state:
+        state.add_item(pending_item(HFT_PAGE, "hft", summary))
+
+    result = material.run(cfg, day=DAY, limit=0, no_expand=True)
+
+    assert bridge.argv == [["extract", "hft", HFT_PAGE]], "one extract, no query"
+    assert result["fetched"] == 1
+    assert result["ok"] is True
+    with material.State(cfg.db_path) as state:
+        row = state.item(HFT_PAGE)
+    assert row is not None and row["status"] == "fetched"
+    written = cfg.resolve(row["raw_path"]).read_text(encoding="utf-8")
+    assert written == material.normalize_text(HFT_BODY) + "\n", "the page, not the summary"
+    provenance = json.loads(cfg.resolve(row["raw_path"]).with_suffix(".json").read_text("utf-8"))
+    assert provenance["text"] == HFT_BODY
+
+
+def test_a_requeued_url_site_errors_when_the_page_cannot_be_read(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The summary fallback is gone: a dead daemon is an error, not a 1.2 KB body."""
+    summary = "SUMMARY-MARKER " + "catalogue preview. " * 50
+    install(monkeypatch, {("extract", "hft", HFT_PAGE): (1, "", "daemon down")})
+    good = cfg.date_dir(DAY) / "hft-uncensored-ai.txt"
+    good.parent.mkdir(parents=True, exist_ok=True)
+    good.write_text("the 40 KB catalogue the last good run stored\n", encoding="utf-8")
+    with material.State(cfg.db_path) as state:
+        state.add_item(pending_item(HFT_PAGE, "hft", summary, raw_path=cfg.display(good)))
+
+    result = material.run(cfg, day=DAY, limit=0, no_expand=True)
+
+    assert result["errors"] == 1
+    assert result["ok"] is False
+    with material.State(cfg.db_path) as state:
+        row = state.item(HFT_PAGE)
+    assert row is not None and row["status"] == "error"
+    assert "daemon down" in (row["error"] or "")
+    assert row["raw_path"] == cfg.display(good), "the good body is not un-pointed"
+    assert good.read_text(encoding="utf-8") == "the 40 KB catalogue the last good run stored\n"
+    assert list(cfg.date_dir(DAY).glob("*.txt")) == [good], "nothing new was written"
+    assert "SUMMARY-MARKER" not in good.read_text(encoding="utf-8")
+
+
+def test_a_requeued_github_item_is_extracted_and_rendered(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pending github row has no `source`; rendering the row alone produced `None` fields."""
+    record = {
+        "site": "github",
+        "op": "extract",
+        "mode": "api",
+        "url": CANARY_ITEM,
+        "repo": "huggingface/peft",
+        "description": "Parameter-efficient fine-tuning",
+        "stars": 17500,
+        "language": "Python",
+    }
+    bridge = install(monkeypatch, {("extract", "github", CANARY_ITEM): record})
+    with material.State(cfg.db_path) as state:
+        state.add_item(pending_item(CANARY_ITEM, "github", "github: huggingface/peft"))
+
+    result = material.run(cfg, day=DAY, limit=0, no_expand=True)
+
+    assert ["extract", "github", CANARY_ITEM] in bridge.argv
+    assert result["fetched"] == 1
+    with material.State(cfg.db_path) as state:
+        row = state.item(CANARY_ITEM)
+    assert row is not None and row["status"] == "fetched"
+    written = cfg.resolve(row["raw_path"]).read_text(encoding="utf-8")
+    assert written == material.normalize_text(material._render_entry("github", record)) + "\n"
+    assert "repo: huggingface/peft" in written
+    assert "stars: 17500" in written
+    assert "None" not in written
+
+
+def test_a_live_payload_is_used_without_another_extract(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The query path already brought the record; re-reading it would spend a call for nothing."""
+    record = {"repo": "huggingface/peft", "url": CANARY_ITEM, "stars": 17500}
+    bridge = install(monkeypatch, {})
+    fetched = material._fetch_body(cfg, {"site": "github", "source": record}, CANARY_ITEM, DAY)
+
+    assert bridge.argv == []
+    assert fetched.error is None
+    assert fetched.raw is record
+    assert fetched.body == material._render_entry("github", record)
+
+
 def test_the_probe_cache_makes_two_links_one_subprocess(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

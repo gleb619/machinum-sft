@@ -2202,6 +2202,24 @@ def _fetch_tweet(cfg: MaterialCfg, entry: dict[str, Any], url: str) -> Fetched:
     return Fetched(text, payload, article=text)
 
 
+def _extract_text_page(
+    cfg: MaterialCfg, site: str, url: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Run one `extract` and confirm the payload is the text page we asked for.
+
+    Returns `(payload, None)` on success and `(payload_or_None, why)` on failure — the payload
+    is kept on a wrong-page answer because it says *which* page came back.
+    """
+    rc, stdout, stderr = run_webbridge(["extract", site, url], cfg.limits.fetch_timeout_s)
+    payload = _loads(stdout)
+    if not isinstance(payload, dict):
+        return None, f"extract failed (rc={rc}): {_tail(stderr or stdout)}"
+    problem = _extract_error(payload, url)
+    if problem:
+        return payload, problem
+    return payload, None
+
+
 def _fetch_body(cfg: MaterialCfg, entry: dict[str, Any], url: str, day: str) -> Fetched:
     """Article body plus the raw payload to keep, with Habr's comment tree appended.
 
@@ -2210,16 +2228,17 @@ def _fetch_body(cfg: MaterialCfg, entry: dict[str, Any], url: str, day: str) -> 
     in-process — one JSON GET, no browser, no auth — and appended under a `# Комментарии`
     delimiter. A comment failure is recorded on the result and never raised: the article a
     browser just rendered is the expensive half and must not be thrown away for it.
+
+    An entry built from the DB (`_fetch_pending`) carries the item's 1200-char `summary` and no
+    page payload, so the page is re-read through webbridge. The summary is never a fallback
+    body: storing it as one turned a re-queued 40 KB catalogue into 1,187 chars with
+    `errors: 0`, and the next distill would have written a note from the summary of a summary.
     """
     site = str(entry["site"])
     if site == "habr":
-        rc, stdout, stderr = run_webbridge(
-            ["extract", "habr", url], cfg.limits.fetch_timeout_s
-        )
-        payload = _loads(stdout)
-        if not isinstance(payload, dict):
-            return Fetched("", None, f"extract failed (rc={rc}): {_tail(stderr or stdout)}")
-        problem = _extract_error(payload, url)
+        payload, problem = _extract_text_page(cfg, site, url)
+        if payload is None:
+            return Fetched("", None, problem or f"extract failed for {url}")
         if problem:
             return Fetched("", payload, problem)
         body = str(payload.get("text") or "")
@@ -2242,8 +2261,18 @@ def _fetch_body(cfg: MaterialCfg, entry: dict[str, Any], url: str, day: str) -> 
     if site == "twitter":
         return _fetch_tweet(cfg, entry, url)
     if site in ("github", "hf"):
-        text = _render_entry(site, entry["source"])
-        return Fetched(text, entry["source"], article=text)
+        payload = entry.get("source")
+        if not isinstance(payload, dict) or not payload:
+            # A re-queued row has no API record, only the rendered summary line. `extract` is
+            # one cheap JSON GET for both sites, so read the record instead of rendering the
+            # row — `_extract_error` does not apply: an API payload carries no `text` page.
+            rc, stdout, stderr = run_webbridge(["extract", site, url], cfg.limits.fetch_timeout_s)
+            live = _loads(stdout)
+            if not isinstance(live, dict):
+                return Fetched("", None, f"extract failed (rc={rc}): {_tail(stderr or stdout)}")
+            payload = live
+        text = _render_entry(site, payload)
+        return Fetched(text, payload, article=text)
     source = entry.get("source")
     if isinstance(source, dict) and str(source.get("text") or "").strip():
         # A text-mode extract (`mode: text`, e.g. a docs site's markdown twin) puts the whole
@@ -2251,8 +2280,13 @@ def _fetch_body(cfg: MaterialCfg, entry: dict[str, Any], url: str, day: str) -> 
         # would silently truncate a 39 KB article to a paragraph.
         text = str(source["text"])
         return Fetched(text, source, article=text)
-    text = str(entry.get("summary") or "")
-    return Fetched(text, entry.get("source"), article=text)
+    page, problem = _extract_text_page(cfg, site, url)
+    if page is None:
+        return Fetched("", None, problem or f"extract failed for {url}")
+    if problem:
+        return Fetched("", page, problem)
+    text = str(page.get("text") or "")
+    return Fetched(text, page, article=text)
 
 
 def _store_comments(
