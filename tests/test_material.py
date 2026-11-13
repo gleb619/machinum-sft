@@ -319,6 +319,13 @@ def test_site_for_url_maps_known_hosts_and_refuses_unknown() -> None:
         material.site_for_url("https://example.com/x")
 
 
+def test_site_for_url_maps_hft_and_its_subdomains() -> None:
+    assert material.site_for_url("https://hft.md/uncensored-ai/") == "hft"
+    assert material.site_for_url("https://www.hft.md/uncensored-ai") == "hft"
+    assert material.site_for_url("https://hft.md/uncensored-ai") == "hft"
+    assert "hft" not in material.SITES, "url-only: hft.md is not a search-capable seed site"
+
+
 def test_site_for_url_maps_x_and_twitter_to_twitter() -> None:
     for url in (
         "https://x.com/u/status/1",
@@ -483,6 +490,53 @@ def test_add_urls_unknown_host_is_a_config_error(cfg: material.MaterialCfg) -> N
     with pytest.raises(ConfigError, match="no site recipe"):
         material.add_urls(cfg, ["https://example.com/x"])
     assert not cfg.db_path.exists(), "a rejected URL must not create state"
+
+
+HFT_PAGE = "https://hft.md/uncensored-ai"
+
+
+def test_hft_links_are_now_fetchable_not_hints() -> None:
+    """`URL_SITES` is what `link_target` consults, so the recipe also un-hints future links."""
+    assert material.link_target(HFT_PAGE, {}) == ("url", "hft")
+
+
+def test_add_urls_promotes_a_hint_instead_of_duplicating_it(cfg: material.MaterialCfg) -> None:
+    """A link first seen as a dead hint must become the operator's fetch row, not a twin."""
+    with material.State(cfg.db_path) as state:
+        assert state.add_candidate(
+            "hint", HFT_PAGE, "hft.md",
+            parent="https://x.com/u/status/1", reason="hint:hft.md", status="hint",
+        )
+
+    first = material.add_urls(cfg, [HFT_PAGE])
+    assert first["added"] == 1, "the hint became fetchable, so it counts as new work"
+    assert first["existing"] == 0
+    assert first["frontier"] == 1
+
+    with material.State(cfg.db_path) as state:
+        rows = state.conn.execute(
+            "SELECT * FROM candidates WHERE value = ?", (HFT_PAGE,)
+        ).fetchall()
+    assert len(rows) == 1, "the hint row is converted in place, not shadowed"
+    row = rows[0]
+    assert row["kind"] == "url"
+    assert row["site"] == "hft"
+    assert row["priority"] == 1.0
+    assert row["reason"] == "manual"
+    assert row["status"] == "new"
+    assert row["attempts"] == 0
+    assert row["error"] is None
+    assert row["parent"] == "https://x.com/u/status/1", "provenance of the lead survives"
+
+    second = material.add_urls(cfg, [HFT_PAGE])
+    assert second["added"] == 0
+    assert second["existing"] == 1
+    assert second["known"] == [f"url/hft: {HFT_PAGE}"]
+    with material.State(cfg.db_path) as state:
+        count = state.conn.execute(
+            "SELECT COUNT(*) AS n FROM candidates WHERE value = ?", (HFT_PAGE,)
+        ).fetchone()["n"]
+    assert count == 1
 
 
 def test_candidate_argv_maps_url_to_extract() -> None:

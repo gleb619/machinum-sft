@@ -166,6 +166,7 @@ class ConfigError(MsftError):
 URL_SITES = {
     "habr.com": "habr",
     "github.com": "github",
+    "hft.md": "hft",
     "huggingface.co": "hf",
     "x.com": "twitter",
     "twitter.com": "twitter",
@@ -1954,8 +1955,25 @@ def add_urls(
             if already:
                 known.append(entry)
                 continue
+            # A `hint` is the opposite of an `add`: the link was shown, never fetched. An
+            # explicit `add` is the operator overriding that, so promote the row in place —
+            # inserting a second row for the same value would leave the dead hint in `tree`
+            # for ever. `parent` stays: it still says which item carried the lead.
+            hint = state.conn.execute(
+                "SELECT id FROM candidates WHERE kind = 'hint' AND value = ? LIMIT 1",
+                (canonical,),
+            ).fetchone()
             if not dry_run:
-                state.add_candidate("url", canonical, site, reason="manual", priority=1.0)
+                if hint:
+                    state.conn.execute(
+                        "UPDATE candidates SET kind = 'url', site = ?, reason = 'manual', "
+                        "priority = 1.0, status = 'new', attempts = 0, error = NULL, "
+                        "updated_at = ? WHERE id = ?",
+                        (site, _now(), int(hint["id"])),
+                    )
+                    state.conn.commit()
+                else:
+                    state.add_candidate("url", canonical, site, reason="manual", priority=1.0)
             added.append(entry)
         frontier = state.frontier(cfg.limits.refresh_days)
         return {
