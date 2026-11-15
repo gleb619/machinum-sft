@@ -46,12 +46,18 @@ recipes:
 
   # `msft eval` is pure Python over a predictions JSONL: the 2026-11-08 gates printed in the
   # same second as the command, so 12 s of container start is the whole cost -> 0.2.
-  # Needs the predictions the last `probe`/`arena` wrote under the config's output dir.
+  #
+  # It cannot produce what it reads. No box job writes a predictions JSONL: `msft probe` and
+  # `msft arena` are laptop-side and write next to their cases file, and `msft eval` itself
+  # costs 0.1 s locally (0.081-0.121 s per file, tick 05), so no `--predictions` path exists
+  # until a probe has run. 2026-11-13T05:01 (exp-20261113-1) failed rc=2 in 20 s on the
+  # default `out/eval/predictions.jsonl` -> 20 s / 60 = 0.33 -> 0.4. The higher number also
+  # keeps a job that needs another run's output from being drained as if it were cheap.
   eval-4b-gates:
     kind: eval
     config: configs/qwen3.5-4b-lora.yaml
-    est_minutes: 0.2
-    what: replay the six protocol gates on the 4B predictions already on the box
+    est_minutes: 0.4
+    what: replay the six protocol gates on a predictions JSONL a laptop-side probe must write first
 
   # 31.6 s measured for the 0.8B merge (adapter -> 1.7 GB bf16) -> 0.53 -> 0.6.
   smoke-merge:
