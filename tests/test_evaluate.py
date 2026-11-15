@@ -108,6 +108,36 @@ def test_double_terms_block_fails_terms_block(tmp_path: Path) -> None:
     assert "at most one" in gates["terms_block"].detail
 
 
+def test_missing_terms_block_fails_terms_block(tmp_path: Path) -> None:
+    """The product prompt asks for one block; a reply that omits it is not compliant."""
+    reply = (
+        "<result><id>1</id><translation>Привет.</translation></result>\n"
+        "<result><id>2</id><translation>Как дела?</translation></result>"
+    )
+    gates = by_gate(run_gates(write_predictions(tmp_path, [record(reply, expected_lines=2)])))
+    assert gates["terms_block"].passed is False
+    assert "no <terms> block" in gates["terms_block"].detail
+    assert gates["xml_shape"].passed is True
+    assert gates["schema_validity"].passed is False
+
+
+def test_empty_terms_body_fails_terms_block(tmp_path: Path) -> None:
+    """`<terms></terms>` must not be read as an array the model never wrote."""
+    reply = GOOD_XML.replace("<terms>[]</terms>", "<terms></terms>")
+    gates = by_gate(run_gates(write_predictions(tmp_path, [record(reply, expected_lines=2)])))
+    assert gates["terms_block"].passed is False
+    assert "empty <terms> block" in gates["terms_block"].detail
+    assert gates["schema_validity"].passed is False
+
+
+def test_literal_empty_array_passes_terms_block(tmp_path: Path) -> None:
+    """`[]` is the product's own "nothing to report" form, so it must stay green."""
+    gates = by_gate(run_gates(write_predictions(tmp_path, [record(GOOD_XML, expected_lines=2)])))
+    assert gates["terms_block"].passed is True
+    assert "0 entries" in gates["terms_block"].detail
+    assert gates["schema_validity"].value == 1.0
+
+
 def test_wrong_line_count_fails_line_parity(tmp_path: Path) -> None:
     reply = "1=Первая строка.\n2=Вторая строка."
     gates = by_gate(
@@ -139,7 +169,9 @@ def test_empty_reply_fails_no_chatter_and_xml_shape(tmp_path: Path) -> None:
 
 def test_malformed_jsonl_line_is_a_failed_gate_not_a_crash(tmp_path: Path) -> None:
     path = tmp_path / "predictions.jsonl"
-    path.write_text('{"case": "ok", "reply": "1=а"}\nnot json at all\n', encoding="utf-8")
+    path.write_text(
+        '{"case": "ok", "reply": "1=а\\n<terms>[]</terms>"}\nnot json at all\n', encoding="utf-8"
+    )
     gates = by_gate(run_gates(path))
     assert gates["schema_validity"].passed is False
     assert gates["schema_validity"].value == 0.5
@@ -215,3 +247,39 @@ def test_non_integer_expected_lines_fails(tmp_path: Path, expected: Any) -> None
     gate = by_gate(run_gates(path))["line_parity"]
     assert gate.passed is False
     assert "not an integer" in gate.detail
+
+
+def test_unterminated_terms_block_does_not_add_lines(tmp_path: Path) -> None:
+    """The product drops an unclosed `<terms>` opener through to the end of the reply."""
+    reply = 'a\nb\n<terms>[{"term": "x"}]'
+    gates = by_gate(run_gates(write_predictions(tmp_path, [record(reply, expected_lines=2)])))
+    assert gates["line_parity"].passed is True
+    assert "2 line(s)" in gates["line_parity"].detail
+
+
+def test_terminated_terms_block_is_not_counted(tmp_path: Path) -> None:
+    """A properly closed `<terms>` block was already metadata and stays that way."""
+    reply = 'a\nb\n<terms>[{"term": "x"}]</terms>'
+    gates = by_gate(run_gates(write_predictions(tmp_path, [record(reply, expected_lines=2)])))
+    assert gates["line_parity"].passed is True
+    assert "2 line(s)" in gates["line_parity"].detail
+
+
+def test_think_block_and_term_tag_are_stripped_for_parity(tmp_path: Path) -> None:
+    """Reasoning blocks vanish and a `<term id="..">` wrapper keeps its inner text."""
+    reply = '<think planning>secret</think>\n1=<term id="t1">Grog</term> says hi.'
+    gates = by_gate(
+        run_gates(write_predictions(tmp_path, [record(reply, PROPS_PROMPT, expected_lines=1)]))
+    )
+    assert gates["line_parity"].passed is True
+    assert "1 line(s)" in gates["line_parity"].detail
+
+
+def test_genuine_merge_still_fails_line_parity(tmp_path: Path) -> None:
+    """Two source lines collapsed into one is a real failure, not a metadata artifact."""
+    reply = "1=Он вошёл. Она кивнула."
+    gates = by_gate(
+        run_gates(write_predictions(tmp_path, [record(reply, PROPS_PROMPT, expected_lines=2)]))
+    )
+    assert gates["line_parity"].passed is False
+    assert "expected 2" in gates["line_parity"].detail

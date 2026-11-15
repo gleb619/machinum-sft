@@ -253,7 +253,15 @@ def test_run_model_payload_and_error_row(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_replies_file_passes_evaluate_gates(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    install(monkeypatch)
+    seam = install(monkeypatch)
+
+    def reply_with_terms(payload: dict[str, Any]) -> dict[str, Any]:
+        row = default_reply(payload)
+        if payload.get("format") != "json":
+            row["message"]["content"] += "\n<terms>[]</terms>"
+        return row
+
+    seam.reply = reply_with_terms
     cases = write_cases(tmp_path, CASE)
     board = arena.run(
         endpoint="http://ollama.test",
@@ -285,14 +293,14 @@ def test_score_failure_is_zero_and_n_ref_only_counts_references() -> None:
         arena.Case("c3", "p", "s", None, None),
     ]
     rows = [
-        row("c1", "ref one"),
+        row("c1", "ref one\n<terms>[]</terms>"),
         {"case": "c2", "prompt_logged": "Translate this line.", "_error": "boom"},
-        row("c3", "ok"),
+        row("c3", "ok\n<terms>[]</terms>"),
     ]
     stats = arena.score({"m": rows}, cases)["m"]
     assert stats["answered"] == 2
     assert stats["n_ref"] == 2
-    assert stats["chrf"] == 50.0
+    assert stats["chrf"] == 24.8409
     assert stats["schema_validity"] == pytest.approx(2 / 3, abs=1e-4)
 
 
@@ -317,8 +325,14 @@ def test_a_protocol_failure_is_never_marked_near_leader() -> None:
         arena.Case("c1", "p", "s", "ref one", 1),
         arena.Case("c2", "p", "s", "ref two", 1),
     ]
-    good = [row("c1", "ref one", 100.0), row("c2", "ref two", 100.0)]
-    bad = [row("c1", "ref one\nsecond line", 100.0), row("c2", "ref two\nsecond line", 100.0)]
+    good = [
+        row("c1", "ref one\n<terms>[]</terms>", 100.0),
+        row("c2", "ref two\n<terms>[]</terms>", 100.0),
+    ]
+    bad = [
+        row("c1", "ref one\nsecond line\n<terms>[]</terms>", 100.0),
+        row("c2", "ref two\nsecond line\n<terms>[]</terms>", 100.0),
+    ]
     for entry in good + bad:
         entry["expected_lines"] = 1
     board = arena.leaderboard(["m1", "m2"], {"m1": good, "m2": bad}, cases, [], self_judge=None)

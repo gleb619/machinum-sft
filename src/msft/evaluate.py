@@ -30,6 +30,15 @@ Outcome = tuple[bool | None, str]
 _RESULT_RE = re.compile(r"<result\b[^>]*>(.*?)</result>", re.S)
 _ID_RE = re.compile(r"<id>\s*(\d+)\s*</id>")
 _TERMS_RE = re.compile(r"<terms>\s*(.*?)\s*</terms>", re.S)
+# The product's `cleanTranslation` strips reasoning and report markup before counting lines.
+_THINK_TERMINATED_RE = re.compile(r"<think[\s\S]*?</think>", re.I)
+_THINK_PREFIX_RE = re.compile(r"^\s*[\s\S]*?</think>(?=\s*\S)", re.I)
+_THINK_TRAILING_RE = re.compile(r"\s*</think>\s*$", re.I)
+_THINK_UNTERMINATED_RE = re.compile(r"<think[\s\S]*$", re.I)
+_TERMS_UNTERMINATED_RE = re.compile(r"<terms>\s*[\[{][\s\S]*$", re.I)
+_TERMS_LINE_RE = re.compile(r"^\s*<terms>[\s\S]*$", re.I | re.M)
+# `<term id="t1">Grog</term>` keeps its inner text, as the product's `stripTerms` does.
+_TERM_TAG_RE = re.compile(r'<term id="[^"]*">([\s\S]*?)</term>')
 _PROPERTIES_RE = re.compile(r"^\s*(\d+)\s*=(.*)$")
 _FENCE_RE = re.compile(r"```|~~~")
 _CHATTER_RE = re.compile(
@@ -69,9 +78,26 @@ def _detect_mode(prompt: str, reply: str) -> str:
     return "plain"
 
 
+def _clean_reply(reply: str) -> str:
+    """Strip reasoning blocks and report markup exactly as the product's `cleanTranslation` does.
+
+    Mirrors `machinum-pipeline/.../normalization/translation-prompt.ts:349-367`: terminated and
+    unterminated ``<terms>`` blocks are metadata, an unterminated one swallowing the rest of the
+    reply, and ``<term id="..">..</term>`` keeps its inner text (`stripTerms`).
+    """
+    cleaned = _THINK_TERMINATED_RE.sub("", reply)
+    cleaned = _THINK_PREFIX_RE.sub("", cleaned)
+    cleaned = _THINK_TRAILING_RE.sub("", cleaned)
+    cleaned = _THINK_UNTERMINATED_RE.sub("", cleaned)
+    cleaned = _TERMS_RE.sub("", cleaned)
+    cleaned = _TERMS_UNTERMINATED_RE.sub("", cleaned)
+    cleaned = _TERMS_LINE_RE.sub("", cleaned)
+    return _TERM_TAG_RE.sub(r"\1", cleaned)
+
+
 def _split_terms(reply: str) -> tuple[str, list[str]]:
-    """Return the reply without its `<terms>` block(s), plus the raw block bodies."""
-    return _TERMS_RE.sub("", reply), _TERMS_RE.findall(reply)
+    """Return the cleaned reply plus the raw `<terms>` block bodies for `_check_terms`."""
+    return _clean_reply(reply), _TERMS_RE.findall(reply)
 
 
 def _first_content_line(reply: str, mode: str) -> tuple[int, str]:
@@ -177,17 +203,19 @@ def _check_line_parity(reply: str, expected: Any) -> Outcome:
 
 
 def _check_terms(reply: str) -> Outcome:
-    """Check at most one `<terms>` block whose body is a JSON array of term objects."""
+    """Check for exactly one `<terms>` block whose body is a JSON array of term objects."""
     bodies = _TERMS_RE.findall(reply)
     if len(bodies) > 1:
         return False, f"{len(bodies)} <terms> blocks; expected at most one"
     if not bodies:
         if "<terms>" in reply:
             return False, "unterminated <terms> block"
-        return True, "no <terms> block"
+        return False, "no <terms> block; write <terms>[]</terms> when nothing to report"
     body = bodies[0].strip()
+    if not body:
+        return False, "empty <terms> block; write <terms>[]</terms> when nothing to report"
     try:
-        data = json.loads(body or "[]")
+        data = json.loads(body)
     except json.JSONDecodeError as exc:
         return False, f"<terms> is not valid JSON: {exc}"
     if not isinstance(data, list):
