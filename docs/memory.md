@@ -200,6 +200,13 @@ echo it. It was exposed once today — rotate it if any output was kept.
 **Jobs are plain JSON in the queue.** Editing `<dir>/inbox/<id>.json` before it is picked up is
 a supported way to tweak a run; `worker reset` clears the queue and keeps the logs.
 
+**Training configs live outside git and are pushed, not committed.** The container mounts the box's
+checkout at `/workspace`, so a job's `--config` path must exist there — but `configs/*.local.yaml` is
+git-ignored on purpose (host, private paths). `scripts/configs.sh put <file.yaml> [--name S]` installs a
+config as `configs/<S>.local.yaml` after asserting it is ignored, and `scripts/configs.sh push S` copies it
+to the box over the same `WorkerSpec` host that `msft remote` uses, verifying the remote byte count. Point
+the job at `configs/<S>.local.yaml`, never at a tracked name.
+
 ## Guard and CI
 
 **`scripts/guard.sh` is the merge gate** (`ruff` → `pytest` → `wrkflw validate` → `wrkflw run
