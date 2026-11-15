@@ -114,6 +114,9 @@ COMMENT_UA = (
     "Chrome/130 Safari/537.36"
 )
 COMMENT_HEADING = "# Комментарии"
+# A tweet's replies are the same kind of material as Habr's comment tree — discussion under a
+# post, not the post — so they get the same delimiter and the same standing in the pack.
+TWEET_REPLIES_HEADING = "# Ответы"
 
 # The chat sites this loop can ask, keyed to the `urls.home` of their tunnelstack site config; the
 # item URL is that home plus a marker, because a chat answer has no permalink that survives a
@@ -1322,12 +1325,19 @@ def _comment_when(value: str) -> str:
 
 
 def _split_comments(text: str) -> tuple[str, str]:
-    """Split a stored raw text into `(article, comment block)` at the `# Комментарии` line."""
-    marker = f"\n{COMMENT_HEADING}"
-    index = (text or "").find(marker)
-    if index < 0:
-        return text or "", ""
-    return text[:index].rstrip(), text[index:].strip()
+    """Split a stored raw text into `(article, tail)` at the first discussion heading.
+
+    Habr appends `# Комментарии` and a tweet appends `# Ответы`; whichever was rendered marks
+    the start of the discussion half, and everything before it is the post itself.
+    """
+    body = text or ""
+    indexes = [index for index in (
+        body.find(f"\n{COMMENT_HEADING}"), body.find(f"\n{TWEET_REPLIES_HEADING}"),
+    ) if index >= 0]
+    if not indexes:
+        return body, ""
+    index = min(indexes)
+    return body[:index].rstrip(), body[index:].strip()
 
 
 def content_sha(title: str, body: str) -> str:
@@ -2075,10 +2085,12 @@ def _extract_error(payload: dict[str, Any], url: str) -> str | None:
 
 # X renders a long URL across lines and truncates it with `…`, so the tweet text cannot be
 # mined for links with a regex. The anchors behind `[data-testid="tweetText"]` carry the real
-# `href` (a `t.co` short link); one evaluate against the tab the extract just left open.
+# `href` (a `t.co` short link); one evaluate against the tab the extract just left open. The
+# query is scoped to the focal tweet: replies live in the same DOM, and their links belong to
+# the reply block, not to the tweet's `# Links`.
 _TWEET_LINKS_JS = (
     "(()=>({href:location.href,links:[...document.querySelectorAll("
-    "'[data-testid=\"tweetText\"] a')].map(a=>a.href)}))()"
+    "'[data-wb-focal=\"1\"] [data-testid=\"tweetText\"] a')].map(a=>a.href)}))()"
 )
 _SHORT_LINK_HOST = "t.co"
 _SHORT_LINK_TIMEOUT_S = 6
@@ -2182,8 +2194,55 @@ def _tweet_links(cfg: MaterialCfg, url: str) -> list[str]:
     return out
 
 
+def _tweet_replies(payload: Any) -> tuple[str, list[dict[str, Any]]]:
+    """Render a tweet's replies as the tail of the raw text; `(block, rendered rows)`.
+
+    The payload's `replies` list is the cap: the recipe decides how many it renders, and a
+    promoted row or a media-only reply (no `text`) is skipped, not counted. A payload without
+    `replies` — an older extract, an empty DOM, a failed read — is no replies, never an error.
+    """
+    if not isinstance(payload, dict):
+        return "", []
+    replies = payload.get("replies")
+    if not isinstance(replies, list):
+        return "", []
+    rendered = [
+        row for row in replies
+        if isinstance(row, dict) and str(row.get("text") or "").strip()
+    ]
+    if not rendered:
+        return "", []
+    lines: list[str] = [
+        "",
+        "",
+        "---",
+        "",
+        f"{TWEET_REPLIES_HEADING} к твиту (Twitter, {len(rendered)} выгружено, "
+        f"дата чтения {datetime.now(timezone.utc):%Y-%m-%d})",
+        "",
+        "Ниже — ответы под постом в том виде, в каком они отрисованы на момент чтения: "
+        "здесь собственный follow-up автора, исправления и ссылки, а ответ — это мнение, "
+        "а не цитата.",
+        "",
+    ]
+    for row in rendered:
+        name = str(row.get("handle") or row.get("author") or "anon").strip()
+        when = str(row.get("time") or "").strip()
+        lines.append(f"## {name} — {when}" if when else f"## {name}")
+        lines.append("")
+        lines.append(str(row.get("text") or "").strip())
+        lines.append("")
+        link = str(row.get("link") or "").strip()
+        if link.startswith("/"):
+            link = "https://x.com" + link
+        if link:
+            lines.append(link)
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n", rendered
+
+
 def _fetch_tweet(cfg: MaterialCfg, entry: dict[str, Any], url: str) -> Fetched:
-    """A tweet plus the links its text cannot show.
+    """A tweet, its outbound links, and the replies under it.
 
     The extract is repeated here because the tab it leaves open is the tab the anchor read
     needs. A failed extract is not an item error: the tweet text the search (or the earlier
@@ -2193,13 +2252,24 @@ def _fetch_tweet(cfg: MaterialCfg, entry: dict[str, Any], url: str) -> Fetched:
     payload: Any = entry.get("source")
     rc, stdout, stderr = run_webbridge(["extract", "twitter", url], cfg.limits.fetch_timeout_s)
     extracted = _loads(stdout)
+    # Replies are read only from a confirmed extract: a failed one can still return a page
+    # (a moved tab is a different tweet), whose replies are not this tweet's.
+    replies_from: Any = None
     if isinstance(extracted, dict) and not _extract_error(extracted, url):
         text = str(extracted.get("text") or text)
         payload = extracted
+        replies_from = extracted
     links = _tweet_links(cfg, url)
+    article = text
     if links:
-        text = f"{text}\n\n# Links\n\n" + "\n".join(f"- {link}" for link in links)
-    return Fetched(text, payload, article=text)
+        article = f"{text}\n\n# Links\n\n" + "\n".join(f"- {link}" for link in links)
+    block, replies = _tweet_replies(replies_from)
+    result = Fetched(article + block, payload, article=article)
+    if block:
+        result.comments = block
+        result.comments_count = len(replies)
+        result.comments_payload = {"replies": replies}
+    return result
 
 
 def _extract_text_page(
@@ -2863,6 +2933,8 @@ PACK_RULES = """\
 - A body that ends with `# Комментарии` carries the article's public comment tree. Those are
   readers and often the author answering: quote numbers from there too, and say they came from
   the comments. Comment text is other people's opinion, not a citation.
+- A body that ends with `# Ответы` carries the replies under a tweet. Quote their numbers too
+  and say they came from the replies; a reply is an opinion, not a citation.
 - No network access. Do not install anything, do not run docker.
 - Keep numbers, model names, versions and links verbatim; do not round, translate or
   transliterate identifiers.
@@ -2924,9 +2996,10 @@ def _pack_body(text: str, budget: int) -> str:
     """The body slice the agent reads: the article head, then the comment tree, each capped.
 
     `budget` comes from `_pack_body_budget` and is what the day can afford for this item. When
-    the text carries a comment tree (`# Комментарии`) the tree keeps its own `PACK_COMMENT_LIMIT`
-    slice out of that budget, so a long article never hides the comments. A cut leaves
-    `PACK_TRUNC_MARKER` where the text stopped, pointing the agent at the `raw:` file.
+    the text carries a `# Комментарии` or `# Ответы` tail, the tail keeps its own
+    `PACK_COMMENT_LIMIT` slice out of that budget, so a long article never hides the discussion.
+    A cut leaves `PACK_TRUNC_MARKER` where the text stopped, pointing the agent at the `raw:`
+    file.
     """
     article, comments = _split_comments(text)
     if not comments:

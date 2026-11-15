@@ -2106,8 +2106,26 @@ TWEET = {
 TWEET_URL = "https://x.com/UnslothAI/status/2120536946774769860"
 TWEET_TEXT = "Qwen3.5 8B-27B GGUF is out: https://t.co/qwen"
 TWEET_RENDERED = f"@UnslothAI: {TWEET_TEXT}"
+# The replies under the focal tweet, as `extract twitter` renders them: the same five-field row
+# the tweet uses, one permalink relative and one absolute.
+TWEET_REPLIES = [
+    {
+        "author": "Nina",
+        "handle": "@nina",
+        "text": "the 12k-pair dataset is in the repo",
+        "time": "2026-11-15T09:12:00.000Z",
+        "link": "/nina/status/2121571269762229999",
+    },
+    {
+        "author": "Tom",
+        "handle": "@tom",
+        "text": "QLoRA saturates a 24 GB card at r=64",
+        "time": "2026-11-15T09:14:00.000Z",
+        "link": "https://x.com/tom/status/2121571269762230000",
+    },
+]
 # One `extract twitter <status>` in the shape sites/twitter.yml returns: the focal tweet under
-# `items`, and a page shell at the top level whose `title` is just "X".
+# `items`, the replies under `replies`, and a page shell at the top level whose `title` is "X".
 TWEET_EXTRACT = {
     "site": "twitter",
     "op": "extract",
@@ -2124,6 +2142,7 @@ TWEET_EXTRACT = {
             "link": "/UnslothAI/status/2120536946774769860",
         }
     ],
+    "replies": TWEET_REPLIES,
 }
 
 
@@ -2946,10 +2965,11 @@ def test_fetch_body_twitter_appends_resolved_links_once(
     result = material._fetch_body(cfg, entry, TWEET_URL, DAY)
 
     link = "https://huggingface.co/unsloth/Qwen3.5-8B-GGUF"
+    focal = TWEET_RENDERED + f"\n\n# Links\n\n- {link}"
     assert result.error is None
     assert resolved == ["https://t.co/qwen", "https://t.co/qwen"], "resolve before dedupe"
-    assert result.body == TWEET_RENDERED + f"\n\n# Links\n\n- {link}", "the link appears once"
-    assert result.article == result.body, "link extraction reads `article`, not `body`"
+    assert result.body.startswith(focal + "\n\n---\n\n"), "the reply tail follows the tweet"
+    assert result.article == focal, "link extraction reads `article`, not `body`"
 
 
 def test_fetch_body_twitter_survives_a_failed_evaluate(
@@ -2966,8 +2986,105 @@ def test_fetch_body_twitter_survives_a_failed_evaluate(
     result = material._fetch_body(cfg, entry, TWEET_URL, DAY)
 
     assert result.error is None, "the tweet text is already stored; links are best-effort"
-    assert result.body == TWEET_RENDERED
+    assert result.body.startswith(TWEET_RENDERED)
     assert "# Links" not in result.body
+    assert material.TWEET_REPLIES_HEADING in result.body, "a dead evaluate costs no replies"
+
+
+def test_fetch_body_twitter_renders_replies_into_the_raw_text(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        material, "run_webbridge", tweet_bridge(TWEET_EXTRACT, {"ok": False, "error": "no tab"})
+    )
+
+    entry = {"site": "twitter", "url": TWEET_URL, "summary": TWEET_TEXT, "source": {}}
+    result = material._fetch_body(cfg, entry, TWEET_URL, DAY)
+
+    assert result.error is None
+    assert result.body.startswith(TWEET_RENDERED), "the tweet still comes first"
+    assert material.TWEET_REPLIES_HEADING in result.body
+    assert result.body.rstrip().endswith(TWEET_REPLIES[-1]["link"]), "the tail is the replies"
+    for reply in TWEET_REPLIES:
+        assert f"## {reply['handle']} — {reply['time']}" in result.body
+        assert reply["text"] in result.body
+    assert "https://x.com/nina/status/2121571269762229999" in result.body, "relative link"
+    assert "https://x.com/tom/status/2121571269762230000" in result.body, "absolute link"
+    assert "x.comhttps://x.com" not in result.body, "a relative link is prefixed once"
+    assert result.comments == result.body[len(result.article):], "the tail is the reply block"
+    assert result.comments_count == len(TWEET_REPLIES)
+    assert result.comments_payload == {"replies": TWEET_REPLIES}
+    assert result.article == TWEET_RENDERED, "reply text is not the tweet's own article"
+    for reply in TWEET_REPLIES:
+        assert reply["text"] not in result.article
+
+
+def test_tweet_without_replies_has_no_block_and_no_count(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    older = {key: value for key, value in TWEET_EXTRACT.items() if key != "replies"}
+    monkeypatch.setattr(material, "run_webbridge", tweet_bridge(older, {"ok": False}))
+
+    entry = {"site": "twitter", "url": TWEET_URL, "summary": TWEET_TEXT, "source": {}}
+    result = material._fetch_body(cfg, entry, TWEET_URL, DAY)
+
+    assert result.error is None, "a missing `replies` key is not an error"
+    assert result.body == TWEET_RENDERED
+    assert material.TWEET_REPLIES_HEADING not in result.body
+    assert result.comments == ""
+    assert result.comments_count == 0
+    assert result.comments_payload is None
+
+
+def test_tweet_with_only_empty_reply_texts_has_no_block(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    promoted = {
+        **TWEET_EXTRACT,
+        "replies": [
+            {"author": "Promoted", "handle": "@ad", "text": "   ", "link": "/ad/status/1"},
+            {"author": "Media", "handle": "@media", "time": "2026-11-15T09:12:00.000Z"},
+        ],
+    }
+    monkeypatch.setattr(material, "run_webbridge", tweet_bridge(promoted, {"ok": False}))
+
+    entry = {"site": "twitter", "url": TWEET_URL, "summary": TWEET_TEXT, "source": {}}
+    result = material._fetch_body(cfg, entry, TWEET_URL, DAY)
+
+    assert result.error is None
+    assert result.body == TWEET_RENDERED
+    assert material.TWEET_REPLIES_HEADING not in result.body
+    assert result.comments_count == 0
+    assert result.comments_payload is None
+
+
+def test_split_comments_understands_both_discussion_headings() -> None:
+    article, tail = material._split_comments(
+        "Post body\n\n---\n\n"
+        f"{material.TWEET_REPLIES_HEADING} к твиту (Twitter, 1 выгружено)\n\n## @nina\n\nhi\n"
+    )
+    assert article == "Post body\n\n---", "the delimiter stays; the heading starts the tail"
+    assert tail.startswith(material.TWEET_REPLIES_HEADING)
+
+    article, tail = material._split_comments(
+        "Article body\n\n---\n\n"
+        f"{material.COMMENT_HEADING} к статье (Habr, 1 опубликованных)\n\n### 1. bob\n"
+    )
+    assert article == "Article body\n\n---"
+    assert tail.startswith(material.COMMENT_HEADING)
+
+    both = f"Body\n\n{material.COMMENT_HEADING} a\n\n{material.TWEET_REPLIES_HEADING} b"
+    article, tail = material._split_comments(both)
+    assert article == "Body"
+    assert tail.startswith(material.COMMENT_HEADING), "the earliest heading wins"
+
+    assert material._split_comments("No discussion here") == ("No discussion here", "")
+    assert material._split_comments("") == ("", "")
+
+
+def test_tweet_links_query_is_scoped_to_the_focal_tweet() -> None:
+    """Reply tweets share the DOM; their anchors must not join the focal tweet's `# Links`."""
+    assert '[data-wb-focal="1"] [data-testid="tweetText"] a' in material._TWEET_LINKS_JS
 
 
 def test_tweet_links_from_a_moved_tab_are_ignored(
