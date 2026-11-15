@@ -2,8 +2,8 @@
 
 The pipeline emits JSONL where a line is either ``{system, user, reply}`` or a
 ``messages`` array of ``{role, content}`` objects, plus ``.json`` files holding a list of
-such records.  Everything here is deterministic: records are ordered and split by a
-SHA-256 digest of their normalised messages, never by ``random``.
+such records.  Everything here is deterministic: records are ordered by a SHA-256 digest of
+their normalised messages and split by the digest of their passage key, never by ``random``.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import warnings
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -23,6 +24,7 @@ SUFFIXES = frozenset({".jsonl", ".json"})
 APPROX_TOKENS_METHOD = "ceil(chars/3.2)"
 
 _TAG = re.compile(r"^[A-Za-z0-9_+.#-]{1,32}$")
+_WINDOW = re.compile(r"#p(?P<start>\d+)(?:-(?P<end>\d+))?$")
 
 
 @dataclass
@@ -240,6 +242,62 @@ def _in_val(digest: str, val_ratio: float) -> bool:
     return int(digest[:8], 16) / float(1 << 32) < val_ratio
 
 
+def _window(source: str) -> tuple[str, int, int] | None:
+    """Parse ``file#pSTART[-END]`` into ``(file, start, end)``; None when unusable.
+
+    A source with no window, an empty file part (``#p7-9``) or a blank source gives None,
+    so the caller can fall back to the record digest and stay deterministic.
+    """
+    text = source.strip()
+    match = _WINDOW.search(text)
+    if match is None:
+        return None
+    file = text[: match.start()].strip()
+    if not file:
+        return None
+    start = int(match.group("start"))
+    end = int(match.group("end") or start)
+    return (file, min(start, end), max(start, end))
+
+
+def _passage_keys(sources: list[str]) -> list[str | None]:
+    """Return one passage key per record, merging overlapping or touching windows.
+
+    Records whose windows overlap share paragraphs, so splitting them by their own digest
+    would leak train text into val. Per source file we merge every window interval that
+    overlaps or touches another into one maximal component; a record's key is the file plus
+    that component's span, so a record and everything it overlaps get the same key.
+    Records with no parsable window get None and are split by their record digest.
+    """
+    windows = [_window(source) for source in sources]
+    by_file: dict[str, list[tuple[int, int, int]]] = {}
+    for index, window in enumerate(windows):
+        if window is not None:
+            file, start, end = window
+            by_file.setdefault(file, []).append((start, end, index))
+
+    keys: list[str | None] = [None] * len(sources)
+    for file, spans in by_file.items():
+        spans.sort()
+        merged: list[list[int]] = []
+        for start, end, _ in spans:
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        for start, _, index in spans:
+            for low, high in merged:
+                if low <= start <= high:
+                    keys[index] = f"{file}#p{low}-{high}"
+                    break
+    return keys
+
+
+def _key_digest(key: str) -> str:
+    """SHA-256 of a passage key, so every window of one passage lands on the same side."""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
 def _bump(counter: dict[str, int], reason: str) -> None:
     """Increment one dropped-by-reason counter."""
     counter[reason] = counter.get(reason, 0) + 1
@@ -311,15 +369,31 @@ def build_dataset(cfg: RunConfig, *, execute: bool = False) -> DataStats:
         )
     )
 
+    keys = _passage_keys([record["source"] for _, record, _ in kept])
+    groups = len({key for key in keys if key is not None})
+    groups += sum(1 for key in keys if key is None)
+
     train: list[dict] = []
     val: list[dict] = []
     chars = 0
     sources: dict[str, int] = {}
-    for digest, record, answer_chars in kept:
+    for (digest, record, answer_chars), key in zip(kept, keys, strict=True):
         chars += answer_chars
         name = record["source"] or "unknown"
         sources[name] = sources.get(name, 0) + 1
-        (val if _in_val(digest, data.val_ratio) else train).append(record)
+        split_digest = digest if key is None else _key_digest(key)
+        (val if _in_val(split_digest, data.val_ratio) else train).append(record)
+
+    if data.val_ratio > 0.0 and not val and train:
+        # Warning, not error: a tiny or one-passage corpus legitimately cannot fill val, and
+        # failing the build would break the train-only path; but a 0-record val must be loud.
+        warnings.warn(
+            f"val split is empty at val_ratio={data.val_ratio}: none of the {groups} "
+            f"passage group(s) hashed below the ratio, so all {len(train)} records are in "
+            f"train. Raise val_ratio, or set val_ratio: 0.0 to train on everything.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     stats = DataStats(
         records_in=records_in,

@@ -235,6 +235,104 @@ def test_split_is_deterministic_by_hash(tmp_path: Path) -> None:
             assert (int(digest[:8], 16) / float(1 << 32) < 0.34) is in_val
 
 
+@pytest.mark.parametrize("val_ratio", [0.0, 0.1, 0.5, 0.9, 1.0])
+def test_windows_of_one_passage_land_on_the_same_side(
+    tmp_path: Path, val_ratio: float
+) -> None:
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    # p1-3 and p4 touch, so they merge into one passage and cannot be split.
+    write_jsonl(
+        data_dir / "records.jsonl",
+        [
+            {"user": "first", "reply": "a" * 80, "source": "book1/chapter-1.en.md#p1-3"},
+            {"user": "second", "reply": "b" * 80, "source": "book1/chapter-1.en.md#p4"},
+        ],
+    )
+
+    stats = build_dataset(cfg_for(tmp_path, data_dir, val_ratio=val_ratio))
+    assert (stats.train, stats.val) in ((2, 0), (0, 2))
+
+
+@pytest.mark.parametrize("val_ratio", [0.5, 0.9, 0.95])
+def test_overlapping_windows_are_merged_into_one_group(
+    tmp_path: Path, val_ratio: float
+) -> None:
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    # p11 sits inside p7-11, so both share a group even though their own digests differ:
+    # unmerged, ratio 0.5 would put one on each side.
+    write_jsonl(
+        data_dir / "records.jsonl",
+        [
+            {"user": "wide", "reply": "a" * 80, "source": "book1/chapter-1.en.md#p7-11"},
+            {"user": "narrow", "reply": "b" * 80, "source": "book1/chapter-1.en.md#p11"},
+        ],
+    )
+
+    stats = build_dataset(cfg_for(tmp_path, data_dir, val_ratio=val_ratio))
+    assert (stats.train, stats.val) in ((2, 0), (0, 2))
+
+
+def test_different_chapters_can_land_on_different_sides(tmp_path: Path) -> None:
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    write_jsonl(
+        data_dir / "records.jsonl",
+        [
+            {"user": "first", "reply": "a" * 80, "source": "book1/chapter-1.en.md#p0"},
+            {"user": "second", "reply": "b" * 80, "source": "book1/chapter-2.en.md#p0"},
+        ],
+    )
+
+    stats = build_dataset(cfg_for(tmp_path, data_dir, val_ratio=0.35))
+    assert (stats.train, stats.val) == (1, 1)
+
+
+def test_source_without_a_window_gets_a_stable_side(tmp_path: Path) -> None:
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    write_jsonl(
+        data_dir / "records.jsonl",
+        [
+            {"user": "no source", "reply": "a" * 80},
+            {"user": "blank source", "reply": "b" * 80, "source": "   "},
+            {"user": "window only", "reply": "c" * 80, "source": "#p7-9"},
+        ],
+    )
+
+    first = cfg_for(tmp_path, data_dir, val_ratio=0.5)
+    first.output_dir = "run_a"
+    second = cfg_for(tmp_path, data_dir, val_ratio=0.5)
+    second.output_dir = "run_b"
+    first_stats = build_dataset(first, execute=True)
+    second_stats = build_dataset(second, execute=True)
+
+    assert first_stats.to_dict() == second_stats.to_dict()
+    assert first_stats.train + first_stats.val == 3
+    for name in ("train.jsonl", "val.jsonl"):
+        left = (first.dataset_path / name).read_bytes()
+        right = (second.dataset_path / name).read_bytes()
+        assert left == right
+
+
+def test_empty_val_split_names_the_ratio_and_group_count(tmp_path: Path) -> None:
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    write_jsonl(
+        data_dir / "records.jsonl",
+        [
+            {"user": "first", "reply": "a" * 80, "source": "book1/chapter-1.en.md#p0-2"},
+            {"user": "second", "reply": "b" * 80, "source": "book1/chapter-1.en.md#p2"},
+        ],
+    )
+
+    # Both windows merge into passage p0-2, whose digest fraction is above 0.5, so no group
+    # reaches val. A 138/0 build must not pass silently.
+    with pytest.warns(UserWarning, match=r"val split is empty at val_ratio=0.5.*1 passage group"):
+        build_dataset(cfg_for(tmp_path, data_dir, val_ratio=0.5))
+
+
 def test_build_is_byte_identical_across_runs(tmp_path: Path) -> None:
     first = cfg_for(tmp_path, val_ratio=0.34)
     first.output_dir = "run_a"
