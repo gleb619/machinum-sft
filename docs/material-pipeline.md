@@ -109,13 +109,23 @@ truth, so a re-run after a crash resumes instead of guessing.
 to the agent process as a *single* argv entry, and Linux caps one argument at 128 KiB
 (`MAX_ARG_STRLEN`), so a pack above that dies in `execve` before the agent starts — the failure
 is instant and total (measured 2026-11-12: a 242 KB pack → `E2BIG` in 35 ms with `0 distilled`;
-the same command on a 100 KB pack ran fine). `distill` therefore packs a bounded slice in
-`items_for_date` order: at most `PACK_MAX_ITEMS` (10) items **and** `PACK_MAX_BYTES` (100 000
-bytes, measured as bytes because the corpus is Russian). Everything else stays `fetched` and a
-log line says `pack holds N of M fetched item(s); the rest wait for the next run`; the next run
-packs the remainder, so a backlog drains one pack per run instead of stalling for ever. Ten items
-is also the agent's own unit of work — nine items took ~15 min — so the cap fits the step's
-1500 s budget as well.
+the same command on a 100 KB pack ran fine). `distill` therefore packs a bounded slice: at most
+`PACK_MAX_ITEMS` (10) items **and** `PACK_MAX_BYTES` (100 000 bytes, measured as bytes because
+the corpus is Russian). Everything else stays `fetched` and a log line says `pack holds N of M
+fetched item(s); the rest wait for the next run`; the next run packs the remainder, so a backlog
+drains one pack per run instead of stalling for ever. Ten items is also the agent's own unit of
+work — nine items took ~15 min — so the cap fits the step's 1500 s budget as well.
+
+**The backlog is cross-day.** The pending list is every row with `status IN ('fetched','packed')`,
+not just the rows whose payload landed in today's `raw/` folder: today's items come first (in
+`score DESC, url ASC` order), then the other days oldest-first, each still `score DESC, url ASC`.
+The pack is written to `pack/<today>.md` and the notes to `notes/<today>/` whatever day an item
+was fetched on, because the per-item `raw:` line already points at the old file — the agent reads
+the full body from there. That is what makes a day the loop skipped (or a `distill` killed at its
+timeout) drain tomorrow instead of stranding 24 `packed` rows, which is exactly what a 2026-11-12
+backlog did: on 2026-11-17 a plain `distill` planned 0 items while 24 sat `packed`, and
+`--date 2026-11-12` still packed only the first 10. `--date YYYY-MM-DD` keeps the old
+single-day scope, and `--dry-run` still never writes.
 
 ## Subcommands
 
@@ -124,8 +134,8 @@ is also the agent's own unit of work — nine items took ~15 min — so the cap 
 | `seed` | inserts the configured queries into the frontier | `candidates` |
 | `add` | inserts explicit URLs into the frontier, ahead of every query | `candidates` |
 | `run` | calls webbridge for the due candidates (fresh, retryable, and `done` ones past `limits.refresh_days`), tops a short day up with synthesized pairs, scores, fetches (with Habr's comment tree), expands, records outbound links | `candidates`, `items`, `raw/` |
-| `distill` | packs a bounded slice (≤ `PACK_MAX_ITEMS` items / `PACK_MAX_BYTES` bytes) of `fetched`/`packed` items into one file, runs the `at` agent over it; the rest of the day waits for the next run | `pack/`, `notes/`, `experiments.md` |
-| `memorize` | posts each `distilled` note to ai-memory | wiki, `INDEX.md` |
+| `distill` | packs a bounded slice (≤ `PACK_MAX_ITEMS` items / `PACK_MAX_BYTES` bytes) of `fetched`/`packed` items into one file, runs the `at` agent over it; today's items first, then the older days oldest-first, so each run drains the backlog one pack at a time | `pack/`, `notes/`, `experiments.md` |
+| `memorize` | posts every `distilled` note to ai-memory, any raw day, each page keeping the date of the day the item was fetched | wiki, `INDEX.md` |
 | `report` | one line (or one JSON object) for a date | nothing |
 | `status` | counters for the whole state dir | nothing |
 | `tree` | the net one day drew: candidate → item(s) → their outbound links, as an ASCII tree or `--json` | nothing |

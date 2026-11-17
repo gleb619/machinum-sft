@@ -240,3 +240,14 @@ itself, unchanged. `_resolve_short_link` therefore does a capped `GET` and parse
 with `…`, so the rendered text yields `https://` as a "link". They are read from the
 `[data-testid="tweetText"] a` hrefs instead, and only when the tab is still on the same status —
 the browser is shared and stateful.
+
+**`distill` and `memorize` used to be day-scoped, so a backlog rotted.** On 2026-11-17 the state
+DB held 24 items from 2026-11-12 at `status='packed'` with `distilled_at IS NULL`, and a plain
+`msft material distill` planned `0 item(s)` while `memorize` posted nothing: both selected with
+`State.items_for_date(today())`, which filters `raw_path LIKE '%/raw/<day>/%'`. Items from an
+earlier day were therefore never revisited, and a `distill --date` that ran late wrote notes the
+next day's `memorize` could not see. Fix: `State.items_pending()` selects every
+`fetched`/`packed` row and orders today first then oldest raw day first; `State.items_distilled()`
+selects every `distilled` row; `memorize` derives each item's page date from `_DATE_DIR_RE` on its
+`raw_path`, so an old note keeps its own date instead of being renamed to today. An explicit
+`--date` still scopes to that one day. Proof: `pytest -q tests/test_material.py -k cross_day`.

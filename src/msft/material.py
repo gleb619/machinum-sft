@@ -622,6 +622,12 @@ def load_material_config(path: str | Path | None = None) -> MaterialCfg:
 # --- state ---------------------------------------------------------------
 
 
+def _raw_day(item: dict[str, Any]) -> str | None:
+    """The `YYYY-MM-DD` of an item's raw payload, read from `raw/<day>/` in `raw_path`."""
+    match = _DATE_DIR_RE.search(str(item.get("raw_path") or ""))
+    return match.group(1) if match else None
+
+
 def _refresh_cutoff(refresh_days: int) -> str:
     """The `updated_at` a `done` node must be at or below to be asked again.
 
@@ -847,6 +853,55 @@ class State:
             params.extend(statuses)
         sql += " ORDER BY score DESC, url ASC"
         return [dict(row) for row in self.conn.execute(sql, params)]
+
+    def items_pending(self, day: str | None = None) -> list[dict]:
+        """Every `fetched`/`packed` item, `day`'s first, then the oldest raw day first.
+
+        `distill` must drain a backlog an earlier day's run left behind, so this query
+        deliberately ignores the raw-day filter `items_for_date` applies: a row is pending
+        whatever folder its payload landed in. Inside a day the order is the one the pack
+        already used (`score DESC, url ASC`); the raw day is parsed from `raw_path` because
+        it is not a column. A row with no readable day sorts last — it cannot be older than
+        a dated one.
+        """
+        fresh_day = day or today()
+        rows = [
+            dict(row)
+            for row in self.conn.execute(
+                "SELECT * FROM items WHERE status IN ('fetched', 'packed') "
+                "ORDER BY score DESC, url ASC"
+            )
+        ]
+        fresh = [row for row in rows if _raw_day(row) == fresh_day]
+        backlog = sorted(
+            (row for row in rows if _raw_day(row) != fresh_day),
+            key=lambda row: (
+                _raw_day(row) or "9999-99-99",
+                -float(row.get("score") or 0),
+                str(row["url"]),
+            ),
+        )
+        return fresh + backlog
+
+    def items_distilled(self) -> list[dict]:
+        """Every `distilled` item, any raw day, oldest first.
+
+        `memorize` without `--date` posts the notes an earlier `distill --date` wrote;
+        scoping that to today with `items_for_date` silently dropped them.
+        """
+        rows = [
+            dict(row) for row in self.conn.execute(
+                "SELECT * FROM items WHERE status = 'distilled'"
+            )
+        ]
+        return sorted(
+            rows,
+            key=lambda row: (
+                _raw_day(row) or "9999-99-99",
+                -float(row.get("score") or 0),
+                str(row["url"]),
+            ),
+        )
 
     def items_by_status(self) -> dict[str, int]:
         rows = self.conn.execute(
@@ -3291,7 +3346,13 @@ def distill(
     timeout_ms: int | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Pack every fetched item of the day, hand the pack to `at`, then mark what came back."""
+    """Pack the fetched items, hand the pack to `at`, then mark what came back.
+
+    Without `day`, the pack is today's: fresh items first, then the `fetched`/`packed`
+    backlog of every earlier raw day, oldest day first, so a run skipped or killed on one
+    day no longer strands its items. `--date` keeps the exact single-day behaviour.
+    """
+    explicit_day = day is not None
     day = day or today()
     agent = agent or cfg.distill.agent
     timeout = int(timeout_ms if timeout_ms is not None else cfg.distill.timeout_ms)
@@ -3325,14 +3386,18 @@ def distill(
     if dry_run and not cfg.db_path.is_file():
         return empty
     with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
-        fetched = state.items_for_date(day, statuses=("fetched", "packed"))
+        fetched = (
+            state.items_for_date(day, statuses=("fetched", "packed"))
+            if explicit_day
+            else state.items_pending(day)
+        )
         if not fetched:
             return empty
         # One `at` run carries one prompt, and one prompt must fit in one argv entry (see
-        # `PACK_MAX_BYTES`). The rest of the day stays `fetched` and is packed next run.
+        # `PACK_MAX_BYTES`). The rest of the list stays `fetched` and is packed next run.
         items = _pack_slice(cfg, day, fetched)
         deferred = len(fetched) - len(items)
-        # The same budget the slice was measured against: with fewer items packed than the day
+        # The same budget the slice was measured against: with fewer items packed than the list
         # holds, re-deriving it from `items` would grow every section and could push the written
         # pack back over the argv cap.
         pack_text = _pack_text(cfg, day, items, _pack_body_budget(fetched))
@@ -3527,7 +3592,13 @@ def memorize(
     workspace: str | None = None,
     project: str | None = None,
 ) -> dict[str, Any]:
-    """POST every distilled note of the day to ai-memory, then refresh `INDEX.md`."""
+    """POST every distilled note to ai-memory, then refresh `INDEX.md`.
+
+    Without `day`, every `distilled` item is posted whatever raw day it came from, and each
+    page keeps its own date in the wiki path — a `distill --date` that ran after the fact is
+    still editable. `--date` keeps the exact single-day behaviour.
+    """
+    explicit_day = day is not None
     day = day or today()
     if dry_run and not cfg.db_path.is_file():
         # Nothing has been collected yet, so there is nothing to preview and nothing to create.
@@ -3542,14 +3613,20 @@ def memorize(
             "payloads": [],
         }
     with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
-        items = state.items_for_date(day, statuses=("distilled",))
+        items = (
+            state.items_for_date(day, statuses=("distilled",))
+            if explicit_day
+            else state.items_distilled()
+        )
         payloads: list[dict[str, Any]] = []
         skipped = 0
         for item in items:
-            payload = memory_payload(cfg, day, item, workspace=workspace, project=project)
+            item_day = day if explicit_day else (_raw_day(item) or day)
+            payload = memory_payload(cfg, item_day, item, workspace=workspace, project=project)
             if payload is None:
                 skipped += 1
                 continue
+            payload["_day"] = item_day
             payloads.append(payload)
         if dry_run:
             return {
@@ -3589,7 +3666,6 @@ def memorize(
                     payload["_url"],
                     status="memorized",
                     memorized_at=_now(),
-                    digest_path=cfg.display(cfg.notes_dir / day / f"{payload['_slug']}.md"),
                 )
                 continue
             errors += 1

@@ -1253,18 +1253,20 @@ sys.exit({exit_code})
 
 
 def seed_fetched_day(
-    cfg: material.MaterialCfg, count: int, *, body_chars: int = 3_000
+    cfg: material.MaterialCfg, count: int, *, body_chars: int = 3_000, day: str = DAY
 ) -> list[str]:
-    """`count` fetched items on DAY, each with its own raw body file, all at score 1.0.
+    """`count` fetched items on `day`, each with its own raw body file, all at score 1.0.
 
     Returned in `items_for_date` order (`score DESC, url ASC`), which is the order `_pack_slice`
-    slices in.
+    slices in. The URL carries the day, so the same index on two days stays two rows (the URL is
+    the primary key) and the two slugs — derived from the path — stay distinct.
     """
+    stamp = re.sub(r"\D", "", day)
     urls: list[str] = []
     with material.State(cfg.db_path) as state:
         for index in range(1, count + 1):
-            url = f"https://habr.com/ru/articles/9100{index:02d}/"
-            raw = cfg.material_dir / "raw" / DAY / f"habr-{index:02d}.txt"
+            url = f"https://habr.com/ru/articles/{stamp}{index:02d}/"
+            raw = cfg.material_dir / "raw" / day / f"habr-{index:02d}.txt"
             raw.parent.mkdir(parents=True, exist_ok=True)
             raw.write_text("Body " + "z" * body_chars, encoding="utf-8")
             row = material._new_item_row(
@@ -1531,6 +1533,101 @@ def test_distill_takes_one_item_even_past_the_byte_cap(
     assert result["items"] == 1, "the first item is always taken, whatever its section costs"
     assert result["ok"] is True
     assert result["deferred"] == 0
+
+
+def test_distill_day_none_drains_a_cross_day_backlog(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A `packed` leftover from an earlier day is invisible to a day-scoped default run."""
+    old = "2026-11-09"
+    fresh = seed_fetched_day(cfg, 2)
+    backlog = seed_fetched_day(cfg, 3, day=old)
+    with material.State(cfg.db_path) as state:
+        for url in backlog:
+            state.update_item(url, status="packed")
+    monkeypatch.setattr(material, "today", lambda: DAY)
+    monkeypatch.setenv("MSFT_AT_BIN", str(fake_at(tmp_path)))
+
+    result = material.distill(cfg)
+
+    assert result["date"] == DAY, "the pack is written for today, where the notes land"
+    assert result["packed"] == 5, "today's two plus the three an earlier run left packed"
+    assert result["deferred"] == 0
+    pack = (cfg.pack_dir / f"{DAY}.md").read_text(encoding="utf-8")
+    urls_in_pack = re.findall(r"^- url: (.+)$", pack, re.MULTILINE)
+    assert urls_in_pack == [*fresh, *backlog], "fresh material first, then the oldest day"
+    with material.State(cfg.db_path) as state:
+        assert state.items_pending() == [], "nothing is pending after the run"
+        assert all(state.item(url)["status"] == "distilled" for url in [*fresh, *backlog])
+    assert len(list((cfg.notes_dir / DAY).glob("*.md"))) == 5, "notes land under today, as asked"
+
+    # The same cap still holds across days: the older day alone is a backlog of its own.
+    older = "2026-11-07"
+    more = seed_fetched_day(cfg, material.PACK_MAX_ITEMS + 2, day=older)
+    first = material.distill(cfg)
+    assert first["items"] == material.PACK_MAX_ITEMS, "one `at` run gets one prompt's worth"
+    assert first["deferred"] == 2
+
+    second = material.distill(cfg)
+    assert second["items"] == 2
+    assert second["deferred"] == 0
+    with material.State(cfg.db_path) as state:
+        assert all(state.item(url)["status"] == "distilled" for url in more)
+
+
+def test_memorize_day_none_books_a_distilled_item_from_an_earlier_day(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`memorize` without `--date` posts the notes an earlier `distill --date` wrote."""
+    old = "2026-11-08"
+    url = seed_fetched_day(cfg, 1, day=old)[0]
+    slug = material.slugify(url)
+    note = cfg.notes_dir / old / f"{slug}.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(
+        "---\ntitle: An old item\nsite: habr\ntags: [lora]\n---\n\n# An old item\n\nBody.\n",
+        encoding="utf-8",
+    )
+    with material.State(cfg.db_path) as state:
+        state.update_item(url, status="distilled", digest_path=cfg.display(note))
+    monkeypatch.setattr(material, "today", lambda: DAY)
+    posts: list[dict[str, Any]] = []
+
+    def fake_post(_url: str, _token: str, payload: dict[str, Any]) -> tuple[int, str]:
+        posts.append(payload)
+        return 201, '{"ok":true}'
+
+    monkeypatch.setattr(material, "post_page", fake_post)
+
+    result = material.memorize(cfg)
+
+    assert result["memorized"] == 1
+    assert len(posts) == 1
+    assert posts[0]["path"].startswith(f"projects/machinum-sft/material/{old}-"), (
+        "the page keeps the note's own date instead of being renamed to today"
+    )
+    with material.State(cfg.db_path) as state:
+        assert state.item(url)["status"] == "memorized"
+
+
+
+def test_memorize_day_none_keeps_the_note_a_cross_day_distill_wrote(
+    cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cross-day note lives under the distill day; memorize must not repoint digest_path."""
+    url = seed_fetched_day(cfg, 1, day="2026-11-08")[0]
+    monkeypatch.setattr(material, "today", lambda: DAY)
+    monkeypatch.setenv("MSFT_AT_BIN", str(fake_at(tmp_path)))
+    assert material.distill(cfg)["distilled"] == 1
+
+    monkeypatch.setattr(material, "post_page", lambda *args: (201, "{}"))
+    assert material.memorize(cfg)["memorized"] == 1
+
+    with material.State(cfg.db_path) as state:
+        item = state.item(url)
+    note = Path(item["digest_path"])
+    assert note.is_file(), "the note distill wrote is still the recorded digest"
+    assert note.parent.name == DAY, "the note landed under the distill day, not the raw day"
 
 
 # --- memorize -------------------------------------------------------------
