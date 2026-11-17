@@ -28,7 +28,6 @@ adapters/
 *.pt
 *.pth
 *.log
-*.pt
 
 # --- python ---
 __pycache__/
@@ -64,3 +63,10 @@ deploy/memory/data/
 # docs/material: raw research material (bulky, third-party text). The distilled notes go to
 # the ai-memory wiki instead — see docs/material-pipeline.md
 docs/material/
+*.ignore.*
+/build.gradle
+/configure.ignore.sh
+/.gradle/
+/gradle/wrapper/*
+/gradlew
+/gradlew.bat
