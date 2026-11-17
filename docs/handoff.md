@@ -117,7 +117,7 @@ QLoRA there and documents 10 GB at 4B).
 ```bash
 msft remote signal merge    --config … # out/merged-<config name>, 16-bit
 msft remote signal quantize --config … # out/model-*.gguf via LLAMA_CPP_DIR
-bash scripts/ollama-export.sh out/model-4b.gguf machinum-book-ru:4b
+bash scripts/ollama-export.sh out/model-4b.gguf machinum:4b
 ```
 
 Two things decide whether the result is usable, and neither is the weights:
@@ -128,7 +128,7 @@ Two things decide whether the result is usable, and neither is the weights:
 2. **`think: false` on every request.** Qwen3.5 defaults to thinking. Through the API:
 
 ```json
-{"model": "machinum-book-ru:4b", "think": false, "stream": false,
+{"model": "machinum:4b", "think": false, "stream": false,
  "messages": [{"role": "system", "content": "Translate English prose into Russian. Reply with the translation only."},
               {"role": "user", "content": "The night was cold and the house stood silent."}]}
 ```
@@ -139,8 +139,8 @@ Without them, the same file answers with `Thinking Process: 1. **Analyze the Req
 Push to a namespace you own — a bare name means `library/` and is refused:
 
 ```bash
-docker exec ollama ollama cp machinum-book-ru:4b <user>/machinum-book-ru:4b
-docker exec ollama ollama push <user>/machinum-book-ru:4b
+docker exec ollama ollama cp machinum:4b <user>/machinum:4b
+docker exec ollama ollama push <user>/machinum:4b
 ```
 
 ## 8. Failure playbook (all of these happened)

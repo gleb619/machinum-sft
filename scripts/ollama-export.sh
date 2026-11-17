@@ -1,8 +1,8 @@
 #!/bin/bash
 # Create (and optionally push) an Ollama model from a GGUF produced by `msft quantize`.
 #
-#   scripts/ollama-export.sh out/model.gguf machinum-book-ru
-#   scripts/ollama-export.sh out/model.gguf machinum-book-ru --push
+#   scripts/ollama-export.sh out/model.gguf machinum
+#   scripts/ollama-export.sh out/model.gguf machinum --push
 #
 # Works with a host `ollama` binary or with an ollama container named OLLAMA_CONTAINER
 # (default: ollama): in container mode the GGUF is copied in and `ollama create` runs inside.

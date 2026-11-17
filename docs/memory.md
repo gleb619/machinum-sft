@@ -178,8 +178,8 @@ default.
 **Push needs a namespace you own.** A bare name targets `library/` and is refused with
 `you are not authorized to push to this namespace`.
 ```bash
-docker exec ollama ollama cp machinum-book-ru:4b <user>/machinum-book-ru:4b
-docker exec ollama ollama push <user>/machinum-book-ru:4b
+docker exec ollama ollama cp machinum:4b <user>/machinum:4b
+docker exec ollama ollama push <user>/machinum:4b
 ```
 The account in use is `boris86496`. The ollama container publishes `11434` on host port
 **7869**, and its CLI has no `--system`/`--raw` flags — use `/api/chat` over HTTP for anything

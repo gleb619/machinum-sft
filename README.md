@@ -92,7 +92,7 @@ The GGUF carries the tokenizer's own chat template, and Qwen3.5 defaults to thin
 request without the flag comes back as a reasoning transcript instead of a translation.
 
 ```json
-{"model": "machinum-book-ru:4b", "think": false, "stream": false,
+{"model": "machinum:4b", "think": false, "stream": false,
  "messages": [{"role": "system", "content": "Translate English prose into Russian. Reply with the translation only."},
               {"role": "user", "content": "The night was cold and the house stood silent."}]}
 ```

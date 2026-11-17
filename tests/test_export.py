@@ -15,8 +15,8 @@ from msft.config import MsftError
 
 LISTING = (
     "NAME                     ID    SIZE    MODIFIED\n"
-    "machinum-book-ru:4b  abc  2.6 GB  now\n"
-    "me/machinum-book-ru:4b  abc  2.6 GB  now\n"
+    "machinum:4b  abc  2.6 GB  now\n"
+    "me/machinum:4b  abc  2.6 GB  now\n"
     # ollama tags a bare name, so `ollama create tiny` shows up as `tiny:latest`.
     "tiny:latest  def  2.6 GB  now\n"
 )
@@ -80,7 +80,7 @@ def test_container_flow_creates_the_model_without_a_template(
     fake = FakeRun()
     monkeypatch.setattr(export.subprocess, "run", fake)
 
-    result = export.run(path, "machinum-book-ru:4b")
+    result = export.run(path, "machinum:4b")
 
     assert result["ok"] is True
     assert result["listed"] is True
@@ -90,16 +90,16 @@ def test_container_flow_creates_the_model_without_a_template(
     assert fake.calls[2] == ["docker", "cp", str(path), "ollama:/models/model-4b.gguf"]
     assert fake.calls[3][0:2] == ["docker", "cp"]
     assert fake.calls[3][2].endswith("Modelfile")
-    assert fake.calls[3][3].startswith("ollama:/tmp/Modelfile.machinum-book-ru_4b")
+    assert fake.calls[3][3].startswith("ollama:/tmp/Modelfile.machinum_4b")
     assert fake.calls[4] == [
         "docker",
         "exec",
         "ollama",
         "ollama",
         "create",
-        "machinum-book-ru:4b",
+        "machinum:4b",
         "-f",
-        "/tmp/Modelfile.machinum-book-ru_4b",
+        "/tmp/Modelfile.machinum_4b",
     ]
     assert fake.calls[5] == [
         "docker",
@@ -108,7 +108,7 @@ def test_container_flow_creates_the_model_without_a_template(
         "rm",
         "-f",
         "/models/model-4b.gguf",
-        "/tmp/Modelfile.machinum-book-ru_4b",
+        "/tmp/Modelfile.machinum_4b",
     ]
     assert fake.calls[-1] == ["docker", "exec", "ollama", "ollama", "list"]
 
@@ -126,12 +126,12 @@ def test_namespace_copies_then_pushes(tmp_path: Path, monkeypatch: pytest.Monkey
     fake = FakeRun()
     monkeypatch.setattr(export.subprocess, "run", fake)
 
-    result = export.run(path, "machinum-book-ru:4b", namespace="me", push=True)
+    result = export.run(path, "machinum:4b", namespace="me", push=True)
 
     assert result["ok"] is True
-    assert result["target"] == "me/machinum-book-ru:4b"
-    target = "me/machinum-book-ru:4b"
-    assert ["docker", "exec", "ollama", "ollama", "cp", "machinum-book-ru:4b", target] in (
+    assert result["target"] == "me/machinum:4b"
+    target = "me/machinum:4b"
+    assert ["docker", "exec", "ollama", "ollama", "cp", "machinum:4b", target] in (
         fake.calls
     )
     assert any(call[-2:] == ["push", target] for call in fake.calls)
@@ -145,7 +145,7 @@ def test_push_failure_is_reported_verbatim(
     fake = FakeRun(fail_on="push", stderr=message)
     monkeypatch.setattr(export.subprocess, "run", fake)
 
-    result = export.run(path, "machinum-book-ru:4b", namespace="me", push=True)
+    result = export.run(path, "machinum:4b", namespace="me", push=True)
 
     assert result["ok"] is False
     assert message in result["error"]
@@ -363,14 +363,14 @@ def test_a_namespaced_target_must_appear_in_the_listing(
 ) -> None:
     """`cp` can succeed while `list` still shows only the bare name; that is not exported."""
     path = gguf_file(tmp_path)
-    listing = "NAME ID SIZE MODIFIED\nmachinum-book-ru:4b  abc  2.6 GB  now\n"
+    listing = "NAME ID SIZE MODIFIED\nmachinum:4b  abc  2.6 GB  now\n"
     fake = FakeRun(listing=listing)
     monkeypatch.setattr(export.subprocess, "run", fake)
 
-    result = export.run(path, "machinum-book-ru:4b", namespace="me")
+    result = export.run(path, "machinum:4b", namespace="me")
 
     assert result["ok"] is False
-    assert "me/machinum-book-ru:4b did not appear" in result["error"]
+    assert "me/machinum:4b did not appear" in result["error"]
 
 
 # --- provenance gate ------------------------------------------------------
