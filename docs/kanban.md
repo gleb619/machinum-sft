@@ -19,3 +19,5 @@ Lightweight planner for `at` implementation tasks. Machine-mutated by `at kanban
 
 | ID | Status | Title | Description | Priority | Channel | Blocks | Blocked By | Plan File |
 | :- | :----- | :---- | :---------- | :------- | :------ | :----- | :--------- | :-------- |
+| T1 | Backlog | material: fetch requeued items without spending a query | retry flips error→new; refetch needs run --limit 1, which also searches. Add a pending-only fetch (or retry --fetch). | Low      | loop    | -      | -          | -         |
+| T2 | Backlog | material status: probe webbridge extension, not just the daemon | status said 'webbridge ok' while two rows failed on 'extension not connected'; name the extension state.              | Low      | loop    | -      | -          | -         |
