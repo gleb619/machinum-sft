@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "machinum" }]
-dependencies = ["PyYAML>=6.0"]
+dependencies = ["PyYAML>=6.0", "cryptography>=42"]
 
 [project.optional-dependencies]
 train = [

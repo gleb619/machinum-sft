@@ -14,6 +14,9 @@ ssh_config
 credentials.json
 id_rsa*
 known_hosts
+# plaintext source for `msft secrets encrypt`; the encrypted values live in .env
+docs/secrets.json
+*.secrets.json
 
 # --- training artifacts (large, machine-specific) ---
 data/

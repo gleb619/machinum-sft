@@ -644,6 +644,72 @@ def _cmd_config_show(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# --- encrypted .env -------------------------------------------------------
+
+
+def _secret_name(raw: str) -> str:
+    """Turn a JSON key into an environment-variable name (`hf_token` -> `HF_TOKEN`)."""
+    name = "".join(ch if ch.isalnum() else "_" for ch in raw).upper()
+    if not name or not (name[0].isalpha() or name[0] == "_"):
+        raise MsftError(f"secret key {raw!r} cannot become an environment-variable name")
+    return name
+
+
+def _cmd_secrets_encrypt(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Encrypt a JSON object's values into `.env`; print names only, never values."""
+    from msft import secrets
+
+    source = Path(args.from_json) if args.from_json else secrets.REPO_ROOT / "docs" / "secrets.json"
+    output = Path(args.out) if args.out else secrets.REPO_ROOT / ".env"
+    if not source.is_file():
+        raise MsftError(f"no secret source at {source}")
+    try:
+        data = json.loads(source.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise MsftError(f"{source} is not valid JSON: {exc.msg}") from exc
+    if not isinstance(data, dict):
+        raise MsftError(f"{source} must hold a JSON object of name -> value")
+    updates: dict[str, str] = {}
+    for raw_name, value in data.items():
+        if not isinstance(value, str) or not value:
+            raise MsftError(f"secret {raw_name!r} must be a non-empty string")
+        name = _secret_name(str(raw_name))
+        if name in updates:
+            raise MsftError(f"two secret keys map to {name}")
+        updates[name] = secrets.encrypt(value)
+    secrets.assert_safe_output(output)
+    actions = secrets.write_env_values(output, updates)
+    if args.as_json:
+        rows = [{"name": name, "action": action} for name, action in actions.items()]
+        _emit(True, {"file": str(output), "variables": rows}, "")
+    else:
+        for name, action in actions.items():
+            print(f"{name}\t{action}")
+        print(f"{len(actions)} variables written to {output}")
+    return EXIT_OK
+
+
+def _cmd_secrets_list(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """List `.env` variable names and whether each value is encrypted; never values."""
+    from msft import secrets
+
+    path = Path(args.file) if args.file else secrets.REPO_ROOT / ".env"
+    raw = secrets.read_env_file(path)
+    rows = [
+        {"name": name, "state": "encrypted" if value.startswith(secrets.ENV_PREFIX) else "plain"}
+        for name, value in raw.items()
+    ]
+    if args.as_json:
+        _emit(True, {"file": str(path), "variables": rows, "count": len(rows)}, "")
+    elif not rows:
+        print(f"no variables in {path}")
+    else:
+        for row in rows:
+            print(f"{row['name']}\t{row['state']}")
+        print(f"{len(rows)} variables")
+    return EXIT_OK
+
+
 # --- material: the daily research state machine ---------------------------
 
 
@@ -1405,6 +1471,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = config_sub.add_parser("show", parents=[common], help="print the resolved config")
     p_show.set_defaults(handler=_cmd_config_show)
 
+    p_secrets = sub.add_parser(
+        "secrets", parents=[common], help="encrypted values in .env (names plain, values enc:v1:)"
+    )
+    secrets_sub = p_secrets.add_subparsers(
+        dest="secrets_command", metavar="ACTION", required=True
+    )
+    p_s_encrypt = secrets_sub.add_parser(
+        "encrypt",
+        parents=[common],
+        help="encrypt a JSON object's values into .env; prints names only",
+    )
+    p_s_encrypt.add_argument(
+        "--from-json",
+        metavar="PATH",
+        default=None,
+        help="plaintext source (default: docs/secrets.json)",
+    )
+    p_s_encrypt.add_argument(
+        "--out", metavar="PATH", default=None, help="target (default: .env at the repo root)"
+    )
+    p_s_encrypt.set_defaults(handler=_cmd_secrets_encrypt)
+    p_s_list = secrets_sub.add_parser(
+        "list", parents=[common], help="variable names and encrypted/plain; never values"
+    )
+    p_s_list.add_argument("--file", metavar="PATH", default=None, help="default: .env at the root")
+    p_s_list.set_defaults(handler=_cmd_secrets_list)
+
     p_worker = sub.add_parser(
         "worker", parents=[common], help="job queue served on the GPU box (signal / serve / status)"
     )
@@ -1685,6 +1778,14 @@ def main(argv: list[str] | None = None) -> int:
     handler: Handler | None = getattr(args, "handler", None)
     if handler is None:  # pragma: no cover - argparse requires a subcommand
         parser.print_help(sys.stderr)
+        return EXIT_ERROR
+
+    try:
+        from msft.secrets import load_env_file
+
+        load_env_file()
+    except MsftError as exc:
+        _log(f"error: {exc}")
         return EXIT_ERROR
 
     args.as_json = bool(getattr(args, "as_json", False))
