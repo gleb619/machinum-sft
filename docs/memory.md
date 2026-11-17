@@ -251,3 +251,11 @@ next day's `memorize` could not see. Fix: `State.items_pending()` selects every
 selects every `distilled` row; `memorize` derives each item's page date from `_DATE_DIR_RE` on its
 `raw_path`, so an old note keeps its own date instead of being renamed to today. An explicit
 `--date` still scopes to that one day. Proof: `pytest -q tests/test_material.py -k cross_day`.
+
+**An `error` item is never retried automatically; `retry` is the supported requeue.** `run` only
+drains `status='new'`, and `add` is a no-op because the item row dedupes the URL, so a transient
+fetch failure (a 502, the webbridge daemon restarting — three habr rows on 2026-11-17) stayed
+dead until someone wrote `UPDATE items SET status='new'` by hand. Fix:
+`msft material retry [URL ...]` flips exactly `status='error'` rows to `new`, clears `error`, and
+touches nothing else; `--dry-run` names them without writing. It is deliberately not automatic: a
+site that is down would burn a fetch every day. Proof: `pytest -q tests/test_material.py -k retry`.

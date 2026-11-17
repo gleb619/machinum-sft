@@ -381,6 +381,98 @@ def test_rescore_leaves_a_genuinely_off_topic_row_out(cfg: material.MaterialCfg)
     assert row["status"] == "scored_out"
 
 
+def test_retry_flips_an_error_item_back_to_new(cfg: material.MaterialCfg) -> None:
+    """A transient fetch failure must be re-queued without hand-written SQL, and only that row."""
+    bad = "https://habr.com/ru/articles/464646/"
+    kept = "https://habr.com/ru/articles/474747/"
+    with material.State(cfg.db_path) as state:
+        state.conn.execute(
+            "INSERT INTO items (url, site, title, score, status, error, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (bad, "habr", "Broken", 0.0, "error", "habr: network error: HTTP Error 502",
+             "2026-11-01T00:00:00Z"),
+        )
+        state.conn.execute(
+            "INSERT INTO items (url, site, title, score, status, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (kept, "habr", "Kept", 0.0, "memorized", "2026-11-02T00:00:00Z"),
+        )
+        state.conn.commit()
+
+    result = material.retry(cfg)
+    assert result["errors"] == 1
+    assert result["requeued"] == 1
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute(
+            "SELECT status, error FROM items WHERE url = ?", (bad,)
+        ).fetchone()
+        other = state.conn.execute(
+            "SELECT status FROM items WHERE url = ?", (kept,)
+        ).fetchone()
+    assert row["status"] == "new" and row["error"] is None
+    assert other["status"] == "memorized", "a non-error row must not be touched"
+    assert material.retry(cfg)["errors"] == 0, "a requeued row is no longer an error"
+
+
+def test_retry_dry_run_names_the_rows_and_writes_nothing(cfg: material.MaterialCfg) -> None:
+    url = "https://habr.com/ru/articles/484848/"
+    with material.State(cfg.db_path) as state:
+        state.conn.execute(
+            "INSERT INTO items (url, site, title, score, status, error, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (url, "habr", "Broken", 0.0, "error", "webbridge: daemon/extension not ready",
+             "2026-11-01T00:00:00Z"),
+        )
+        state.conn.commit()
+
+    dry = material.retry(cfg, dry_run=True)
+    assert dry["requeued"] == 1
+    text = material.format_retry(dry)
+    assert "would requeue" in text and url in text
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute("SELECT status FROM items WHERE url = ?", (url,)).fetchone()
+    assert row["status"] == "error", "a dry run must not touch the row"
+
+
+def test_retry_by_url_leaves_other_errors_and_reports_a_non_error_url(
+    cfg: material.MaterialCfg,
+) -> None:
+    first = "https://habr.com/ru/articles/494949/"
+    second = "https://habr.com/ru/articles/505050/"
+    kept = "https://habr.com/ru/articles/515151/"
+    with material.State(cfg.db_path) as state:
+        for url in (first, second):
+            state.conn.execute(
+                "INSERT INTO items (url, site, title, score, status, error, first_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (url, "habr", "Broken", 0.0, "error", "HTTP Error 502",
+                 "2026-11-01T00:00:00Z"),
+            )
+        state.conn.execute(
+            "INSERT INTO items (url, site, title, score, status, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (kept, "habr", "Kept", 0.0, "memorized", "2026-11-02T00:00:00Z"),
+        )
+        state.conn.commit()
+
+    result = material.retry(cfg, urls=[first, kept])
+    assert result["requeued"] == 1
+    assert result["not_error"] == 1
+    assert result["unknown"] == 0
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute(
+            "SELECT status FROM items WHERE url = ?", (first,)
+        ).fetchone()
+        other = state.conn.execute(
+            "SELECT status FROM items WHERE url = ?", (second,)
+        ).fetchone()
+    assert row["status"] == "new"
+    assert other["status"] == "error", "a URL not asked for must stay an error"
+
+    missing = material.retry(cfg, urls=["https://habr.com/ru/articles/000000/"])
+    assert missing["unknown"] == 1 and missing["requeued"] == 0
+
+
 def test_run_fetches_a_kept_but_unread_item_with_no_query_at_all(
     cfg: material.MaterialCfg, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1799,6 +1891,27 @@ def test_cli_status_json(
     payload = one_object(capsys.readouterr().out)
     assert payload["config"].endswith("material.yaml")
     assert payload["frontier"] == 0
+
+
+def test_cli_retry_json(
+    cfg: material.MaterialCfg, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`msft material retry` is the supported requeue for an `error` item."""
+    url = "https://habr.com/ru/articles/525252/"
+    with material.State(cfg.db_path) as state:
+        state.conn.execute(
+            "INSERT INTO items (url, site, title, score, status, error, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (url, "habr", "Broken", 0.0, "error", "HTTP Error 502", "2026-11-01T00:00:00Z"),
+        )
+        state.conn.commit()
+
+    assert main(["material", "retry", "--json", "--config", str(cfg.path)]) == 0
+    payload = one_object(capsys.readouterr().out)
+    assert payload["requeued"] == 1
+    with material.State(cfg.db_path) as state:
+        row = state.conn.execute("SELECT status FROM items WHERE url = ?", (url,)).fetchone()
+    assert row["status"] == "new"
 
 
 def test_cli_seed_and_report(

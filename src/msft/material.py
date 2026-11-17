@@ -3982,6 +3982,82 @@ def format_rescore(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def retry(
+    cfg: MaterialCfg, *, urls: list[str] | None = None, dry_run: bool = False
+) -> dict[str, Any]:
+    """Re-queue `error` items for the next `run`: `error` → `new`, never any other move.
+
+    A fetch failure is usually transient (a 502, the webbridge daemon restarting), but `run`
+    only drains `status='new'` and `add` is a no-op for a known URL, so without this the row
+    stays dead until someone writes SQL by hand. Deliberately not automatic: a site that is
+    down would burn a fetch every day. `raw_path`, `digest_path`, `score` and `fetched_at` are
+    left alone — a failing fetch never wrote them, and `_fetch_one` overwrites `raw_path` on
+    success.
+    """
+    payload: dict[str, Any] = {
+        "dry_run": dry_run,
+        "errors": 0,
+        "requeued": 0,
+        "not_error": 0,
+        "unknown": 0,
+        "items": [],
+    }
+    if not cfg.db_path.is_file():
+        payload["unknown"] = len(urls or [])
+        return payload
+    with State(cfg.db_path, retry_errors=cfg.limits.retry_errors) as state:
+        rows = state.conn.execute(
+            "SELECT url, site, title, error FROM items "
+            "WHERE status = 'error' ORDER BY first_seen_at, url"
+        ).fetchall()
+        payload["errors"] = len(rows)
+        if urls is None:
+            selected = list(rows)
+        else:
+            by_url = {row["url"]: row for row in rows}
+            selected = []
+            for url in urls:
+                if url in by_url:
+                    selected.append(by_url[url])
+                    continue
+                row = state.conn.execute(
+                    "SELECT 1 FROM items WHERE url = ?", (url,)
+                ).fetchone()
+                if row is None:
+                    payload["unknown"] += 1
+                else:
+                    payload["not_error"] += 1
+        for row in selected:
+            payload["requeued"] += 1
+            payload["items"].append(
+                {"url": row["url"], "site": row["site"], "title": row["title"],
+                 "error": row["error"]}
+            )
+            if not dry_run:
+                state.conn.execute(
+                    "UPDATE items SET status = 'new', error = NULL "
+                    "WHERE url = ? AND status = 'error'",
+                    (row["url"],),
+                )
+        if not dry_run:
+            state.conn.commit()
+    return payload
+
+
+def format_retry(payload: dict[str, Any]) -> str:
+    """One head line for a cron log, then the rows that were / would be re-queued."""
+    verb = "would requeue" if payload.get("dry_run") else "requeued"
+    head = (
+        f"retry: {payload['errors']} error item(s) · {verb} {payload['requeued']} "
+        f"· not error {payload['not_error']} · unknown {payload['unknown']}"
+    )
+    lines = [head]
+    for item in payload.get("items", []):
+        error = str(item["error"] or "")[:80]
+        lines.append(f"  {item['site']} {item['url']} — {error}")
+    return "\n".join(lines)
+
+
 def tree(cfg: MaterialCfg, *, day: str | None = None, depth: int = 2) -> dict[str, Any]:
     """The net one day drew: candidate → items → their outbound links, from the rows.
 

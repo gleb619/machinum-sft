@@ -839,6 +839,20 @@ def _cmd_material_rescore(cfg: RunConfig | None, args: argparse.Namespace) -> in
     return EXIT_OK
 
 
+def _cmd_material_retry(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Re-queue `error` items for the next run (status only ever goes error → new)."""
+    material = _impl("msft.material")
+    result = _jsonable(
+        _func(material, "retry")(
+            _material_config(args),
+            urls=list(getattr(args, "urls", None) or []) or None,
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    )
+    _emit(args.as_json, result, _func(material, "format_retry")(result))
+    return EXIT_OK
+
+
 # --- experiments: the queue between the notes and the box ------------------
 
 
@@ -1661,6 +1675,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="re-apply the current brief to items an older brief threw away",
     )
     p_m_rescore.set_defaults(handler=_cmd_material_rescore)
+    p_m_retry = mat_sub.add_parser(
+        "retry",
+        parents=[mat],
+        help="re-queue `error` items for the next `run` (error → new)",
+    )
+    p_m_retry.add_argument(
+        "urls",
+        nargs="*",
+        metavar="URL",
+        help="only these URLs (default: every error row)",
+    )
+    p_m_retry.set_defaults(handler=_cmd_material_retry)
 
     # `experiments` is a sibling of `material`, not a child: it reads the material tree and
     # its own catalog, never a RunConfig. `--catalog` replaces `--config` here for the same

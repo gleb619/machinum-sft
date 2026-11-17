@@ -140,6 +140,7 @@ single-day scope, and `--dry-run` still never writes.
 | `status` | counters for the whole state dir | nothing |
 | `tree` | the net one day drew: candidate → item(s) → their outbound links, as an ASCII tree or `--json` | nothing |
 | `rescore` | re-applies the *current* brief to items an older brief threw away (`scored_out` → `new`); status never moves the other way | `items` |
+| `retry` | re-queues `error` items for the next `run` (`error` → `new`, never the other way); all rows, or only the URLs given | `items` |
 
 Exit codes are the contract: `0` ok, `1` the run finished but some items failed, `2` a
 config or environment error (bad YAML, missing token, unwritable directory). Only `2` means
@@ -643,7 +644,7 @@ silently creates a frontier hides a typo in `configs/material.yaml`), then
 | items stuck `packed` for days | the agent never accepted the pack | `SELECT url, error FROM items WHERE status='packed'` |
 | `memorize` 4xx | ai-memory down, wrong workspace/project, stale token | `curl -s localhost:49374/healthz`, then `memory-stack.md` |
 | `memorize` 5xx | the wiki store refused the write; the note file is kept | re-run `memorize` after fixing the service — it is idempotent by path |
-| an item is `fetched` but its `.txt` is a few bytes | the browser tab was still on another page: `extract` returned that page's payload (`found: false`, a foreign `url`, `text: '""'`). `_extract_error` now refuses all three as retryable errors, so this row means it happened *before* that guard. **Item rows are not retried** — `limits.retry_errors` governs candidates only; a link-discovered item's failure counts as `links_unreadable`, not as a run error | `SELECT url, error FROM items WHERE status='error'`, then re-queue a transient failure with `UPDATE items SET status='new' WHERE url='<url>'` — adding the URL again does **not** refetch it, because the existing item row dedupes the URL |
+| an item is `fetched` but its `.txt` is a few bytes | the browser tab was still on another page: `extract` returned that page's payload (`found: false`, a foreign `url`, `text: '""'`). `_extract_error` now refuses all three as retryable errors, so this row means it happened *before* that guard. **Item rows are not retried automatically** — `limits.retry_errors` governs candidates only; a link-discovered item's failure counts as `links_unreadable`, not as a run error | `msft material retry <url>` then `msft material run --limit 1` — adding the URL again does **not** refetch it, because the existing item row dedupes the URL |
 | everything green, report says `0 items` | the sites answered and nothing scored | `items` rows with `scored_out` say why; usually `keep_min` |
 | everything green, report says `0 queries` | the frontier had nothing due: every candidate is `done` and inside `limits.refresh_days`, and synthesis is off or full | `msft material status` (frontier count), then `limits.refresh_days` / `limits.synthesize_queries` in `configs/material.yaml`; a real run also prints `frontier empty: nothing is due` on stderr |
 
