@@ -56,6 +56,8 @@ working loop) before touching `src/msft/{train,merge,quantize,worker,deploy}.py`
   `git reset`. Push to `origin main` when the guard is green.
 - **Before queueing work on the box:** `msft remote status --execute` must print a `GPU:` line,
   not a `WARNING:`. If it warns, stop.
+- **Plan work on the `at kanban` board: `docs/kanban.md` is the one backlog (`at kanban next` /
+  `status`), not a second list in docs or an issue tracker.**
 
 ## Definition of done for a model run
 
