@@ -16,8 +16,12 @@ from and the surgery it was given, so this page records both.
 
 ## Which to run
 
-- **Pipeline / production:** `machinum:4b-v2-data`. More data, unchanged recipe, best BLEU of the
-  four (45.6 with the training prompt, 45.4 with the default one) and no regression in the gates.
+- **Pipeline / production:** `machinum:4b-v2-data` is the *candidate* — more data, unchanged recipe —
+  but read the numbers before shipping it: on the default prompt it is BLEU **43.5** vs base **43.3**
+  (+0.15) and chrF 63.3 vs 63.1, while **`heretic` leads that table at BLEU 45.4**; the +3.1 BLEU
+  (45.6 vs 42.5) appears only under the corpus builder's own training prompt. Both leaderboards
+  scored **4 of the 6 cases** (`n_ref` 4), so every BLEU delta here is directional, not a ranking.
+  It is also referenced **0 times** in `machinum-pipeline`, i.e. nothing serves it today.
 - **Uncensored prose:** `machinum:4b-heretic`. Same translation behaviour, no refusal on content
   the base model declines.
 - **Reproducing an old number:** `machinum:4b`, then quote `docs/index.md` alongside it.
