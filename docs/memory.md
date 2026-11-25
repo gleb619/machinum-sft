@@ -97,6 +97,27 @@ Proving command: same payload with and without the field — without it `content
 `reasoning` starts with "Thinking Process:"; with it the translation comes back and costs ~28 s
 per chapter on a 4B.
 
+**`MT_OLLAMA_MODEL` outranks `MT_LLM_MODEL`, and `MT_LLM_MODEL_<STAGE>` is not wired.** On the
+ollama backend the model resolves input > tool > meta > settings (`llm.model`) > provider env
+(`MT_OLLAMA_MODEL`) > preset defaults > `MT_LLM_MODEL`
+(`packages/tools/src/core/llm-config.ts:342-350`), so a run exported with only
+`MT_LLM_MODEL=<tag>` silently answers from the preset's `gemma4:latest`. Measured against the
+built package:
+
+```
+$ node --input-type=module -e "import {resolveLlmConfig} from './dist/core/llm-config.js';
+    import {OLLAMA_LLM,OLLAMA_DEFAULTS} from './dist/core/ollama-tool.js';
+    console.log(resolveLlmConfig({env:{MT_LLM_MODEL:'machinum:4b'},
+      tool:OLLAMA_LLM,defaults:OLLAMA_DEFAULTS}).model)"
+bare MT_LLM_MODEL -> gemma4:latest preset-defaults
++MT_OLLAMA_MODEL  -> igorls/gemma-4-12B-it-heretic-GGUF:latest provider-env
+```
+
+The per-stage names in `docs/roadmap.md` (`MT_LLM_MODEL_SUMMARY|NER|PREPROCESS|TRANSLATE`) are
+implemented in the sample's `pickFor()`, not on the product path: the settings layer reads flat
+`llm.model` only (`llm-config.ts:135-142`). Routing two roles by stage needs the pipeline to give
+each stage its own tool instance — see `docs/model-roles.md`.
+
 **`mt` imports the built `@mt/tools`, not its source.** Editing `packages/tools/src/**` changes
 nothing until `pnpm --filter @mt/tools build` runs; `tsc` writes `dist` even when the build exits
 non-zero (the active-record refactor leaves type errors behind), so a failed build is not proof
