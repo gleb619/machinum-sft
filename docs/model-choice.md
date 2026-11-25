@@ -1,5 +1,20 @@
 # Which base model, and why
 
+## Current decision (2026-11)
+
+Two roles, both already decided; `docs/model-roles.md` is the authority for tags and wiring.
+
+- **`misc` — the `machinum:4b` family.** The 4B is the model this repo builds, trains and ships.
+  It handles summaries, NER / `<terms>`, glossary, proofreading, normalisation and short protocol
+  answers.
+- **`translation` — `igorls/gemma-4-12B-it-heretic-GGUF:latest`.** EN→RU book prose only. It is
+  an external GGUF served on the same box; this repo does not train it and has not measured it.
+
+The reasoning below — "train Gemma 4 12B with QLoRA, serve Qwen3.5 9B" — is the **history** that
+produced that split, not the current plan. It is kept unchanged because the measurements in it
+still explain the base-model constraints; read it as the record, not as a task list. Current
+sizes, VRAM and per-chapter costs are in `docs/model-candidates.md`.
+
 Re-ranked on 2026-11-08. Constraints that drive it: **one or two 16 GB consumer cards**, a
 text-only pipeline, Russian literary prose, and a strict line/XML output protocol. Llama is
 excluded by user preference; the 128 K native window is demoted from requirement to bonus

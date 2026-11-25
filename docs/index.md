@@ -1,5 +1,12 @@
 # machinum:4b — a 4-billion-parameter Russian literary translator
 
+> **Current role (2026-11).** This artefact is the **`misc`** model now: bullet summaries,
+> NER / `<terms>`, glossary, proofreading and typo fixing, normalisation, short protocol answers.
+> EN→RU book prose runs on `igorls/gemma-4-12B-it-heretic-GGUF:latest`, an external GGUF served
+> on the same box — this repo does not train it. Everything below is the unchanged record of how
+> the 4B was built and measured as a translator; the numbers stand, the role changed. Roles, tags
+> and the env block are in [model-roles.md](model-roles.md).
+
 A LoRA fine-tune of Qwen3.5-4B that speaks one protocol: take English prose, return Russian
 prose of the same line shape. It is not a chat model, it is a translation instrument, and this
 page is the record of how it was made, what it costs, and where it fails.
@@ -176,8 +183,8 @@ This page describes `machinum:4b`, the artefact this repo builds: 2.63 GB, 3.2 G
 per chapter, correct through the pipeline but with occasional semantic slips (it has rendered
 "boats" as "yachts" and "tin" as "brass").
 
-For the finished text there is one second model in the project,
-`igorls/gemma-4-12B-it-heretic-GGUF`: 7.4 GB, 8.4 GB of VRAM at 32 768 context, ~60 s per chapter,
-and it stops making those substitutions. Both run on one 16 GB card through the same endpoint;
-the measurements and the reasons every other candidate was discarded are in
+For the finished text there is one second model in the project, the **`translation`** role:
+`igorls/gemma-4-12B-it-heretic-GGUF:latest` — 7.4 GB, 8.4 GB of VRAM at 32 768 context, ~60 s per
+chapter, and it stops making those substitutions. Both run on one 16 GB card through the same
+endpoint; the measurements and the reasons every other candidate was discarded are in
 [model-candidates.md](model-candidates.md).

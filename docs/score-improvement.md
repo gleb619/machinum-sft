@@ -1,5 +1,10 @@
 # Raising the arena score: what to change, and in what order
 
+> **4B-as-translator record.** This research pass measured `machinum:4b` on EN→RU translation
+> before the roles were split. `machinum:4b` is the **`misc`** model now; EN→RU book prose is the
+> **`translation`** role, `igorls/gemma-4-12B-it-heretic-GGUF:latest`. The numbers below stand as
+> measured; the role has changed. See [model-roles.md](model-roles.md).
+
 `docs/arena.md` records the first comparison: on six EN→RU cases `machinum:4b` scored chrF 63.1,
 BLEU 43.3, judge 4.17/4.00 — and failed `line_parity` on both multi-line cases (2/6), which dropped
 `schema_validity` to 0.667 while every other model kept the shape. That failure, not the chrF gap,

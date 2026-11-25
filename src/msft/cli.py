@@ -1169,7 +1169,7 @@ def build_parser() -> argparse.ArgumentParser:
     common = _common_flags()
     parser = argparse.ArgumentParser(
         prog="msft",
-        description="Fine-tune the machinum-pipeline book model. Dry-run by default.",
+        description='Build the machinum 4B model (the "misc" role). Dry-run by default.',
         parents=[common],
     )
     parser.add_argument("--version", action="version", version=f"msft {__version__}")

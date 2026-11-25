@@ -1,15 +1,18 @@
 # Model tags: what each one is, and which one to run
 
+This page covers the 4B family only — every `machinum:*` tag is a `misc` model. Translation of
+book prose is a different tag with a different owner: see `docs/model-roles.md`.
+
 The box serves one ollama instance; the machinum family is several tags of the same base
 (Qwen3.5-4B) with different provenance. A tag is only meaningful next to the corpus it learned
 from and the surgery it was given, so this page records both.
 
-| tag | id | size | what it is | corpus | how it was made |
-| --- | --- | --- | --- | --- | --- |
-| `machinum:4b` | `3337790d35d5` | 2.6 GB | the shipped artefact: protocol learned, language is the base model's | 49 single-line pairs | `configs/qwen3.5-4b-lora.yaml` -> merge -> Q4_K_S |
-| `machinum:4b-v2-data` | `7a379d95227a` | 2.6 GB | second run, data arm: same hyperparameters, 2.7x corpus with multi-line samples | 135 records (49 single + 86 grouped) | `configs/machinum-4b-v2-data.yaml` |
-| `machinum:4b-v2-tuned` | `f97436212f97` | 2.6 GB | second run, tuned arm: r=16, alpha=32, lr 1e-4 on the same corpus | same | `configs/machinum-4b-v2-tuned.yaml` |
-| `machinum:4b-heretic` | `204984f5f7d1` | 2.6 GB | `machinum:4b` with the refusal direction projected out | same as `machinum:4b` | `scripts/abliterate.py --execute`, then Q4_K_S |
+| tag | role | id | size | what it is | corpus | how it was made |
+| --- | --- | --- | --- | --- | --- | --- |
+| `machinum:4b` | `misc` | `3337790d35d5` | 2.6 GB | the shipped artefact: protocol learned, language is the base model's | 49 single-line pairs | `configs/qwen3.5-4b-lora.yaml` -> merge -> Q4_K_S |
+| `machinum:4b-v2-data` | `misc` | `7a379d95227a` | 2.6 GB | second run, data arm: same hyperparameters, 2.7x corpus with multi-line samples | 135 records (49 single + 86 grouped) | `configs/machinum-4b-v2-data.yaml` |
+| `machinum:4b-v2-tuned` | `misc` | `f97436212f97` | 2.6 GB | second run, tuned arm: r=16, alpha=32, lr 1e-4 on the same corpus | same | `configs/machinum-4b-v2-tuned.yaml` |
+| `machinum:4b-heretic` | `misc` | `204984f5f7d1` | 2.6 GB | `machinum:4b` with the refusal direction projected out | same as `machinum:4b` | `scripts/abliterate.py --execute`, then Q4_K_S |
 
 `machinum:4b-fullseq` carries the same digest as `machinum:4b` — two tags, one set of weights.
 `machinum:4b-cov2` is an earlier experiment and is not part of this comparison.

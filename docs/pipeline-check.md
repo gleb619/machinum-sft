@@ -1,5 +1,10 @@
 # Pipeline check: machinum:4b through `mt`, and what it actually produced
 
+> **Read this as a 4B-as-translator record.** It was measured before the two roles were split:
+> `machinum:4b` is the **`misc`** model now and EN→RU book prose is the **`translation`** role,
+> `igorls/gemma-4-12B-it-heretic-GGUF:latest`. Every number below stands as measured on the date
+> it states; the role assigned to the model has changed. See [model-roles.md](model-roles.md).
+
 Date: 2026-11-09. Two models, one held-out chapter, the real pipeline, no mock.
 
 ```bash
@@ -9,6 +14,10 @@ MT_ONLY_CHAPTERS=1 MT_LLM_TOOL=ollama MT_LLM_MODEL=machinum:4b \
   MT_OLLAMA_URL=http://<gpu-host>:7869/v1 MT_LLM_REASONING_EFFORT=none \
   pnpm run runner:chapters
 ```
+
+That block is the command as it was run on 2026-11-09, kept verbatim. The tag is now set through
+`MT_OLLAMA_MODEL`, which outranks a bare `MT_LLM_MODEL` on the ollama backend — the precedence
+and the current per-role block are in [model-roles.md](model-roles.md) § "How to wire it".
 
 The book is `books/book2`, the chapter is not in the training set.
 

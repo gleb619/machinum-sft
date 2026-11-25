@@ -5,8 +5,13 @@ that eliminated it — kept as evidence, not as a recommendation.
 
 | role | model | why this one |
 | --- | --- | --- |
-| **fast / cheap** | `machinum:4b` — our Qwen3.5-4B + LoRA | 2.63 GB Q4_K_S, 3.2 GB resident at 8 k, 40 s per chapter, learns the protocol; the artefact this repo builds |
-| **quality** | `igorls/gemma-4-12B-it-heretic-GGUF` | 7.4 GB Q4_K_M, 8.4 GB resident at 32 k, 60 s per chapter — the largest model that still leaves a 16 GB card free for training |
+| **`misc`** | `machinum:4b` — our Qwen3.5-4B + LoRA | 2.63 GB Q4_K_S, 3.2 GB resident at 8 k, 40 s per chapter, learns the protocol; the artefact this repo builds |
+| **`translation`** | `igorls/gemma-4-12B-it-heretic-GGUF:latest` | 7.4 GB Q4_K_M, 8.4 GB resident at 32 k, 60 s per chapter — the largest model that still leaves a 16 GB card free for training |
+
+The `misc` role is the `machinum:4b` family: bullet summaries, NER / `<terms>`, glossary,
+proofreading and typo fixing, normalisation, short protocol answers. The `translation` role is
+the external GGUF above, for EN→RU book prose only; this repo does not train it. See
+`docs/model-roles.md`.
 
 Both speak the OpenAI-compatible endpoint `mt` uses, both answer with `reasoning_effort: "none"`
 (Gemma 4 declares `thinking`, so this is mandatory, not optional), both fit one card.
@@ -15,10 +20,10 @@ Both speak the OpenAI-compatible endpoint `mt` uses, both answer with `reasoning
 
 Same held-out chapter (book2 ch.1), same filled glossary, same flags, one card, through `mt`:
 
-| model | quant | size | resident @ 32k | chapter | prose verdict |
-| --- | --- | --- | --- | --- | --- |
-| `machinum:4b` | Q4_K_S | 2.63 GB | 3.2 GB | **40 s** | fluent, but semantic slips |
-| `gemma-4-12B-it-heretic` | Q4_K_M | 7.4 GB | **8.4 GB** | 60 s | no slips in the sample |
+| model | role | quant | size | resident @ 32k | chapter | prose verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| `machinum:4b` | `misc` | Q4_K_S | 2.63 GB | 3.2 GB | **40 s** | fluent, but semantic slips |
+| `igorls/gemma-4-12B-it-heretic-GGUF:latest` | `translation` | Q4_K_M | 7.4 GB | **8.4 GB** | 60 s | no slips in the sample |
 
 Aggregates do not separate them — both give 17/17 lines, 0 metadata leaks, 0 foreign characters,
 identical name handling, Cyrillic share 0.79. The gap is semantic and shows on single sentences.

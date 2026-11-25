@@ -63,6 +63,13 @@ Jobs run in the order they were queued and each one is a fresh process, so a fai
 only that stage. Re-queue with a new `--id` after fixing the cause; `worker reset` clears the
 queue but keeps the logs.
 
+What this repo trains is the **`misc`** model — `machinum:4b`: bullet summaries, NER / `<terms>`,
+glossary, proofreading, normalisation, short protocol answers. EN→RU book prose is the
+**`translation`** role and runs on the external `igorls/gemma-4-12B-it-heretic-GGUF:latest`,
+which this repo never trains. When you wire a run — a pipeline, a script or a curl — the tag and
+the env block come from `docs/model-roles.md`, not from here: one block per role, and
+`MT_OLLAMA_MODEL` is the variable that picks the tag.
+
 ## 4. What each stage actually costs (measured)
 
 | Stage | 0.8B | 4B |
@@ -108,11 +115,19 @@ Both Qwen3.5 and Gemma 4 are **not gated** (`gated=False`), so no HF token is ne
 | `qwen3.5-4b-lora.yaml` | 4B | 13.4 GB | the smallest model worth judging on translations |
 | `gemma-4-12b-qlora.yaml` | 12B | ~20 GB | only with a stable link; 23 GB to download |
 
+That 12B config is history: the `translation` role is now the external
+`igorls/gemma-4-12B-it-heretic-GGUF:latest`, which this repo does not train. Everything this
+table builds is `misc` (`machinum:4b`); see `docs/model-roles.md`.
+
 Rules that held: plain LoRA, never DoRA (not GGUF-convertible); `completion_only_loss: true`;
 `lm_head` in `modules_to_save`; bf16 LoRA on Qwen3.5 rather than QLoRA (Unsloth discourages
 QLoRA there and documents 10 GB at 4B).
 
 ## 7. From weights to a servable model
+
+Everything in this section builds the **`misc`** model (`machinum:4b`). The `translation` model
+is an external GGUF served on the same box; this repo neither trains nor exports it, and the two
+roles, tags and the env block that wires each are in `docs/model-roles.md`.
 
 ```bash
 msft remote signal merge    --config … # out/merged-<config name>, 16-bit
@@ -125,16 +140,20 @@ Two things decide whether the result is usable, and neither is the weights:
 1. **The chat template must come from the GGUF.** It carries the tokenizer's own
    `chat_template`; a hand-copied one (this repo shipped Gemma's `<|turn>` format to a Qwen
    model) makes the model narrate its reasoning instead of answering.
-2. **`think: false` on every request.** Qwen3.5 defaults to thinking. Through the API:
+2. **`think: false` on every request.** Qwen3.5 defaults to thinking. Through the API, on the
+   `misc` model:
 
 ```json
 {"model": "machinum:4b", "think": false, "stream": false,
- "messages": [{"role": "system", "content": "Translate English prose into Russian. Reply with the translation only."},
-              {"role": "user", "content": "The night was cold and the house stood silent."}]}
+ "messages": [{"role": "system", "content":
+               "Summarise the report as three markdown bullets. Reply with the bullets only."},
+              {"role": "user", "content": "INCIDENT: the night shift handed over the manifest."}]}
 ```
 
-With both, `msft eval` goes green: `Ночь была холодной, и дом стоял в тишине.`
-Without them, the same file answers with `Thinking Process: 1. **Analyze the Request:** …`.
+Both flags are what keeps the model answering instead of narrating. The recorded gate result
+predates the role split, on this repo's EN→RU eval set (`docs/memory.md`): `msft eval` green
+(6 gates), the reply `Ночь была холодной, и дом стоял в тишине.`; without the flags the same file
+answers with `Thinking Process: 1. **Analyze the Request:** …`.
 
 Push to a namespace you own — a bare name means `library/` and is refused:
 

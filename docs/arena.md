@@ -1,5 +1,15 @@
 # `msft arena`: same prompts, several models, several scoring frameworks
 
+> **The runs recorded here are 4B-as-translator records.** They compared `machinum:4b` as a
+> translator, before the roles were split. `machinum:4b` is the **`misc`** model now; EN→RU book
+> prose is the **`translation`** role, `igorls/gemma-4-12B-it-heretic-GGUF:latest`, which has
+> **no** arena run in this repo. The numbers stand; the role has changed. The tool itself is
+> role-neutral. See [model-roles.md](model-roles.md).
+>
+> **State the role a `--models` list is comparing.** `machinum:4b*` models are `misc`; the
+> `igorls/...` tag is `translation`. A mixed list answers no single role's question — and a case
+> file whose `task` is `translate` is only a `translation` measurement.
+
 `msft eval` scores a file of recorded replies. `msft probe` sends one model through the serve
 path and runs the gates. Neither answers the question that decides which GGUF goes into the
 pipeline: **on the same cases, which model keeps the instruction's format, keeps the terms,

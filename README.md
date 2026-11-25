@@ -1,17 +1,21 @@
 # machinum-sft
 
-Fine-tuning CLI for the model that processes books in
-[`machinum-pipeline`](https://github.com/gleb619/machinum-pipeline): translation EN→RU,
-proofreading and text normalization against a strict line/XML protocol.
+The project runs two models with different jobs. This repo builds and trains the **`misc`**
+model (`machinum:4b`): bullet summaries, NER / `<terms>` extraction, proofreading and typo
+fixing, normalisation and short protocol answers against a strict line/XML protocol. EN→RU
+literary translation of book prose — and only that — runs on an external 12B GGUF served on the
+same box; this repo does not train it. Roles, tags and the wiring block are in
+`docs/model-roles.md`.
 
 The point of this repo is a **repeatable, boring** run: dataset in, adapter out, GGUF out,
 gates green. Everything that touches hardware, paths or secrets is configuration; nothing is
 hardcoded.
 
-**Model card (public):** <https://gleb619.github.io/machinum-sft/> — how `machinum:4b` was built,
-what it costs and where it fails; `docs/pipeline-check.md` records it running through the real
-pipeline, and `docs/model-candidates.md` says which second model this project supports
-(`gemma-4-12B-it-heretic`) and why everything else was discarded.
+**Model card (public):** <https://gleb619.github.io/machinum-sft/> — how `machinum:4b`, the
+misc model, was built, what it costs and where it fails. `docs/pipeline-check.md` records it
+running through the real pipeline, and `docs/model-candidates.md` compares it with the
+`translation` model (`igorls/gemma-4-12B-it-heretic-GGUF:latest`) and says why everything else
+was discarded.
 
 ```bash
 uv venv --python 3.11 && . .venv/bin/activate
@@ -53,6 +57,7 @@ hand JSONL to `msft data build`.
 | `docs/handoff.md` | the working loop: setup, daily commands, stage timings, failure playbook |
 | `docs/run-2026-11-08.md` | one real run end to end, with numbers |
 | `docs/memory-stack.md` | the one-container project journal — start it, seed it, read it |
+| `docs/model-roles.md` | the two roles — `misc` on the 4B, `translation` on the 12B — and the env block |
 | `docs/index.md` | model card: how `machinum:4b` was built, what it costs, where it fails |
 | `docs/pipeline-check.md` | the model through `mt` on held-out prose, with the defects quoted |
 | `docs/model-candidates.md` | the models the internet recommends, checked against the registry |
@@ -88,14 +93,32 @@ compose healthcheck reads.
 
 ## Calling the exported model
 
-The GGUF carries the tokenizer's own chat template, and Qwen3.5 defaults to thinking — a
-request without the flag comes back as a reasoning transcript instead of a translation.
+Two models, one endpoint, two requests. Both GGUFs carry their tokenizer's own chat template,
+and both families think by default — a request without the flag comes back as a reasoning
+transcript instead of the answer.
+
+Translation, on the `translation` model (external 12B):
+
+```json
+{"model": "igorls/gemma-4-12B-it-heretic-GGUF:latest", "think": false, "stream": false,
+ "messages": [{"role": "system", "content":
+               "Translate the English line into Russian. Reply with the translation only."},
+              {"role": "user", "content": "The night was cold and the house stood silent."}]}
+```
+
+Misc — here a bullet summary — on `machinum:4b`:
 
 ```json
 {"model": "machinum:4b", "think": false, "stream": false,
- "messages": [{"role": "system", "content": "Translate English prose into Russian. Reply with the translation only."},
-              {"role": "user", "content": "The night was cold and the house stood silent."}]}
+ "messages": [{"role": "system", "content":
+               "Summarise the report as three markdown bullets. Reply with the bullets only."},
+              {"role": "user", "content": "INCIDENT: the night shift handed over the manifest."}]}
 ```
+
+On the OpenAI-compatible endpoint ollama ignores `think` and honours
+`"reasoning_effort": "none"` instead (`docs/memory.md`); keep one of the two on every request.
+The variables that pick the tag, and what the pipeline must do to run the two roles, are in
+`docs/model-roles.md`.
 
 ## Verified run (2026-11-08)
 
