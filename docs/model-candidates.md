@@ -51,6 +51,7 @@ That is the whole trade: 2.4× the time and 2.6× the VRAM for prose that stops 
 | `Mistral-Small-3.2-24B-abliterated` | published as **safetensors only** — no GGUF, so `ollama pull hf.co/…` cannot fetch it |
 | `gemma4:latest` (7.5 B), `gemma4:31b` | superseded by the 12B on quality-per-GB; the 31B needs both cards |
 | `machinum:0.8b` | the sibling artefact: 1.088 train loss but **eval red** — it does not hold the line protocol, so it has no role |
+| `gigachat3.1-lightning:q4` (GigaChat3.1-10B-A1.8B, MIT, 6.5 GB Q4_K_M, served on the box) | long cases (8 passages × 12 lines): line parity **8/8**, chrF **67.9** vs the 12B's **74.1** (−6.2, lower on all 8), 154 vs 32 tok/s — **fails the −2.0 chrF bar** (needs ≥ 72.1); speed is not the budget |
 
 Two conclusions survived contact with the measurements:
 
