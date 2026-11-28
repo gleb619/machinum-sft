@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from msft.config import MsftError
-from msft.evaluate import GateResult, run_gates
+from msft.evaluate import GateResult, _evaluate_case, run_gates
 
 XML_PROMPT = (
     "## Input format (xml mode)\n"
@@ -283,3 +283,132 @@ def test_genuine_merge_still_fails_line_parity(tmp_path: Path) -> None:
     )
     assert gates["line_parity"].passed is False
     assert "expected 2" in gates["line_parity"].detail
+
+
+# --- task-aware applicability (W4d, kanban T9) -----------------------------
+#
+# Measured before the fix: the gold reference of every W4 protocol failed `terms_block` and
+# therefore `schema_validity` (ner 0/6, proofread 0/6, summarize 0/6, typofix 0/6) for a
+# contract those prompts never ask for. The table lives in `protocols.TASK_GATES`.
+
+PLAIN_PROMPT = "## Input format (plain mode)\nReturn the corrected text only."
+
+GOLD_REPLIES = {
+    "summarize": "- Nadia visits the pier at night.\n- Fiona brings four boxes to the archive.",
+    "ner": '[\n  {"name": "Nadia", "category": "Character", "description": "the archivist"}\n]',
+    "proofread": "<result><id>1</id><proofread>He walked in.</proofread></result>",
+    "typofix": "He walked in.\nShe nodded.",
+}
+
+
+@pytest.mark.parametrize("task", sorted(GOLD_REPLIES))
+def test_gold_reply_per_protocol_scores_schema_validity_1(
+    tmp_path: Path, task: str
+) -> None:
+    """A protocol's own gold answer must pass, and the translation gates must not apply."""
+    gold = GOLD_REPLIES[task]
+    lines = len([line for line in gold.splitlines() if line.strip()])
+    row = record(gold, PLAIN_PROMPT, task=task, expected_lines=lines)
+    gates = by_gate(run_gates(write_predictions(tmp_path, [row])))
+    assert gates["schema_validity"].passed is True
+    assert gates["schema_validity"].value == 1.0
+    assert gates["no_chatter"].passed is True
+    assert gates["terms_block"].value is None
+    _, outcomes = _evaluate_case(row, 1)
+    assert outcomes["terms_block"] == (None, f"not a {task} gate")
+
+
+def test_translate_task_missing_terms_still_fails_terms_block(tmp_path: Path) -> None:
+    """The fix must not weaken the translation contract it was carved out of."""
+    reply = (
+        "<result><id>1</id><translation>Привет.</translation></result>\n"
+        "<result><id>2</id><translation>Как дела?</translation></result>"
+    )
+    gates = by_gate(
+        run_gates(
+            write_predictions(
+                tmp_path, [record(reply, expected_lines=2, task="translate")]
+            )
+        )
+    )
+    assert gates["terms_block"].passed is False
+    assert "no <terms> block" in gates["terms_block"].detail
+    assert gates["schema_validity"].passed is False
+
+
+@pytest.mark.parametrize("task", [None, "dub", "", 7])
+def test_unknown_or_missing_task_keeps_the_old_behaviour(
+    tmp_path: Path, task: Any
+) -> None:
+    """An unlabelled case is scored as translate: all five checks, as before W4d."""
+    reply = GOLD_REPLIES["summarize"]
+    extra = {} if task is None else {"task": task}
+    row = record(reply, PLAIN_PROMPT, expected_lines=2, **extra)
+    gates = by_gate(run_gates(write_predictions(tmp_path, [row])))
+    assert gates["terms_block"].passed is False
+    assert gates["schema_validity"].passed is False
+
+
+@pytest.mark.parametrize("task", ["proofread", "typofix"])
+def test_line_parity_is_scored_for_line_preserving_tasks(
+    tmp_path: Path, task: str
+) -> None:
+    gold = GOLD_REPLIES[task]
+    row = record(gold, PLAIN_PROMPT, task=task, expected_lines=3)
+    gates = by_gate(run_gates(write_predictions(tmp_path, [row])))
+    assert gates["line_parity"].passed is False
+    assert "expected 3" in gates["line_parity"].detail
+    assert gates["schema_validity"].passed is False
+
+
+@pytest.mark.parametrize("task", ["summarize", "ner"])
+def test_line_parity_is_not_scored_for_reshaping_tasks(
+    tmp_path: Path, task: str
+) -> None:
+    """A summary and a glossary are not one-output-unit-per-line; the count is meaningless."""
+    gold = GOLD_REPLIES[task]
+    row = record(gold, PLAIN_PROMPT, task=task, expected_lines=99)
+    gates = by_gate(run_gates(write_predictions(tmp_path, [row])))
+    assert gates["line_parity"].value is None
+    assert gates["schema_validity"].passed is True
+
+
+@pytest.mark.parametrize("task", sorted(GOLD_REPLIES))
+def test_no_chatter_applies_to_every_protocol(tmp_path: Path, task: str) -> None:
+    """The fix removes contracts, not the universal one: chatter still fails any task."""
+    reply = "Sure, here you go:\n" + GOLD_REPLIES[task]
+    lines = len([line for line in GOLD_REPLIES[task].splitlines() if line.strip()])
+    row = record(reply, PLAIN_PROMPT, task=task, expected_lines=lines)
+    gates = by_gate(run_gates(write_predictions(tmp_path, [row])))
+    assert gates["no_chatter"].passed is False
+    assert gates["schema_validity"].passed is False
+
+
+def test_mixed_file_scores_each_case_on_its_own_task(tmp_path: Path) -> None:
+    """A translate case with terms and a ner case in one file: 2/2; drop one term block, 1/2."""
+    translate = GOOD_XML
+    rows = [
+        record(translate, expected_lines=2, task="translate"),
+        record(GOLD_REPLIES["ner"], PLAIN_PROMPT, task="ner", expected_lines=3),
+    ]
+    gates = by_gate(run_gates(write_predictions(tmp_path, rows)))
+    assert gates["terms_block"].passed is True
+    assert gates["schema_validity"].value == 1.0
+
+    rows[0] = record(translate.replace("<terms>[]</terms>", ""), expected_lines=2,
+                     task="translate")
+    gates = by_gate(run_gates(write_predictions(tmp_path, rows, name="mixed.jsonl")))
+    assert gates["terms_block"].passed is False
+    assert gates["schema_validity"].value == 0.5
+
+
+def test_error_record_still_fails_and_is_not_excused_by_its_task(tmp_path: Path) -> None:
+    """A malformed case with task=ner fails on what does apply; it does not pass by masking."""
+    path = write_predictions(
+        tmp_path, [{"case": "broken", "task": "ner", "_error": "invalid JSON: boom"}]
+    )
+    gates = by_gate(run_gates(path))
+    assert gates["no_chatter"].passed is False
+    assert "boom" in gates["no_chatter"].detail
+    assert gates["terms_block"].value is None
+    assert gates["schema_validity"].passed is False

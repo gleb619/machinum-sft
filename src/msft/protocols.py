@@ -34,6 +34,25 @@ RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+#: Gates each task is scored on. ``translate`` is the translation contract and keeps every
+#: check. The other protocols carry no ``<terms>``, XML or ``N=text`` contract, so
+#: ``no_chatter`` is the only universal one, plus ``line_parity`` where the output is one unit
+#: per input unit (proofread items, typofix lines). Measured on the W4 cases (2026-11-28): the
+#: gold reference of every non-translate protocol failed ``terms_block`` 24/24 and therefore
+#: ``schema_validity`` 0/24 — a contract those protocols were never asked for. ``schema_validity``
+#: is absent here on purpose: it is the roll-up over whichever checks apply.
+TASK_GATES: dict[str, tuple[str, ...]] = {
+    "translate": ("no_chatter", "xml_shape", "properties_shape", "line_parity", "terms_block"),
+    "summarize": ("no_chatter",),
+    "ner": ("no_chatter",),
+    "proofread": ("no_chatter", "line_parity"),
+    "typofix": ("no_chatter", "line_parity"),
+}
+
+#: Task a case is scored as when its ``task`` is missing or not one of the protocols.
+DEFAULT_TASK = "translate"
+
+
 def system_text(record: dict[str, Any]) -> str:
     """The system turn of a raw record: the ``system`` field, else the first system message."""
     raw = record.get("system")
@@ -61,3 +80,17 @@ def classify(system: str) -> str | None:
 def classify_record(record: dict[str, Any]) -> str | None:
     """Protocol for a raw record, read from whichever system turn it carries."""
     return classify(system_text(record))
+
+
+def task_label(task: Any) -> str:
+    """The scoring label for a case's ``task``: a known protocol, else `DEFAULT_TASK`."""
+    if isinstance(task, str):
+        candidate = task.strip().lower()
+        if candidate in TASK_GATES:
+            return candidate
+    return DEFAULT_TASK
+
+
+def gates_for(task: Any) -> tuple[str, ...]:
+    """Gates a case with this ``task`` is scored on; unknown or missing means translate."""
+    return TASK_GATES[task_label(task)]

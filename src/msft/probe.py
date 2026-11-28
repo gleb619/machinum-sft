@@ -148,6 +148,8 @@ def run(
         }
         if "expected_lines" in record:
             row["expected_lines"] = record["expected_lines"]
+        if "task" in record:
+            row["task"] = record["task"]
         try:
             data = _post_json(url, build_request(model, prompt, system), timeout)
             row["reply"] = _reply(data)

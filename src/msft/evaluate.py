@@ -4,6 +4,12 @@ The shapes being checked come from the pipeline prompts (`llm.format.xml.md`,
 `llm.format.properties.md`, `llm.format.plain.md`, `translate.system.md`):
 one output unit per input line, `<result><id>N</id>...` blocks or `N=text` pairs with
 contiguous 1-based ids, and an optional trailing `<terms>[...]</terms>` JSON array.
+
+Which checks apply is a property of the case's ``task``, not of the reply: the translation
+contract above is scored only for ``translate`` (and for a missing or unknown task, which keeps
+the old behaviour); ``summarize``/``ner``/``proofread``/``typofix`` are scored on the checks
+``protocols.TASK_GATES`` lists for them. A check that does not apply reports ``None`` and
+cannot fail a case.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import MsftError
+from .protocols import gates_for, task_label
 
 GATES = (
     "no_chatter",
@@ -229,15 +236,27 @@ def _check_terms(reply: str) -> Outcome:
     return True, f"<terms> array with {len(data)} entr{'y' if len(data) == 1 else 'ies'}"
 
 
+def _mask(outcomes: dict[str, Outcome], task: str) -> dict[str, Outcome]:
+    """Blank the checks the case's task is not scored on, so they cannot fail it."""
+    scored = gates_for(task)
+    return {
+        gate: outcome if gate in scored else (None, f"not a {task} gate")
+        for gate, outcome in outcomes.items()
+    }
+
+
 def _evaluate_case(record: dict[str, Any], index: int) -> tuple[str, dict[str, Outcome]]:
     """Run every applicable check on one record, never raising."""
     name = str(record.get("case") or f"case {index}")
+    task = task_label(record.get("task"))
     if "_error" in record:
         message = str(record["_error"])
-        return name, {gate: (False, message) for gate in GATES}
+        return name, _mask({gate: (False, message) for gate in GATES}, task)
     reply = record.get("reply")
     if not isinstance(reply, str):
-        return name, {gate: (False, "'reply' is missing or not a string") for gate in GATES}
+        return name, _mask(
+            {gate: (False, "'reply' is missing or not a string") for gate in GATES}, task
+        )
     prompt = record.get("prompt_logged")
     if not isinstance(prompt, str):
         prompt = ""
@@ -252,8 +271,8 @@ def _evaluate_case(record: dict[str, Any], index: int) -> tuple[str, dict[str, O
         }
     except Exception as exc:  # a malformed case must become a failed gate, not a traceback
         message = f"{type(exc).__name__}: {exc}"
-        return name, {gate: (False, message) for gate in GATES}
-    return name, outcomes
+        return name, _mask({gate: (False, message) for gate in GATES}, task)
+    return name, _mask(outcomes, task)
 
 
 def _load_cases(path: Path) -> list[dict[str, Any]]:

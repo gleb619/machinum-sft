@@ -428,6 +428,7 @@ def test_fixture_cases_parse_through_the_gates(tmp_path: Path) -> None:
             json.dumps(
                 {
                     "case": row["case"],
+                    "task": row["task"],
                     "reply": row["reference"],
                     "expected_lines": row["expected_lines"],
                     "prompt_logged": row["prompt"],
@@ -450,6 +451,9 @@ def test_fixture_cases_parse_through_the_gates(tmp_path: Path) -> None:
     }
     assert gates["no_chatter"].passed
     assert gates["line_parity"].passed
-    # Known gap, registered on the kanban board: no W4 protocol's gold reference carries a
-    # <terms> block, so `terms_block` fails on gold. W4c must not read that as model failure.
-    assert not gates["terms_block"].passed
+    # Both cases are proofread/typofix, so the translation contract is not scored at all
+    # (W4d, kanban T9): the gold reference has no <terms> block and never was asked for one.
+    assert gates["terms_block"].passed
+    assert gates["terms_block"].value is None
+    assert gates["schema_validity"].passed
+    assert gates["schema_validity"].value == 1.0

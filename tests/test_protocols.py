@@ -4,7 +4,17 @@ from __future__ import annotations
 
 import pytest
 
-from msft.protocols import PROTOCOLS, RULES, classify, classify_record, system_text
+from msft.protocols import (
+    DEFAULT_TASK,
+    PROTOCOLS,
+    RULES,
+    TASK_GATES,
+    classify,
+    classify_record,
+    gates_for,
+    system_text,
+    task_label,
+)
 
 # Excerpts of the three real system prompts in `data/` (2026-11-28), plus the two export
 # protocols. The excerpts keep the phrases the rules are anchored on, not the whole prompts.
@@ -97,3 +107,44 @@ def test_classify_record_accepts_both_record_shapes() -> None:
                            {"role": "assistant", "content": "r"}]}
     assert classify_record(record) == "summarize"
     assert classify_record({"user": "u", "reply": "r"}) is None
+
+
+# --- the gate-applicability table (W4d, kanban T9) --------------------------
+
+
+def test_every_protocol_has_exactly_one_gate_row() -> None:
+    assert set(TASK_GATES) == set(PROTOCOLS)
+    assert set(TASK_GATES) == set(ARENA_TASKS) | {"typofix"}
+
+
+def test_only_translate_keeps_the_translation_contract() -> None:
+    """The 0/24 gold failure was `terms_block`; translate is the one task that keeps it."""
+    assert TASK_GATES["translate"] == (
+        "no_chatter",
+        "xml_shape",
+        "properties_shape",
+        "line_parity",
+        "terms_block",
+    )
+    for protocol in PROTOCOLS:
+        if protocol == "translate":
+            continue
+        assert "no_chatter" in TASK_GATES[protocol], protocol
+        for gate in ("xml_shape", "properties_shape", "terms_block"):
+            assert gate not in TASK_GATES[protocol], f"{protocol} must not be scored on {gate}"
+
+
+def test_line_parity_belongs_to_the_line_preserving_tasks_only() -> None:
+    """One output unit per input unit: translation lines, proofread items, typofix lines."""
+    scored = {protocol for protocol in PROTOCOLS if "line_parity" in TASK_GATES[protocol]}
+    assert scored == {"translate", "proofread", "typofix"}
+
+
+def test_task_label_normalises_and_falls_back_to_translate() -> None:
+    assert task_label(" NER ") == "ner"
+    assert task_label("Typofix") == "typofix"
+    assert task_label(None) == DEFAULT_TASK == "translate"
+    assert task_label("dub") == "translate"
+    assert task_label(7) == "translate"
+    assert gates_for("proofread") == ("no_chatter", "line_parity")
+    assert gates_for(None) == TASK_GATES["translate"]

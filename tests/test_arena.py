@@ -960,3 +960,33 @@ def test_dry_run_calls_neither_seam(
     assert "candidate requests: 2" in text
     assert "judge calls: 2" in text
     assert redact(str(tmp_path / "out")) in text
+
+
+# --- protocol-aware gates (W4d, kanban T9) --------------------------------
+
+
+def test_gate_column_is_scored_on_the_case_task() -> None:
+    """A ner reply has no <terms> block and must still count as passing its own gates."""
+    ner = {"case": "n1", "task": "ner", "prompt_logged": "", "reply": '[{"name": "Nadia"}]'}
+    assert arena._passes_gates(ner, 1) is True
+    translate = {"case": "t1", "task": "translate", "prompt_logged": "", "reply": "Привет."}
+    assert arena._passes_gates(translate, 1) is False, "translate still needs <terms>"
+
+
+def test_arena_rows_carry_the_task_so_the_gate_column_can_use_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seam = install(monkeypatch)
+    seam.reply = lambda payload: {"message": {"content": '[{"name": "Nadia"}]'}}
+    cases = write_cases(tmp_path, {"case": "n1", "task": "ner", "prompt": "Extract the terms."})
+    board = arena.run(
+        endpoint="http://ollama.test",
+        models=["a:1"],
+        cases=cases,
+        out=tmp_path / "out",
+    )
+    replies = [json.loads(line) for line in
+               Path(board["artifacts"]["replies"]["a:1"]).read_text(encoding="utf-8").splitlines()
+               if line.strip()]
+    assert replies[0]["task"] == "ner"
+    assert run_gates(Path(board["artifacts"]["replies"]["a:1"]))[-1].passed is True
