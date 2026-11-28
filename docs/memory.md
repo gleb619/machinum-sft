@@ -280,3 +280,54 @@ dead until someone wrote `UPDATE items SET status='new'` by hand. Fix:
 `msft material retry [URL ...]` flips exactly `status='error'` rows to `new`, clears `error`, and
 touches nothing else; `--dry-run` names them without writing. It is deliberately not automatic: a
 site that is down would burn a fetch every day. Proof: `pytest -q tests/test_material.py -k retry`.
+
+## 2026-11-28 — the weekend campaign (new traps, all measured today)
+
+**`msft train` needs `msft data build` first.** A train job signalled against a fresh config dies
+in 5.8 s with `error: train dataset missing: /workspace/out/<name>/dataset/train.jsonl; run
+`msft data build` first`. Signal `data` with the same `--config`, wait for its `done/<id>.json`,
+then signal `train`. The W6 chain did exactly that (`w6-data` rc=0, 0.1 s).
+
+**`msft remote deploy` rebuilds the image (~8 min) and is not a sync step.** It runs
+`docker compose up -d --build worker`; today it ate 8 minutes while the GPU sat idle, and the
+bind-mounted repo already had the code. For a config, `msft remote signal --config` pushes it
+(S34 behaviour); for data, `msft remote sync --local data/<dir> --execute`. Deploy is for a
+`Dockerfile`/compose change, not for a Python or config edit.
+
+**A 4B misc run on 203 records is 17.6 min, not 4.** `w6-train2` (203 records, 3 epochs,
+`grad_accum 8`, seq 4096) was 75 steps at ~14 s/step = **1057.6 s**. The catalog's `est_minutes`
+3.0 is derived from the 49-pair/4-step run; any recipe over a bigger corpus needs its own
+measurement, not the inherited number.
+
+**`msft arena` runs by default; `--execute` must precede the subcommand.** `msft arena … --execute`
+exits 2 (`unrecognized arguments`). Use `msft --execute arena …`, or omit it — the arena is not a
+dry-run tool. W7 and W9 both hit this.
+
+**The arena judge is exactly reproducible at seed 7 / temperature 0.** Three identical runs, 14
+rows each: fidelity 14/14, fluency 14/14, per-case spread 0. Do not "stabilise" it with binary
+labels — that would erase the only between-model difference (`harbor-3-lines` fluency 2 vs 3).
+
+**No real summarize/NER prompt-reply pairs exist on disk.** The one summary run recorded
+`fallbackUsed: true` after 63 attempts (the "summary" is the chapter text), and
+`chapters/schema/*.entities.json` holds replies without prompts. Product-prompt triples have to be
+exported by `scripts/export_protocol_triples.py` against a teacher (`machinum:4b`, think:false,
+temperature 0); the result is 21+21 TL254 triples with `recordsIn=recordsOut` and no drops.
+
+**The misc arm wins the protocol ruler; the union does not.** `machinum:4b-w6-misc` (4B trained on
+summaries+NER+proofread+typofix) passes **24/24** applicable W4 gates and 10/10 of the held-out
+half (v3/base: 8/10), and heldout-50 schema 39/50 vs 38/50 v3 and 35/50 base. The 0.8B
+rank-2r union (`machinum:4b-w4-union`) fails the summarize chrF rule (48.81 vs mixed 50.26) and on
+50 unseen windows drops judge fidelity to 1.18 vs 2.20 for `machinum:4b` — do not serve it.
+
+**Q3_K_M is 11.9 % smaller, not 25 %, and is not free.** `machinum:4b-v3-q3km` is 2,318,806,560 B
+vs 2,631,771,680 B (Q4_K_S), +6.4 % tok/s, chrF 67.4 vs 70.7, one hard schema miss. Keep Q4_K_S.
+
+**A stuck coding agent is a real GPU cost.** qwen wrote no file in 20 min (W4 plan) and again in
+8 min (W6) on multi-step shell work; `at`'s watchdog killed the first only after 20 min. For
+box-driving runs prefer codex, and check for a written file after ~5 min before waiting out the
+watchdog.
+
+**`at loop` has no external supervisor and self-pauses.** The daemon died at 09:19 and nothing
+fired for 2.5 h; after three idle ticks the keeper paused itself (T18). `pgrep -f 'at serve
+--daemon'` and `at loop list` are the first checks on a quiet day; cron is not available to this
+repo, so a dead daemon means a manual restart.
