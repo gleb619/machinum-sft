@@ -21,7 +21,8 @@ State shape (create once if missing):
 ```json
 {"date": "2026-11-28",
  "items": {"W4d": {"status": "todo"}, "W4c": {"status": "todo"},
-           "W6": {"status": "todo"}, "W7": {"status": "todo"}},
+           "W6": {"status": "todo"}, "W7": {"status": "todo"},
+           "W9": {"status": "todo"}},
  "failures": 0, "last_tick": null}
 ```
 
@@ -91,7 +92,7 @@ unless §5 says to.
 
 When the queue is empty and no item is `running`:
 
-1. Take the first item in order `W4d, W4c, W6, W7` whose status is `todo` or `failed` (one retry
+1. Take the first item in order `W4d, W4c, W6, W7, W9` whose status is `todo` or `failed` (one retry
    maximum per item; `failures >= 2` → `blocked`).
 2. Mark it `running` in the state file **before** dispatching.
 3. Dispatch it detached, with the spec as the prompt:
