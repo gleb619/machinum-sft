@@ -558,11 +558,13 @@ def main():
     messages = [{"role": "user", "content": PROBE}]
     try:
         text = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, enable_thinking=False
+            messages, add_generation_prompt=True, enable_thinking=False, tokenize=False
         )
     except TypeError:
         print("note: this tokenizer has no enable_thinking flag", file=sys.stderr)
-        text = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        text = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=MAX_SEQ_LENGTH)
     inputs = {key: value.to(model.device) for key, value in inputs.items()}
     with torch.no_grad():

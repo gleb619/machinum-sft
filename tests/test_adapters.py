@@ -368,6 +368,9 @@ def test_build_script_embeds_the_paths_and_the_self_checks(tmp_path: Path) -> No
     assert "self-check 2:" in script
     assert "self-check 3:" in script
     assert "enable_thinking=False" in script
+    # apply_chat_template defaults to tokenize=True; feeding its id list back into the
+    # tokenizer is the self-check-3 crash this asserts against.
+    assert script.count("tokenize=False") == 2
     compile(script, "merge_script.py", "exec")
 
 
