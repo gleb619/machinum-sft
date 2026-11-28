@@ -102,7 +102,7 @@ at -p "Execute experiment <ID> for the machinum-sft weekend campaign.
 Read /media/boris/data_nvme1n1/WORKSPACES/WORKSPACE/machinum-sft/docs/plans/weekend-2026-11-28.md section <ID> and follow it exactly.
 The repo is the cwd. Do not commit or push: the keeper commits.
 Write out/weekend/<ID>/RESULT.md with the exact commands, rc and numbers, ending with a final line 'RESULT: done' or 'RESULT: failed: <reason>'.
-Report the same numbers in your last message." --timeout 5400000
+Report the same numbers in your last message." --timeout 10800000
 ```
 
 `at -p` returns immediately; copy the run id from its output into the state item.
