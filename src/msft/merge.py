@@ -20,9 +20,13 @@ MERGE_META_NAME = "merge_meta.json"
 SAVE_METHOD = "merged_16bit"
 
 
-def _adapter_files(cfg: RunConfig) -> dict[str, bool]:
+def adapter_dir(cfg: RunConfig, adapter: str | Path | None = None) -> Path:
+    """The adapter to merge: an explicit override (union adapter), else the config's own."""
+    return cfg.adapter_path if adapter is None else Path(adapter)
+
+
+def _adapter_files(adapter: Path) -> dict[str, bool]:
     """Which adapter artifacts are on disk right now."""
-    adapter = cfg.adapter_path
     return {
         "adapter_exists": adapter.is_dir(),
         "adapter_config": (adapter / "adapter_config.json").is_file(),
@@ -31,22 +35,28 @@ def _adapter_files(cfg: RunConfig) -> dict[str, bool]:
     }
 
 
-def plan(cfg: RunConfig) -> dict[str, Any]:
-    """Paths, save method and on-disk state for merging the adapter into bf16 weights."""
+def plan(cfg: RunConfig, *, adapter: str | Path | None = None) -> dict[str, Any]:
+    """Paths, save method and on-disk state for merging the adapter into bf16 weights.
+
+    ``adapter`` overrides ``cfg.adapter_path`` only: ``merged_path`` stays keyed on the run
+    name, so merging a union adapter into a run's output_dir cannot overwrite an arm's
+    merged weights.
+    """
     script_path = cfg.output_path / MERGE_SCRIPT_NAME
-    checks = _adapter_files(cfg)
+    source = adapter_dir(cfg, adapter)
+    checks = _adapter_files(source)
     notes: list[str] = []
     if not checks["adapter_exists"]:
-        notes.append(f"{cfg.adapter_path} does not exist yet; run `msft train --execute`")
+        notes.append(f"{source} does not exist yet; run `msft train --execute`")
     elif not checks["adapter_config"]:
-        notes.append(f"{cfg.adapter_path} has no adapter_config.json; merge would fail")
+        notes.append(f"{source} has no adapter_config.json; merge would fail")
     if cfg.merged_path.exists():
         notes.append(f"{cfg.merged_path} already exists and would be overwritten")
     return {
         "stage": "merge",
         "name": cfg.name,
         "model": cfg.model.id,
-        "adapter": str(cfg.adapter_path),
+        "adapter": str(source),
         "merged": str(cfg.merged_path),
         "save_method": SAVE_METHOD,
         "dtype": "bfloat16",
@@ -218,12 +228,12 @@ def _literal(value: object) -> str:
     return "None" if value is None else json.dumps(value)
 
 
-def build_script(cfg: RunConfig) -> str:
+def build_script(cfg: RunConfig, *, adapter: str | Path | None = None) -> str:
     """The standalone merge script for `cfg`, ready to save and run with any python."""
     return _SCRIPT.substitute(
         MODEL_ID=json.dumps(cfg.model.id),
         MODEL_REVISION=_literal(cfg.model.revision),
-        ADAPTER_DIR=json.dumps(str(cfg.adapter_path)),
+        ADAPTER_DIR=json.dumps(str(adapter_dir(cfg, adapter))),
         MERGED_DIR=json.dumps(str(cfg.merged_path)),
         META_FILE=json.dumps(str(cfg.output_path / MERGE_META_NAME)),
         SAVE_METHOD=json.dumps(SAVE_METHOD),
@@ -237,30 +247,32 @@ def _log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def _require_adapter(cfg: RunConfig) -> None:
-    """Raise unless a trainable adapter is on disk where the config says it is."""
-    checks = _adapter_files(cfg)
+def _require_adapter(source: Path) -> None:
+    """Raise unless a trainable adapter is on disk where we were told to look."""
+    checks = _adapter_files(source)
     if not checks["adapter_exists"] or not checks["adapter_config"]:
         raise MsftError(
-            f"no adapter at {cfg.adapter_path}; run `msft train --execute` first "
+            f"no adapter at {source}; run `msft train --execute` first "
             "(or point output_dir at an existing run)"
         )
 
 
-def run(cfg: RunConfig, *, execute: bool = False) -> dict[str, Any]:
+def run(
+    cfg: RunConfig, *, execute: bool = False, adapter: str | Path | None = None
+) -> dict[str, Any]:
     """Return the plan; with `execute=True` write output/merge_script.py and run it.
 
     Nothing is written when `execute` is false: a dry run must not create artifacts.
     """
-    result = plan(cfg)
+    result = plan(cfg, adapter=adapter)
     result["executed"] = False
     if not execute:
         return result
 
-    _require_adapter(cfg)
+    _require_adapter(adapter_dir(cfg, adapter))
     script_path = Path(result["script"])
     script_path.parent.mkdir(parents=True, exist_ok=True)
-    script_path.write_text(build_script(cfg), encoding="utf-8")
+    script_path.write_text(build_script(cfg, adapter=adapter), encoding="utf-8")
     _log(f"wrote {script_path}")
     _log(f"$ {sys.executable} {script_path}")
 

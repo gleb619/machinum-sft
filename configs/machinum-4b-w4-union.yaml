@@ -1,0 +1,66 @@
+# W4 the union -- merge/quantize only, trained by `msft adapters merge`
+#
+# One of four configs in the protocol-slice union experiment (`docs/plans/weekend-2026-11-28.md`
+# section W4, binding spec `out/weekend/W4/PLAN.md` section 5). All four share base model,
+# r=16 / alpha=32, dropout 0, optimiser, lr, seed and epoch count; only `data.input` and the
+# output paths differ, so the only variable between an arm and the mixed control is the data.
+#
+# The union config is merge/quantize only: its adapter is written by
+# `msft adapters merge --a out/w4/arm-a/adapter --b out/w4/arm-b/adapter` and loaded with
+# `msft merge --config configs/machinum-4b-w4-union.yaml --adapter out/w4/union-adapter`.
+# `data`/`train` are unused by those stages; they are filled so validation has no special case.
+base_dir: ".."
+name: w4-union-0.8b
+
+model:
+  id: Qwen/Qwen3.5-0.8B
+  revision: null
+  load_in_4bit: false
+  dtype: bfloat16
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  modules_to_save: []
+  use_rslora: false
+
+train:
+  max_seq_length: 4096
+  per_device_batch: 1
+  grad_accum: 8
+  lr: 1.0e-4
+  epochs: 1.0
+  warmup_steps: 4
+  weight_decay: 0.05
+  max_grad_norm: 1.0
+  scheduler: cosine
+  optim: adamw_8bit
+  seed: 42
+  packing: false
+  completion_only_loss: true
+  save_steps: 50
+  eval_steps: 50
+
+data:
+  input: data/slices/w4/union
+  val_ratio: 0.05
+  dedupe: true
+  min_chars: 40
+  max_chars: 8000
+  max_tokens: null
+
+quantize:
+  method: q4_k_s
+  imatrix: false
+  output: out/w4/union-run/model-w4-union-0.8b.gguf
+
+output_dir: out/w4/union-run

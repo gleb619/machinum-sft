@@ -76,7 +76,8 @@ def test_iter_records_reads_json_array() -> None:
 
 def test_iter_records_walks_directory_recursively() -> None:
     records = list(iter_records(FIXTURES))
-    assert len(records) == 17
+    # 17 training fixtures + the 2 W4 eval cases under fixtures/w4-cases/.
+    assert len(records) == 19
     assert all(isinstance(r, dict) for r in records)
 
 
@@ -187,12 +188,14 @@ def test_normalize_falls_back_to_fields_when_messages_are_empty() -> None:
 def test_build_dataset_dry_run_stats(tmp_path: Path) -> None:
     cfg = cfg_for(tmp_path, val_ratio=0.34)
     stats = build_dataset(cfg)
-    assert stats.records_in == 17
+    # 17 training fixtures plus the 2 W4 eval cases, which carry no trainable turn.
+    assert stats.records_in == 19
     assert stats.records_out == 8
     assert stats.dropped == {
         "code_fence": 1,
         "duplicate": 1,
         "no_assistant": 4,
+        "no_messages": 2,
         "no_user": 2,
         "too_short": 1,
     }

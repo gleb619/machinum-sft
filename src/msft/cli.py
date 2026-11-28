@@ -242,6 +242,51 @@ def _cmd_data_build(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cmd_data_slice(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Classify, dedupe and split artifacts into disjoint protocol arms (no config needed)."""
+    slices = _impl("msft.slices")
+    gate_error = getattr(slices, "GateError", MsftError)
+    try:
+        result = _jsonable(
+            _func(slices, "run")(
+                inputs=list(args.input),
+                arms_values=list(args.arm),
+                out=args.out,
+                report=args.report,
+                cases_dir=args.cases_dir,
+                cases_per_protocol=int(args.cases_per_protocol),
+                min_per_protocol=int(args.min_per_protocol),
+                min_per_arm=int(args.min_per_arm),
+                execute=bool(args.execute),
+            )
+        )
+    except gate_error as exc:  # a refused slice is a red gate (1), not bad usage (2)
+        _log(f"error: {exc}")
+        if args.as_json:
+            _emit(True, {"ok": False, "error": redact(str(exc))}, "")
+        return 1
+    title = "data slice" if result.get("executed") else "data slice plan"
+    _emit(args.as_json, result, _render(title, result))
+    return _exit_for(result)
+
+
+def _cmd_adapters_merge(cfg: RunConfig | None, args: argparse.Namespace) -> int:
+    """Concatenate two LoRA deltas at rank 2r; dry run prints the plan."""
+    adapters = _impl("msft.adapters")
+    kwargs = {
+        "weights": args.weights,
+        "cases": args.cases,
+        "max_seq_length": int(args.max_seq_length),
+    }
+    if args.execute:
+        result = _jsonable(_func(adapters, "run")(args.a, args.b, args.out, execute=True, **kwargs))
+        _emit(args.as_json, result, _render("adapters merge", result))
+    else:
+        result = _jsonable(_func(adapters, "plan")(args.a, args.b, args.out, **kwargs))
+        _emit(args.as_json, result, _render("adapters merge plan", result))
+    return _exit_for(result)
+
+
 def _model_stage(
     module: str,
     title: str,
@@ -298,7 +343,25 @@ def _cmd_train(cfg: RunConfig | None, args: argparse.Namespace) -> int:
 
 def _cmd_merge(cfg: RunConfig | None, args: argparse.Namespace) -> int:
     """Plan or execute adapter merging into 16-bit weights."""
-    return _model_stage("msft.merge", "merge", cfg, args)
+    adapter = getattr(args, "adapter", None)
+    if adapter is None:
+        return _model_stage("msft.merge", "merge", cfg, args)
+    # An explicit adapter (the union) changes what `merge` loads but not where it writes:
+    # merged_path stays keyed on the run name. `_model_stage` does not forward kwargs to
+    # `plan`, so this branch calls the module directly.
+    config = _require_config(cfg)
+    merge = _impl("msft.merge")
+    if getattr(args, "script", False):
+        script = _func(merge, "build_script")(config, adapter=adapter)
+        _emit(args.as_json, {"script": script}, str(script))
+        return EXIT_OK
+    if args.execute:
+        result = _jsonable(_func(merge, "run")(config, execute=True, adapter=adapter))
+        _emit(args.as_json, result, _render("merge", result))
+        return EXIT_OK
+    result = _jsonable(_func(merge, "plan")(config, adapter=adapter))
+    _emit(args.as_json, result, _render("merge plan", result))
+    return EXIT_OK
 
 
 def _cmd_quantize(cfg: RunConfig | None, args: argparse.Namespace) -> int:
@@ -1186,6 +1249,42 @@ def build_parser() -> argparse.ArgumentParser:
         "build", parents=[common], help="build chat triples from pipeline artifacts"
     )
     p_data_build.set_defaults(handler=_cmd_data_build)
+    p_data_slice = data_sub.add_parser(
+        "slice",
+        parents=[common],
+        help="split artifacts into disjoint protocol arms by their system prompt",
+    )
+    p_data_slice.add_argument(
+        "--input",
+        action="append",
+        required=True,
+        metavar="PATH",
+        help="artifact file or directory (repeatable; same rules as `data build`)",
+    )
+    p_data_slice.add_argument(
+        "--arm",
+        action="append",
+        required=True,
+        metavar="NAME=PROTO[,PROTO]",
+        help="arm name and the protocols it trains (repeatable)",
+    )
+    p_data_slice.add_argument("--out", required=True, metavar="DIR", help="slice tree to write")
+    p_data_slice.add_argument(
+        "--report", metavar="PATH", default=None, help="write the JSON report here"
+    )
+    p_data_slice.add_argument(
+        "--cases-dir", metavar="DIR", default=None, help="write per-protocol eval cases here"
+    )
+    p_data_slice.add_argument(
+        "--cases-per-protocol", type=int, default=0, metavar="N", help="eval cases per protocol"
+    )
+    p_data_slice.add_argument(
+        "--min-per-protocol", type=int, default=1, metavar="N", help="hard gate per protocol"
+    )
+    p_data_slice.add_argument(
+        "--min-per-arm", type=int, default=1, metavar="N", help="hard gate per arm"
+    )
+    p_data_slice.set_defaults(handler=_cmd_data_slice)
     p_data.set_defaults(handler=_cmd_data_build)
 
     p_train = sub.add_parser("train", parents=[common], help="QLoRA/SFT via Unsloth + TRL")
@@ -1199,11 +1298,45 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_merge = sub.add_parser("merge", parents=[common], help="merge the adapter into 16-bit")
     p_merge.add_argument("--script", action="store_true", help="print the generated script")
+    p_merge.add_argument(
+        "--adapter",
+        metavar="DIR",
+        default=None,
+        help="merge this adapter instead of the config's adapter_path (writes the same merged dir)",
+    )
     p_merge.set_defaults(handler=_cmd_merge)
 
     p_quant = sub.add_parser("quantize", parents=[common], help="GGUF conversion and quantisation")
     p_quant.add_argument("--script", action="store_true", help="print the generated script")
     p_quant.set_defaults(handler=_cmd_quantize)
+
+    p_adapters = sub.add_parser(
+        "adapters", parents=[common], help="merge LoRA deltas from two arms"
+    )
+    adapters_sub = p_adapters.add_subparsers(
+        dest="adapters_command", metavar="ACTION", required=True
+    )
+    p_ad_merge = adapters_sub.add_parser(
+        "merge",
+        parents=[common],
+        help="concatenate two LoRA deltas into one rank-2r adapter",
+    )
+    p_ad_merge.add_argument("--a", required=True, metavar="DIR", help="first arm's adapter dir")
+    p_ad_merge.add_argument("--b", required=True, metavar="DIR", help="second arm's adapter dir")
+    p_ad_merge.add_argument("--out", required=True, metavar="DIR", help="where to write adapter/")
+    p_ad_merge.add_argument(
+        "--weights",
+        choices=("mean", "sum"),
+        default="mean",
+        help="mean = (delta_a+delta_b)/2 (default), sum = delta_a+delta_b",
+    )
+    p_ad_merge.add_argument(
+        "--cases", metavar="PATH", default=None, help="use its first prompt for the forward check"
+    )
+    p_ad_merge.add_argument(
+        "--max-seq-length", dest="max_seq_length", type=int, default=4096, metavar="N"
+    )
+    p_ad_merge.set_defaults(handler=_cmd_adapters_merge)
 
     p_eval = sub.add_parser("eval", parents=[common], help="protocol gates on predictions")
     p_eval.add_argument(

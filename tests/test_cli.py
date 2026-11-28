@@ -785,3 +785,104 @@ def test_remote_stop_missing_session_exits_one(
     captured = capsys.readouterr()
     assert code == 1
     assert "no such session" in captured.out
+
+
+# --- W4: protocol slices and adapter merge --------------------------------
+
+
+def test_data_slice_and_adapters_merge_help_exit_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["data", "slice", "--help"]) == 0
+    captured = capsys.readouterr()
+    assert "--min-per-arm" in captured.out
+    assert main(["adapters", "merge", "--help"]) == 0
+    captured = capsys.readouterr()
+    assert "--weights" in captured.out
+
+
+def test_data_slice_dry_run_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "in"
+    root.mkdir()
+    summarize = "You are a precise AI assistant producing plain text summary notes."
+    rows = [
+        {
+            "messages": [
+                {"role": "system", "content": summarize},
+                {"role": "user", "content": f"chapter {index}"},
+                {"role": "assistant", "content": f"- note {index}"},
+            ]
+        }
+        for index in range(2)
+    ]
+    (root / "summarize.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    out = tmp_path / "slice"
+    code = main(
+        [
+            "--json",
+            "data",
+            "slice",
+            "--input",
+            str(root),
+            "--arm",
+            "a=summarize",
+            "--out",
+            str(out),
+            "--min-per-protocol",
+            "1",
+            "--min-per-arm",
+            "1",
+        ]
+    )
+    assert code == 0
+    payload = only_object(capsys.readouterr().out)
+    assert payload["executed"] is False
+    assert payload["per_arm"] == {"a": 2}
+    assert not out.exists()
+
+
+def test_data_slice_gate_refusal_exits_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "in"
+    root.mkdir()
+    row = {
+        "system": "Fix only obvious typos and punctuation mistakes.",
+        "user": "Teh cat.",
+        "reply": "The cat.",
+    }
+    (root / "typofix.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    out = tmp_path / "slice"
+    code = main(
+        [
+            "data",
+            "slice",
+            "--input",
+            str(root),
+            "--arm",
+            "a=typofix",
+            "--out",
+            str(out),
+            "--min-per-protocol",
+            "20",
+            "--min-per-arm",
+            "60",
+        ]
+    )
+    assert code == 1
+    assert "below --min-per-protocol" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_merge_accepts_adapter_override(tmp_path: Path) -> None:
+    parser = cli.build_parser()
+    override = parser.parse_args(
+        ["--config", str(write_config(tmp_path)), "merge", "--adapter", "out/w4/union/adapter"]
+    )
+    assert override.adapter == "out/w4/union/adapter"
+    plain = parser.parse_args(["--config", str(write_config(tmp_path)), "merge"])
+    assert plain.adapter is None
