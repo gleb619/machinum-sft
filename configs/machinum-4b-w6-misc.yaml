@@ -1,0 +1,62 @@
+# W6 — the 4B "misc" arm on the non-translation protocols.
+#
+# Spec: `docs/plans/weekend-2026-11-28.md` § W6. One variable against `machinum:4b-v3`:
+# the corpus is the W4 union slice (summarize 21 + ner 21 + proofread 27 + typofix 134 =
+# 203 records), not the 138 translate pairs of `data/v3`. The 0.05 val split is the same
+# digest rule the W4 slicer used to label its cases, so the 10 val-sourced W4 cases are
+# held out of training.
+base_dir: ".."
+name: machinum-4b-w6
+
+model:
+  id: Qwen/Qwen3.5-4B
+  revision: null
+  load_in_4bit: false
+  dtype: bfloat16
+
+lora:
+  r: 32
+  alpha: 16
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  modules_to_save: []
+  use_rslora: false
+
+train:
+  max_seq_length: 4096
+  per_device_batch: 1
+  grad_accum: 8
+  lr: 5.0e-5
+  epochs: 3.0
+  warmup_steps: 8
+  weight_decay: 0.05
+  max_grad_norm: 1.0
+  scheduler: cosine
+  optim: adamw_8bit
+  seed: 42
+  packing: false
+  completion_only_loss: true
+  save_steps: 20
+  eval_steps: 20
+
+data:
+  input: data/slices/w4/union
+  val_ratio: 0.05
+  dedupe: true
+  min_chars: 40
+  max_chars: 8000
+  max_tokens: null
+
+quantize:
+  method: q4_k_s
+  imatrix: false
+  output: out/w6/model-machinum-4b-w6.gguf
+
+output_dir: out/w6
