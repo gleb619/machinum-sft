@@ -70,6 +70,8 @@ at status | head -15                                 # agent runs (global, other
 ```
 
 - No `GPU:` string, or a `WARNING:` → **heal the box** (§5) before anything else.
+- Any item with `"blocked_by": "gpu"` whose box counts are `pending 0` and `running 0` → set it
+  back to `todo` in this tick. That is how a queued experiment resumes without an operator.
 - `at serve --daemon` not running (`at loop list` says so, or `pgrep -f 'at serve --daemon'` is
   empty) → `at serve --daemon >/dev/null 2>&1 &` and confirm the daemon is alive next tick.
 
