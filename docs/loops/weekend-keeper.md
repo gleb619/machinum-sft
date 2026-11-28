@@ -20,9 +20,8 @@ State shape (create once if missing):
 
 ```json
 {"date": "2026-11-28",
- "items": {"W2": {"status": "todo"}, "W1": {"status": "todo"},
-           "W3": {"status": "todo"}, "W4b": {"status": "todo"},
-           "W4c": {"status": "todo"}, "W5": {"status": "todo"}},
+ "items": {"W4d": {"status": "todo"}, "W4c": {"status": "todo"},
+           "W6": {"status": "todo"}, "W7": {"status": "todo"}},
  "failures": 0, "last_tick": null}
 ```
 
@@ -92,7 +91,7 @@ unless §5 says to.
 
 When the queue is empty and no item is `running`:
 
-1. Take the first item in order `W2, W1, W3, W4b, W4c, W5` whose status is `todo` or `failed` (one retry
+1. Take the first item in order `W4d, W4c, W6, W7` whose status is `todo` or `failed` (one retry
    maximum per item; `failures >= 2` → `blocked`).
 2. Mark it `running` in the state file **before** dispatching.
 3. Dispatch it detached, with the spec as the prompt:
@@ -133,6 +132,10 @@ at status <runId> -n 70
   from it yourself, then set `done` (or `failed` if `RESULT: failed`).
 - `running` → leave it.
 - `failed` → §5.
+
+**Then go back to §4 in the same tick** and dispatch the next `todo` item, unless the tick is
+already past 12 minutes. A finished item must not wait 20 minutes for the next fire — the day is
+for experiments, not for gaps.
 
 ### 7. Commit, gate, push
 
